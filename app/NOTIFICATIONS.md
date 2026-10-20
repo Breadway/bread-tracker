@@ -16,10 +16,12 @@ flutter build apk --debug
 The APK is `app/build/app/outputs/flutter-apk/app-debug.apk` relative to the
 repository root. It is a debug build, not a signed production release.
 
-Android builds require the gitignored `android/app/google-services.json` for
-Firebase project `bread-tracker-df441`, package `dev.breadway.tracker`. This client
+Push needs the gitignored `android/app/google-services.json` for
+Firebase project `bread-tracker-df441`, package `dev.breadway.tracker`. Without it the
+build still succeeds (with a warning) but push registration fails at runtime. This client
 configuration is not the server service-account private key. Never put the
-service-account key in the app or repository.
+service-account key in the app or repository. Release signing, versioning and getting
+the APK onto a phone are in `RELEASE.md`.
 
 ## Pairing and notifications
 

@@ -6,10 +6,26 @@
 #   BREADTRACKER_BIND=127.0.0.1:7290            host bind (Aegis reaches it over Tailscale, see DEPLOY.md)
 #   BREADTRACKER_BACKUP_DIR=/var/backups/bread-tracker
 #   BREADTRACKER_FCM_KEY_FILE=/home/breadway/secrets/bread-tracker-fcm.json   Firebase service account
+#   BREADTRACKER_UID / BREADTRACKER_GID         user the server runs as (default 10001:10001). The FCM key
+#                                               file must be readable by it: chown it to that uid, or set
+#                                               these to the file's owner (see DEPLOY.md).
 #
 # Pair a phone:  docker exec bread-tracker bread-tracker-server pair
 
 services:
+  # One-shot: hand the data volume to the unprivileged user. A volume created by an older image
+  # (which ran as root) is root-owned and the server could not write its database.
+  init-perms:
+    build:
+      context: .
+      dockerfile: packaging/Containerfile
+    image: bread-tracker:local
+    user: root
+    entrypoint: ["chown", "-R", "${BREADTRACKER_UID:-10001}:${BREADTRACKER_GID:-10001}", "/var/lib/bread-tracker"]
+    restart: "no"
+    volumes:
+      - bread-tracker-data:/var/lib/bread-tracker
+
   bread-tracker:
     build:
       context: .
@@ -17,6 +33,10 @@ services:
     image: bread-tracker:local
     container_name: bread-tracker
     restart: unless-stopped
+    user: "${BREADTRACKER_UID:-10001}:${BREADTRACKER_GID:-10001}"
+    depends_on:
+      init-perms:
+        condition: service_completed_successfully
     ports:
       - "${BREADTRACKER_BIND:-127.0.0.1:7290}:7290"
     environment:
@@ -32,6 +52,9 @@ services:
     container_name: bread-tracker-litestream
     restart: unless-stopped
     command: ["replicate"]
+    # Same user as the server so the SQLite -wal/-shm files are never owned by someone else.
+    # BREADTRACKER_BACKUP_DIR must be writable by this uid.
+    user: "${BREADTRACKER_UID:-10001}:${BREADTRACKER_GID:-10001}"
     volumes:
       - bread-tracker-data:/var/lib/bread-tracker
       - ${BREADTRACKER_BACKUP_DIR:-./backups}:/var/backups/bread-tracker

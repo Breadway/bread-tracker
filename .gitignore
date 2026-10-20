@@ -12,3 +12,5 @@ app/android/key.properties
 *.jks
 *.keystore
 service-account*.json
+app/test/failures/
+app/test/goldens/

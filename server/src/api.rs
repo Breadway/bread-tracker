@@ -172,6 +172,13 @@ fn valid_time_or_empty(t: &str) -> bool {
 }
 
 async fn put_settings(State(st): State<AppState>, Json(p): Json<SettingsPatch>) -> ApiResult<Json<Settings>> {
+    // Quiet hours need both ends or neither; a half-set window used to disable them silently.
+    let cur = load_settings(&st).await?;
+    let start = p.quiet_start.clone().unwrap_or(cur.quiet_start);
+    let end = p.quiet_end.clone().unwrap_or(cur.quiet_end);
+    if start.is_empty() != end.is_empty() {
+        return Err(ApiError::BadRequest("quiet_start and quiet_end must both be set or both be empty".into()));
+    }
     if let Some(tz) = &p.timezone {
         Tz::from_str(tz).map_err(|_| ApiError::BadRequest("unknown timezone".into()))?;
         store::set_setting(&st.db, "timezone", tz).await?;

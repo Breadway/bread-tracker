@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use async_trait::async_trait;
-use chrono::{DateTime, Datelike, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
@@ -206,8 +206,26 @@ pub fn in_quiet_hours(now: NaiveTime, quiet: Option<(NaiveTime, NaiveTime)>) -> 
     }
 }
 
+/// When a reminder at `at` may first be sent: `at` itself, or the end of the quiet window
+/// it fell inside (it is held back during quiet hours and released when they end).
+fn release_time(at: NaiveDateTime, quiet: Option<(NaiveTime, NaiveTime)>) -> NaiveDateTime {
+    let Some((s, e)) = quiet else { return at };
+    if !in_quiet_hours(at.time(), quiet) {
+        return at;
+    }
+    let day = at.date();
+    if s <= e || at.time() < e {
+        day.and_time(e)
+    } else {
+        (day + ChronoDuration::days(1)).and_time(e) // window wraps midnight and we are before it
+    }
+}
+
 /// Reminders that should go out now. A reminder is due once its local time has passed,
-/// until `grace_mins` later; it is skipped when already done today or already sent.
+/// until `grace_mins` later. A reminder whose time falls inside quiet hours is held until
+/// the quiet window ends and then gets its full grace from that moment, so a long quiet
+/// window cannot swallow it. Yesterday's held reminders are considered too, because they
+/// are released the next morning. Skipped when done or already sent.
 pub fn due_reminders(
     now: DateTime<Tz>,
     items: &[Item],
@@ -217,39 +235,47 @@ pub fn due_reminders(
     quiet: Option<(NaiveTime, NaiveTime)>,
 ) -> Vec<Due> {
     let local = now.naive_local();
-    let today = local.date();
-    let date = today.format("%Y-%m-%d").to_string();
     if in_quiet_hours(local.time(), quiet) {
         return Vec::new();
     }
+    let today = local.date();
     // Chores and habits are done per day. A to-do is done once, on whichever day it was
     // ticked (the app records the tick date, which can be before the due date).
     let todo_ids: HashSet<&str> = items.iter().filter(|i| i.kind == "todo").map(|i| i.id.as_str()).collect();
-    let done: HashSet<&str> = completions
-        .iter()
-        .filter(|c| c.deleted_at.is_none() && (c.date == date || todo_ids.contains(c.item_id.as_str())))
-        .map(|c| c.item_id.as_str())
-        .collect();
 
     let mut out = Vec::new();
-    for it in items.iter().filter(|i| i.active && i.deleted_at.is_none()) {
-        let Some(rt) = it.remind_time.as_deref().and_then(|t| NaiveTime::parse_from_str(t, "%H:%M").ok()) else {
-            continue;
-        };
-        let applies = match it.kind.as_str() {
-            "chore" | "habit" => it.weekdays & (1 << today.weekday().num_days_from_monday()) != 0,
-            "todo" => it.due_date.as_deref() == Some(date.as_str()),
-            _ => false,
-        };
-        if !applies || done.contains(it.id.as_str()) || sent.contains(&(it.id.clone(), date.clone())) {
-            continue;
+    for day in [today - ChronoDuration::days(1), today] {
+        let date = day.format("%Y-%m-%d").to_string();
+        let done: HashSet<&str> = completions
+            .iter()
+            .filter(|c| c.deleted_at.is_none() && (c.date == date || todo_ids.contains(c.item_id.as_str())))
+            .map(|c| c.item_id.as_str())
+            .collect();
+        for it in items.iter().filter(|i| i.active && i.deleted_at.is_none()) {
+            let Some(rt) = it.remind_time.as_deref().and_then(|t| NaiveTime::parse_from_str(t, "%H:%M").ok()) else {
+                continue;
+            };
+            let applies = match it.kind.as_str() {
+                "chore" | "habit" => it.weekdays & (1 << day.weekday().num_days_from_monday()) != 0,
+                "todo" => it.due_date.as_deref() == Some(date.as_str()),
+                _ => false,
+            };
+            if !applies || done.contains(it.id.as_str()) || sent.contains(&(it.id.clone(), date.clone())) {
+                continue;
+            }
+            let at = day.and_time(rt);
+            let from = release_time(at, quiet);
+            // Yesterday's reminders only matter when quiet hours held them over midnight;
+            // an ordinary missed one is still dropped at the day boundary.
+            if day < today && from == at {
+                continue;
+            }
+            let late = (local - from).num_minutes();
+            if late < 0 || late > grace_mins {
+                continue;
+            }
+            out.push(Due { item_id: it.id.clone(), name: it.name.clone(), kind: it.kind.clone(), date: date.clone() });
         }
-        let at = today.and_time(rt);
-        let late = (local - at).num_minutes();
-        if late < 0 || late > grace_mins {
-            continue;
-        }
-        out.push(Due { item_id: it.id.clone(), name: it.name.clone(), kind: it.kind.clone(), date: date.clone() });
     }
     out
 }
@@ -280,15 +306,19 @@ pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize
     );
     let now = tz.from_utc_datetime(&now_utc.naive_utc());
     let date = now.format("%Y-%m-%d").to_string();
+    let yesterday = (now.date_naive() - ChronoDuration::days(1)).format("%Y-%m-%d").to_string();
 
     let items = store::all_items(&st.db).await?;
-    let completions = store::reminder_completions(&st.db, &date).await?;
-    let sent: HashSet<(String, String)> = sqlx::query_as::<_, (String, String)>("SELECT item_id, date FROM reminders_sent WHERE date = ?")
-        .bind(&date)
-        .fetch_all(&st.db)
-        .await?
-        .into_iter()
-        .collect();
+    let mut completions = store::reminder_completions(&st.db, &date).await?;
+    completions.extend(store::reminder_completions(&st.db, &yesterday).await?);
+    let sent: HashSet<(String, String)> =
+        sqlx::query_as::<_, (String, String)>("SELECT item_id, date FROM reminders_sent WHERE date IN (?, ?)")
+            .bind(&date)
+            .bind(&yesterday)
+            .fetch_all(&st.db)
+            .await?
+            .into_iter()
+            .collect();
 
     let due = due_reminders(now, &items, &completions, &sent, st.config.reminder_grace_mins, quiet);
     if due.is_empty() {

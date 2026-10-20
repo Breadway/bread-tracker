@@ -106,6 +106,12 @@ class AppDb extends _$AppDb {
     await (update(completions)).write(const CompletionsCompanion(dirty: Value(true)));
   }
 
+  /// Delete every local item and completion (used when signing out and wiping the phone).
+  Future<void> clearAll() => transaction(() async {
+    await delete(completions).go();
+    await delete(items).go();
+  });
+
   Future<void> softDeleteItem(String id, int now) =>
       (update(items)..where((t) => t.id.equals(id))).write(
         ItemsCompanion(

@@ -117,7 +117,7 @@ void main() {
 
   test('offline keeps rows dirty; auth loss reports unpaired', () async {
     final server = FakeServer()..down = true;
-    final (db, sync, _) = await device(server);
+    final (db, sync, store) = await device(server);
     await db.upsertItem(ItemsCompanion.insert(id: id1, kind: 'habit', name: 'Read', points: 15, updatedAt: 1, dirty: const Value(true)));
     expect(await sync.sync(), SyncStatus.offline);
     expect(await (db.select(db.items)..where((t) => t.dirty.equals(true))).get(), hasLength(1));
@@ -126,8 +126,12 @@ void main() {
       ..down = false
       ..reject = true;
     expect(await sync.sync(), SyncStatus.unpaired);
+    expect(await store.token, isNull, reason: 'a revoked token is forgotten, not retried forever');
+    expect(await sync.sync(), SyncStatus.unpaired, reason: 'and nothing is sent without a token');
+    expect(await (db.select(db.items)..where((t) => t.dirty.equals(true))).get(), hasLength(1), reason: 'local data is kept');
 
     server.reject = false;
+    await store.saveToken('new');
     expect(await sync.sync(), SyncStatus.idle);
     expect(await (db.select(db.items)..where((t) => t.dirty.equals(true))).get(), isEmpty);
   });

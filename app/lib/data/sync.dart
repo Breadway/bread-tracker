@@ -58,6 +58,9 @@ class SyncEngine {
         [for (final c in dirtyComps) _compJson(c)],
       );
     } on AuthLost {
+      // The server no longer knows this token (device revoked). Forget it instead of
+      // retrying a dead credential forever; local data is kept for the next pairing.
+      await store.clearToken();
       return SyncStatus.unpaired;
     } on ApiException {
       return SyncStatus.offline;

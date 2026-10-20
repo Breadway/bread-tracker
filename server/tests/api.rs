@@ -568,3 +568,65 @@ async fn prune_removes_only_what_can_never_matter_again() {
     let again = store::prune(&h.state.db, now, 180).await.unwrap();
     assert_eq!(again, store::Pruned::default(), "idempotent");
 }
+
+#[tokio::test]
+async fn revoked_device_loses_access_immediately() {
+    use bread_tracker_server::devices::{self, Revoked};
+    let h = harness().await;
+    let phone = paired(&h).await;
+    let tablet = paired(&h).await;
+    let list = devices::list(&h.state.db).await.unwrap();
+    assert_eq!(list.len(), 2);
+
+    let (s, _) = call(&h.app, "GET", "/sync", Some(&phone), None).await;
+    assert_eq!(s, StatusCode::OK);
+    // Too short a prefix and unknown ids do nothing.
+    assert_eq!(devices::revoke(&h.state.db, "ab").await.unwrap(), Revoked::NotFound);
+    assert_eq!(devices::revoke(&h.state.db, "zzzzzzzz").await.unwrap(), Revoked::NotFound);
+    assert_eq!(devices::list(&h.state.db).await.unwrap().len(), 2);
+
+    // Revoke the first device by a unique prefix of its id.
+    let victim = &list[0];
+    let revoked = devices::revoke(&h.state.db, &victim.id[..8]).await.unwrap();
+    assert_eq!(revoked, Revoked::Removed(victim.name.clone()));
+    let (s, _) = call(&h.app, "GET", "/sync", Some(&phone), None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "revoked token is dead");
+    let (s, _) = call(&h.app, "GET", "/sync", Some(&tablet), None).await;
+    assert_eq!(s, StatusCode::OK, "the other device is untouched");
+}
+
+#[tokio::test]
+async fn ambiguous_prefix_revokes_nothing() {
+    use bread_tracker_server::devices::{self, Revoked};
+    let h = harness().await;
+    paired(&h).await;
+    paired(&h).await;
+    for (id, n) in [("aaaa1111-0000-4000-8000-000000000001", 1), ("aaaa1111-0000-4000-8000-000000000002", 2)] {
+        sqlx::query("INSERT INTO devices (id, name, token_hash, created_at, last_seen) VALUES (?, ?, ?, 0, 0)")
+            .bind(id).bind(format!("d{n}")).bind(format!("hash{n}"))
+            .execute(&h.state.db).await.unwrap();
+    }
+    assert_eq!(devices::revoke(&h.state.db, "aaaa1111").await.unwrap(), Revoked::Ambiguous(2));
+    assert_eq!(devices::list(&h.state.db).await.unwrap().len(), 4);
+    assert_eq!(devices::revoke(&h.state.db, "aaaa1111-0000-4000-8000-000000000002").await.unwrap(), Revoked::Removed("d2".into()));
+    assert_eq!(devices::list(&h.state.db).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn sign_out_revokes_only_the_calling_device() {
+    let h = harness().await;
+    let phone = paired(&h).await;
+    let other = paired(&h).await;
+    call(&h.app, "PUT", "/device", Some(&phone), Some(json!({"fcm_token": "fcm-phone"}))).await;
+    let (s, v) = call(&h.app, "DELETE", "/device", Some(&phone), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, _) = call(&h.app, "GET", "/sync", Some(&phone), None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _) = call(&h.app, "GET", "/sync", Some(&other), None).await;
+    assert_eq!(s, StatusCode::OK);
+    // Its push token went with it, so it is not reminded any more.
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE fcm_token = 'fcm-phone'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(n, 0);
+    let (s, _) = call(&h.app, "DELETE", "/device", None, None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "needs auth");
+}

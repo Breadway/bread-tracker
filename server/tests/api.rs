@@ -365,3 +365,86 @@ async fn half_set_quiet_window_is_rejected() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["quiet_start"], "");
 }
+
+#[tokio::test]
+async fn completion_dates_far_in_the_future_or_past_are_rejected() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    let far = (Utc::now() + Duration::days(30)).format("%Y-%m-%d").to_string();
+    let tomorrow = (Utc::now() + Duration::days(1)).format("%Y-%m-%d").to_string();
+    for bad in ["2999-01-01", far.as_str(), "1999-12-31"] {
+        let (s, _) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"completions": [comp(C1, bad, now, None)]}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    let (s, _) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"completions": [comp(C1, &tomorrow, now, None)]}))).await;
+    assert_eq!(s, StatusCode::OK, "a phone a day ahead is normal");
+}
+
+#[tokio::test]
+async fn completed_at_is_clamped_like_updated_at() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    let future = now + 400 * 86_400_000;
+    let mut c = comp(C1, "2026-10-19", now, None);
+    c["completed_at"] = json!(future);
+    let (_, v) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"completions": [c]}))).await;
+    let got = v["completions"][0]["completed_at"].as_i64().unwrap();
+    assert!(got <= now + 86_400_000 + 5_000, "completed_at {got} was not clamped");
+}
+
+#[tokio::test]
+async fn last_seen_is_written_at_most_once_per_interval() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let seen = |h: &Harness| {
+        let db = h.state.db.clone();
+        async move { sqlx::query_scalar::<_, i64>("SELECT last_seen FROM devices").fetch_one(&db).await.unwrap() }
+    };
+    // Pretend the device was last seen two minutes ago: the next request refreshes it.
+    sqlx::query("UPDATE devices SET last_seen = ?").bind(store::now_ms() - 120_000).execute(&h.state.db).await.unwrap();
+    call(&h.app, "GET", "/settings", Some(&tok), None).await;
+    let first = seen(&h).await;
+    assert!(first > store::now_ms() - 5_000, "stale last_seen was refreshed");
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    call(&h.app, "GET", "/settings", Some(&tok), None).await;
+    assert_eq!(seen(&h).await, first, "a request inside the interval does not write");
+}
+
+#[tokio::test]
+async fn prune_removes_only_what_can_never_matter_again() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    let day = 86_400_000;
+    let old = now - 200 * day;
+    let recent = now - 10 * day;
+    const C2: &str = "33333333-3333-4333-8333-333333333333";
+    let mut gone = item(C1, "chore", "Old gone", 127, None, old);
+    gone["deleted_at"] = json!(old);
+    let mut fresh_gone = item(C2, "chore", "Recently gone", 127, None, recent);
+    fresh_gone["deleted_at"] = json!(recent);
+    call(&h.app, "POST", "/sync", Some(&tok), Some(json!({
+        "items": [gone, fresh_gone, item(H1, "habit", "Kept", 127, None, now)],
+        "completions": [comp(C1, "2026-01-01", old, Some(old)), comp(C2, "2026-10-01", recent, Some(recent)), comp(H1, "2026-10-19", now, None)]
+    }))).await;
+    sqlx::query("INSERT INTO reminders_sent (item_id, date, sent_at) VALUES (?, '2020-01-01', 0), (?, ?, 0)")
+        .bind(H1).bind(H1).bind(Utc::now().format("%Y-%m-%d").to_string())
+        .execute(&h.state.db).await.unwrap();
+    sqlx::query("INSERT INTO pairing_codes (code_hash, expires_at) VALUES ('expired', ?), ('live', ?)")
+        .bind(now - 1000).bind(now + 600_000)
+        .execute(&h.state.db).await.unwrap();
+
+    let p = store::prune(&h.state.db, now, 180).await.unwrap();
+    assert_eq!((p.reminders, p.pairing_codes, p.items, p.completions), (1, 1, 1, 1), "{p:?}");
+
+    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM items ORDER BY id").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(ids, vec![H1.to_string(), C2.to_string()], "old tombstone gone, recent tombstone and live item kept");
+    let comps: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM completions").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(comps, 2);
+    let codes: Vec<String> = sqlx::query_scalar("SELECT code_hash FROM pairing_codes").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(codes, vec!["live".to_string()]);
+    let again = store::prune(&h.state.db, now, 180).await.unwrap();
+    assert_eq!(again, store::Pruned::default(), "idempotent");
+}

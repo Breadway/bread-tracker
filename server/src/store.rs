@@ -79,7 +79,7 @@ pub async fn apply_push(db: &Db, items: &[Item], completions: &[Completion]) -> 
         )
         .bind(&c.item_id)
         .bind(&c.date)
-        .bind(c.completed_at)
+        .bind(c.completed_at.min(ceiling))
         .bind(updated)
         .bind(c.deleted_at)
         .bind(seq)
@@ -140,6 +140,59 @@ pub async fn reminder_completions(db: &Db, date: &str) -> Result<Vec<Completion>
     .bind(date)
     .fetch_all(db)
     .await
+}
+
+/// Items the scheduler can remind about, instead of loading every row each tick.
+pub async fn reminder_items(db: &Db) -> Result<Vec<Item>, sqlx::Error> {
+    sqlx::query_as::<_, Item>(&format!(
+        "SELECT {ITEM_COLS} FROM items WHERE active = 1 AND deleted_at IS NULL AND remind_time IS NOT NULL"
+    ))
+    .fetch_all(db)
+    .await
+}
+
+/// How many rows a cleanup pass removed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Pruned {
+    pub reminders: u64,
+    pub items: u64,
+    pub completions: u64,
+    pub pairing_codes: u64,
+}
+
+/// Delete data that can never matter again: reminder bookkeeping older than two days,
+/// expired pairing codes, and tombstones older than `tombstone_days`. A tombstone only has
+/// to survive until every device has synced once after the delete, so the retention is long;
+/// a device that stays offline longer than that would keep a row that was deleted elsewhere.
+pub async fn prune(db: &Db, now: i64, tombstone_days: i64) -> Result<Pruned, sqlx::Error> {
+    let cutoff = now - tombstone_days * DAY_MS;
+    let day_before_yesterday = (chrono::DateTime::from_timestamp_millis(now).unwrap_or_default().date_naive()
+        - chrono::Duration::days(2))
+    .format("%Y-%m-%d")
+    .to_string();
+    let mut p = Pruned::default();
+    // reminders_sent.date is a local date in the user's zone, so keep a margin of days.
+    p.reminders = sqlx::query("DELETE FROM reminders_sent WHERE date < ?")
+        .bind(day_before_yesterday)
+        .execute(db)
+        .await?
+        .rows_affected();
+    p.pairing_codes = sqlx::query("DELETE FROM pairing_codes WHERE expires_at < ?")
+        .bind(now)
+        .execute(db)
+        .await?
+        .rows_affected();
+    p.completions = sqlx::query("DELETE FROM completions WHERE deleted_at IS NOT NULL AND deleted_at < ?")
+        .bind(cutoff)
+        .execute(db)
+        .await?
+        .rows_affected();
+    p.items = sqlx::query("DELETE FROM items WHERE deleted_at IS NOT NULL AND deleted_at < ?")
+        .bind(cutoff)
+        .execute(db)
+        .await?
+        .rows_affected();
+    Ok(p)
 }
 
 pub async fn get_setting(db: &Db, key: &str) -> Result<String, sqlx::Error> {

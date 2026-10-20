@@ -82,8 +82,9 @@ async fn sync(State(st): State<AppState>, Json(req): Json<SyncRequest>) -> ApiRe
     for it in &req.items {
         it.validate().map_err(ApiError::BadRequest)?;
     }
+    let today = Utc::now().date_naive();
     for c in &req.completions {
-        c.validate().map_err(ApiError::BadRequest)?;
+        c.validate(today).map_err(ApiError::BadRequest)?;
     }
     store::apply_push(&st.db, &req.items, &req.completions).await?;
     Ok(Json(store::pull(&st.db, req.since).await?))

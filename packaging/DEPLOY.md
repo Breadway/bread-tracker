@@ -10,6 +10,15 @@ docker exec bread-tracker bread-tracker-server pair   # one-time pairing code fo
 
 Run compose as the `breadway` user, not root.
 
+## Devices
+
+```sh
+docker exec bread-tracker bread-tracker-server devices          # id, name, last seen, push yes/no
+docker exec bread-tracker bread-tracker-server revoke 1a2b3c4d  # id or unique prefix (4+ chars)
+```
+
+A lost or sold phone: revoke it here. Its token stops working immediately and it is no longer sent reminders.
+
 ## Edge
 
 Hestia's own Caddy (LAN) and Aegis (public) both reverse-proxy `tracker.breadway.dev` to port 7290; the blocks live in the infra repo (`hestia/Caddyfile`, `aegis/Caddyfile`). Aegis reaches Hestia over Tailscale, so the container must bind an address Tailscale can reach: set `BREADTRACKER_BIND=0.0.0.0:7290` in `.env` (as breadboard does with 7280) or the Tailscale IP.

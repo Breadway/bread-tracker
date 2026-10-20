@@ -24,7 +24,7 @@ const MAX_BATCH: usize = 5000;
 pub fn router(state: AppState) -> Router {
     let authed = Router::new()
         .route("/sync", get(pull).post(sync))
-        .route("/device", put(set_device))
+        .route("/device", put(set_device).delete(sign_out))
         .route("/stats", get(stats))
         .route("/settings", get(get_settings).put(put_settings))
         .route("/push/test", post(push_test))
@@ -116,6 +116,15 @@ async fn set_device(
         .bind(&id)
         .execute(&st.db)
         .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Sign out: revoke the calling device. Its token stops working immediately.
+async fn sign_out(
+    State(st): State<AppState>,
+    Extension(DeviceId(id)): Extension<DeviceId>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::devices::revoke_self(&st.db, &id).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 

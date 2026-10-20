@@ -79,4 +79,7 @@ class Api {
       _send('PUT', '/device', {'fcm_token': token});
 
   Future<void> pushTest() => _send('POST', '/push/test');
+
+  /// Ask the server to revoke this device's token.
+  Future<void> signOut() => _send('DELETE', '/device');
 }

@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import 'package:drift/drift.dart' show Value;
 
+import 'data/api.dart';
 import 'data/database.dart';
 import 'data/store.dart';
 import 'data/sync.dart';
@@ -15,6 +16,7 @@ import 'fx/sfx.dart';
 import 'push.dart';
 import 'rules.dart';
 import 'theme.dart';
+import 'ui/pair.dart' show pairedProvider;
 
 final prefsProvider = Provider<SharedPreferences>(
   (ref) => throw UnimplementedError('override in main'),
@@ -27,6 +29,10 @@ final dbProvider = Provider<AppDb>((ref) {
 });
 final syncEngineProvider = Provider<SyncEngine>(
   (ref) => SyncEngine(ref.watch(dbProvider), ref.watch(storeProvider)),
+);
+/// How the controller builds an [Api] for one-off calls such as sign out. Tests override it.
+final apiFactoryProvider = Provider<Api Function(String base, String token)>(
+  (ref) => (base, token) => Api(base, token: token),
 );
 final sfxProvider = Provider<Sfx>((ref) => NoSfx());
 final pushProvider = Provider<PushService>((ref) => NoPushService());
@@ -155,6 +161,36 @@ class AppController {
     if (status != SyncStatus.syncing) {
       ref.read(syncStatusProvider.notifier).set(status);
     }
+    if (status == SyncStatus.unpaired) {
+      ref.invalidate(pairedProvider);
+      unawaited(ref.read(pushProvider).register());
+    }
+  }
+
+  /// Sign this phone out: ask the server to revoke the token (best effort, the phone may be
+  /// offline), forget the token and sync cursor, and optionally delete the local data.
+  /// Returns false when the server could not be told, so the caller can say the token may
+  /// still be valid until revoked from the server.
+  Future<bool> signOut({bool wipeLocal = false}) async {
+    final store = ref.read(storeProvider);
+    final token = await store.token;
+    var revoked = true;
+    if (token != null) {
+      try {
+        await ref.read(apiFactoryProvider)(store.serverUrl, token).signOut();
+      } on AuthLost {
+        // Already revoked on the server.
+      } catch (_) {
+        revoked = false;
+      }
+    }
+    await store.clearToken();
+    await store.resetSync();
+    if (wipeLocal) await _db.clearAll();
+    ref.read(syncStatusProvider.notifier).set(SyncStatus.unpaired);
+    ref.invalidate(pairedProvider);
+    unawaited(ref.read(pushProvider).register());
+    return revoked;
   }
 
   Future<void> toggle(ItemRow item, DateTime date, {Offset? at}) async {

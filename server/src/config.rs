@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use crate::push::PushMode;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub listen: String,
@@ -10,6 +12,8 @@ pub struct Config {
     pub fcm_service_account: Option<PathBuf>,
     /// Reminders older than this are dropped instead of sent late (server downtime guard).
     pub reminder_grace_mins: i64,
+    /// `notification` (default) or `data`; see `push::PushMode`.
+    pub push_mode: PushMode,
 }
 
 impl Config {
@@ -24,6 +28,14 @@ impl Config {
             reminder_grace_mins: get("BREADTRACKER_REMINDER_GRACE_MINS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(360),
+            push_mode: get("BREADTRACKER_PUSH_MODE")
+                .map(|v| {
+                    PushMode::parse(&v).unwrap_or_else(|| {
+                        eprintln!("ignoring invalid BREADTRACKER_PUSH_MODE {v:?}, using notification");
+                        PushMode::Notification
+                    })
+                })
+                .unwrap_or_default(),
         }
     }
 

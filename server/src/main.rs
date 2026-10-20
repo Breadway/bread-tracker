@@ -29,7 +29,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let sender: Arc<dyn push::PushSender> = match &config.fcm_service_account {
-        Some(path) => Arc::new(push::Fcm::from_file(path).context("loading FCM service account")?),
+        Some(path) => {
+            tracing::info!(mode = ?config.push_mode, "push delivery mode");
+            Arc::new(push::Fcm::from_file(path, config.push_mode).context("loading FCM service account")?)
+        },
         None => {
             tracing::warn!("BREADTRACKER_FCM_SERVICE_ACCOUNT unset: push reminders are disabled");
             Arc::new(push::NoPush)

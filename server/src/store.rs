@@ -171,6 +171,7 @@ pub struct Pruned {
 /// expired pairing codes, and tombstones older than `tombstone_days`. A tombstone only has
 /// to survive until every device has synced once after the delete, so the retention is long;
 /// a device that stays offline longer than that would keep a row that was deleted elsewhere.
+#[allow(clippy::field_reassign_with_default)]
 pub async fn prune(db: &Db, now: i64, tombstone_days: i64) -> Result<Pruned, sqlx::Error> {
     let cutoff = now - tombstone_days * DAY_MS;
     let day_before_yesterday = (chrono::DateTime::from_timestamp_millis(now).unwrap_or_default().date_naive()

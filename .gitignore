@@ -4,7 +4,7 @@
 *.db-wal
 .env
 /backups
-# Flutter / Android (app/ is added in a later milestone)
+# Flutter / Android
 app/build/
 app/.dart_tool/
 app/android/app/google-services.json

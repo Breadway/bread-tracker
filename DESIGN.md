@@ -1,7 +1,7 @@
 # Bread Tracker design
 
 Separate from the Nextcloud Chores calendar and the Gotify cron reminders. Server and
-database live on Hestia; the Android app (Flutter) is offline-first and syncs to it.
+database live on a server you host; the Android app (Flutter) is offline-first and syncs to it.
 
 ## Rules (shared by server `server/src/xp.rs` and the app; vectors in `spec/xp_vectors.json`)
 

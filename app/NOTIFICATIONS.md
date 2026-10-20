@@ -17,7 +17,7 @@ The APK is `app/build/app/outputs/flutter-apk/app-debug.apk` relative to the
 repository root. It is a debug build, not a signed production release.
 
 Android builds require the gitignored `android/app/google-services.json` for
-Firebase project `bread-tracker-df441`, package `dev.breadway.tracker`. This client
+your Firebase project, package `dev.breadway.tracker`. This client
 configuration is not the server service-account private key. Never put the
 service-account key in the app or repository.
 
@@ -49,6 +49,6 @@ foreground. **Mark done from a notification is not implemented yet.**
 - Deny notification permission, then enable it in Android settings and retry.
 - Pair without notification permission, then enable it and confirm registration.
 - Complete an item offline and verify sync after reconnecting.
-- Confirm scheduled reminders use Perth time and skip completed items.
+- Confirm scheduled reminders use the configured timezone and skip completed items.
 - Test under Doze. Android force-stop is different from swiping away and can
   prevent delivery until the app is opened again.

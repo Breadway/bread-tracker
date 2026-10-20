@@ -102,9 +102,9 @@ class SettingsScreen extends ConsumerWidget {
           const Spacer8(),
           PanelButton(
             icon: Icons.playlist_add_rounded,
-            title: 'Add starter chores',
+            title: 'Add example chores',
             subtitle:
-                'The weekly household schedule, skipping any already added',
+                'A few generic weekly chores, skipping any already added',
             onTap: () async =>
                 toast('Added ${await ctl.addStarterChores()} chores'),
           ),

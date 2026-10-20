@@ -1,0 +1,43 @@
+# bread-tracker as a container on Hestia (build runs in the Containerfile, no host toolchain).
+#
+#   docker compose -f packaging/compose.yaml --project-directory . up -d --build
+#
+# Optional secrets/settings go in .env (NOT committed):
+#   BREADTRACKER_BIND=127.0.0.1:7290            host bind (Aegis reaches it over Tailscale, see DEPLOY.md)
+#   BREADTRACKER_BACKUP_DIR=/var/backups/bread-tracker
+#   BREADTRACKER_FCM_KEY_FILE=/home/breadway/secrets/bread-tracker-fcm.json   Firebase service account
+#
+# Pair a phone:  docker exec bread-tracker bread-tracker-server pair
+
+services:
+  bread-tracker:
+    build:
+      context: .
+      dockerfile: packaging/Containerfile
+    image: bread-tracker:local
+    container_name: bread-tracker
+    restart: unless-stopped
+    ports:
+      - "${BREADTRACKER_BIND:-127.0.0.1:7290}:7290"
+    environment:
+      BREADTRACKER_FCM_SERVICE_ACCOUNT: ${BREADTRACKER_FCM_SERVICE_ACCOUNT:-}
+    volumes:
+      - bread-tracker-data:/var/lib/bread-tracker
+      # FCM service account, mounted read-only when BREADTRACKER_FCM_KEY_FILE is set.
+      - ${BREADTRACKER_FCM_KEY_FILE:-/dev/null}:/run/secrets/fcm.json:ro
+
+  # Continuous SQLite backup, same pattern as breadboard. Restore: packaging/DEPLOY.md.
+  litestream:
+    image: litestream/litestream:0.3.13
+    container_name: bread-tracker-litestream
+    restart: unless-stopped
+    command: ["replicate"]
+    volumes:
+      - bread-tracker-data:/var/lib/bread-tracker
+      - ${BREADTRACKER_BACKUP_DIR:-./backups}:/var/backups/bread-tracker
+      - ./packaging/litestream.yml:/etc/litestream.yml:ro
+    depends_on:
+      - bread-tracker
+
+volumes:
+  bread-tracker-data:

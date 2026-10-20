@@ -1,0 +1,14 @@
+/target
+*.db
+*.db-shm
+*.db-wal
+.env
+/backups
+# Flutter / Android (app/ is added in a later milestone)
+app/build/
+app/.dart_tool/
+app/android/app/google-services.json
+app/android/key.properties
+*.jks
+*.keystore
+service-account*.json

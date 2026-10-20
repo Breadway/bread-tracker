@@ -1,0 +1,9 @@
+# Litestream replication for the bread-tracker SQLite database (see packaging/compose.yaml).
+# Restore:  litestream restore -o /path/to/bread-tracker.db file:///var/backups/bread-tracker/litestream
+dbs:
+  - path: /var/lib/bread-tracker/bread-tracker.db
+    replicas:
+      - type: file
+        path: /var/backups/bread-tracker/litestream
+        retention: 168h
+        snapshot-interval: 24h

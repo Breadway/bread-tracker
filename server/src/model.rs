@@ -1,0 +1,90 @@
+//! Wire and storage types, with validation for client-supplied rows.
+
+use chrono::{NaiveDate, NaiveTime};
+use serde::{Deserialize, Serialize};
+
+pub const KINDS: [&str; 3] = ["chore", "habit", "todo"];
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Item {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub weekdays: i64,
+    pub remind_time: Option<String>,
+    pub points: i64,
+    pub due_date: Option<String>,
+    pub sort: i64,
+    pub active: bool,
+    pub updated_at: i64,
+    pub deleted_at: Option<i64>,
+    #[serde(default)]
+    pub seq: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Completion {
+    pub item_id: String,
+    pub date: String,
+    pub completed_at: i64,
+    pub updated_at: i64,
+    pub deleted_at: Option<i64>,
+    #[serde(default)]
+    pub seq: i64,
+}
+
+fn bad(msg: &str) -> String {
+    msg.to_string()
+}
+
+impl Item {
+    pub fn validate(&self) -> Result<(), String> {
+        uuid::Uuid::parse_str(&self.id).map_err(|_| bad("item id must be a uuid"))?;
+        if !KINDS.contains(&self.kind.as_str()) {
+            return Err(bad("item kind must be chore, habit or todo"));
+        }
+        let name = self.name.trim();
+        if name.is_empty() || name.chars().count() > 200 {
+            return Err(bad("item name must be 1 to 200 characters"));
+        }
+        if !(0..=127).contains(&self.weekdays) {
+            return Err(bad("weekdays must be a 7-bit mask"));
+        }
+        if let Some(t) = &self.remind_time {
+            NaiveTime::parse_from_str(t, "%H:%M").map_err(|_| bad("remind_time must be HH:MM"))?;
+        }
+        if let Some(d) = &self.due_date {
+            NaiveDate::parse_from_str(d, "%Y-%m-%d").map_err(|_| bad("due_date must be YYYY-MM-DD"))?;
+        }
+        if !(0..=1000).contains(&self.points) {
+            return Err(bad("points must be 0 to 1000"));
+        }
+        Ok(())
+    }
+}
+
+impl Completion {
+    pub fn validate(&self) -> Result<(), String> {
+        uuid::Uuid::parse_str(&self.item_id).map_err(|_| bad("completion item_id must be a uuid"))?;
+        NaiveDate::parse_from_str(&self.date, "%Y-%m-%d").map_err(|_| bad("date must be YYYY-MM-DD"))?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct SyncRequest {
+    #[serde(default)]
+    pub since: i64,
+    #[serde(default)]
+    pub items: Vec<Item>,
+    #[serde(default)]
+    pub completions: Vec<Completion>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SyncResponse {
+    pub cursor: i64,
+    pub items: Vec<Item>,
+    pub completions: Vec<Completion>,
+    pub server_time: i64,
+}

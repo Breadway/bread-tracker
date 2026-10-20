@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
+use std::net::SocketAddr;
+
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use bread_tracker_server::config::Config;
@@ -41,6 +44,17 @@ async fn call(app: &Router, method: &str, uri: &str, token: Option<&str>, body: 
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, json)
+}
+
+/// Like `call`, but as a request from a given peer address, optionally with X-Forwarded-For.
+async fn call_from(app: &Router, peer: &str, xff: Option<&str>, uri: &str, body: Value) -> StatusCode {
+    let mut req = Request::builder().method("POST").uri(uri).header("content-type", "application/json");
+    if let Some(x) = xff {
+        req = req.header("x-forwarded-for", x);
+    }
+    let mut req = req.body(Body::from(body.to_string())).unwrap();
+    req.extensions_mut().insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+    app.clone().oneshot(req).await.unwrap().status()
 }
 
 async fn paired(h: &Harness) -> String {
@@ -266,4 +280,76 @@ async fn push_test_route_needs_a_registered_token() {
     let (s, v) = call(&h.app, "POST", "/push/test", Some(&tok), None).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(h.mock.sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn failed_pair_attempts_from_one_source_do_not_block_another() {
+    let h = harness().await;
+    let bad = json!({"code": "AAAA-BBBB"});
+    for _ in 0..5 {
+        assert_eq!(call_from(&h.app, "203.0.113.9:5000", None, "/pair", bad.clone()).await, StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(call_from(&h.app, "203.0.113.9:5001", None, "/pair", bad.clone()).await, StatusCode::TOO_MANY_REQUESTS);
+
+    // A different source can still pair with a valid code.
+    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    let ok = call_from(&h.app, "198.51.100.7:4000", None, "/pair", json!({"code": code})).await;
+    assert_eq!(ok, StatusCode::OK);
+
+    // The blocked source is refused even with a valid code until its window passes.
+    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    let blocked = call_from(&h.app, "203.0.113.9:5002", None, "/pair", json!({"code": code})).await;
+    assert_eq!(blocked, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn successful_pairings_do_not_count_against_the_limit() {
+    let h = harness().await;
+    for _ in 0..8 {
+        let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+        let s = call_from(&h.app, "203.0.113.9:5000", None, "/pair", json!({"code": code})).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn forwarded_for_is_only_believed_from_a_trusted_proxy() {
+    use bread_tracker_server::auth::TrustedProxy;
+    let bad = json!({"code": "AAAA-BBBB"});
+
+    // Untrusted peer: it cannot dodge the limit by rotating X-Forwarded-For.
+    let h = harness().await;
+    for i in 0..5 {
+        let xff = format!("10.9.9.{i}");
+        call_from(&h.app, "203.0.113.9:5000", Some(&xff), "/pair", bad.clone()).await;
+    }
+    assert_eq!(call_from(&h.app, "203.0.113.9:5000", Some("10.9.9.99"), "/pair", bad.clone()).await, StatusCode::TOO_MANY_REQUESTS);
+
+    // Trusted proxy (100.64.0.0/10): the client in X-Forwarded-For is the key.
+    let db = db::connect_memory().await.unwrap();
+    let mut config = Config::from_env();
+    config.trusted_proxies = vec![TrustedProxy::parse("100.64.0.0/10").unwrap()];
+    let state = AppState::new(db, config, Arc::new(MockSender::default()));
+    let app = api::router(state.clone());
+    for _ in 0..5 {
+        call_from(&app, "100.100.1.1:4000", Some("203.0.113.50"), "/pair", bad.clone()).await;
+    }
+    assert_eq!(call_from(&app, "100.100.1.1:4000", Some("203.0.113.50"), "/pair", bad.clone()).await, StatusCode::TOO_MANY_REQUESTS);
+    let code = auth::create_pairing_code(&state.db).await.unwrap();
+    let other = call_from(&app, "100.100.1.1:4000", Some("203.0.113.51"), "/pair", json!({"code": code})).await;
+    assert_eq!(other, StatusCode::OK, "the real user behind the same proxy is unaffected");
+}
+
+#[test]
+fn client_ip_resolution() {
+    use bread_tracker_server::auth::{client_ip, TrustedProxy};
+    let trusted = [TrustedProxy::parse("10.0.0.0/8").unwrap(), TrustedProxy::parse("::1").unwrap()];
+    let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    assert_eq!(client_ip(ip("1.2.3.4"), Some("9.9.9.9"), &trusted), ip("1.2.3.4"), "untrusted peer");
+    assert_eq!(client_ip(ip("10.0.0.2"), None, &trusted), ip("10.0.0.2"), "no header");
+    assert_eq!(client_ip(ip("10.0.0.2"), Some("5.5.5.5"), &trusted), ip("5.5.5.5"));
+    assert_eq!(client_ip(ip("10.0.0.2"), Some("6.6.6.6, 5.5.5.5, 10.0.0.9"), &trusted), ip("5.5.5.5"), "spoofed left entry ignored");
+    assert_eq!(client_ip(ip("10.0.0.2"), Some("garbage"), &trusted), ip("10.0.0.2"));
+    assert!(TrustedProxy::parse("10.0.0.0/33").is_none());
+    assert!(TrustedProxy::parse("nope").is_none());
 }

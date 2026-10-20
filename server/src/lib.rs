@@ -22,7 +22,7 @@ pub struct AppState {
     pub db: Db,
     pub config: Arc<Config>,
     pub push: Arc<dyn PushSender>,
-    pub pair_limiter: Arc<auth::PairLimiter>,
+    pub pair_limiter: Arc<auth::FailureLimiter>,
 }
 
 impl AppState {
@@ -31,7 +31,7 @@ impl AppState {
             db,
             config: Arc::new(config),
             push,
-            pair_limiter: Arc::new(auth::PairLimiter::new(5, Duration::from_secs(600))),
+            pair_limiter: Arc::new(auth::FailureLimiter::new(5, Duration::from_secs(600))),
         }
     }
 }

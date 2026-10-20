@@ -63,10 +63,21 @@ impl Item {
     }
 }
 
+/// Completions dated further ahead of the server's UTC date than this are refused. Real
+/// phones are at most about a day ahead (time zones); the rest is margin for clock error.
+pub const MAX_COMPLETION_DAYS_AHEAD: i64 = 7;
+/// Nothing in this app predates this, so an earlier date is a bug or garbage.
+pub const EARLIEST_COMPLETION_DATE: (i32, u32, u32) = (2020, 1, 1);
+
 impl Completion {
-    pub fn validate(&self) -> Result<(), String> {
+    /// `today` is the server's current UTC date.
+    pub fn validate(&self, today: NaiveDate) -> Result<(), String> {
         uuid::Uuid::parse_str(&self.item_id).map_err(|_| bad("completion item_id must be a uuid"))?;
-        NaiveDate::parse_from_str(&self.date, "%Y-%m-%d").map_err(|_| bad("date must be YYYY-MM-DD"))?;
+        let date = NaiveDate::parse_from_str(&self.date, "%Y-%m-%d").map_err(|_| bad("date must be YYYY-MM-DD"))?;
+        let (y, m, d) = EARLIEST_COMPLETION_DATE;
+        if date > today + chrono::Duration::days(MAX_COMPLETION_DAYS_AHEAD) || date < NaiveDate::from_ymd_opt(y, m, d).unwrap() {
+            return Err(bad("completion date is out of range"));
+        }
         Ok(())
     }
 }

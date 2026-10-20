@@ -14,6 +14,8 @@ pub struct Config {
     pub reminder_grace_mins: i64,
     /// Reverse proxies (IPs or CIDRs) whose `X-Forwarded-For` is believed. Empty = never.
     pub trusted_proxies: Vec<TrustedProxy>,
+    /// Soft-deleted rows older than this many days are removed for good.
+    pub tombstone_days: i64,
 }
 
 impl Config {
@@ -42,6 +44,10 @@ impl Config {
                         .collect()
                 })
                 .unwrap_or_default(),
+            tombstone_days: get("BREADTRACKER_TOMBSTONE_DAYS")
+                .and_then(|v| v.parse().ok())
+                .filter(|d| *d >= 1)
+                .unwrap_or(180),
         }
     }
 

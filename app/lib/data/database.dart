@@ -84,6 +84,13 @@ class AppDb extends _$AppDb {
     );
   }
 
+  /// Mark every local row as unsynced so the next sync pushes all of them. Safe because the
+  /// server keeps whichever copy has the newer `updated_at`.
+  Future<void> markAllDirty() async {
+    await (update(items)).write(const ItemsCompanion(dirty: Value(true)));
+    await (update(completions)).write(const CompletionsCompanion(dirty: Value(true)));
+  }
+
   Future<void> softDeleteItem(String id, int now) =>
       (update(items)..where((t) => t.id.equals(id))).write(
         ItemsCompanion(

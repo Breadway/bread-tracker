@@ -100,6 +100,13 @@ pub async fn pull(db: &Db, since: i64) -> Result<SyncResponse, sqlx::Error> {
     let cursor: i64 = sqlx::query_scalar("SELECT val FROM meta WHERE key = 'seq'")
         .fetch_one(&mut *tx)
         .await?;
+    // A cursor ahead of the database means it was restored from an older copy. Serve
+    // everything; the client also notices cursor < its own and starts over.
+    let since = if since > cursor { 0 } else { since };
+    let epoch: i64 = sqlx::query_scalar("SELECT val FROM meta WHERE key = 'epoch'")
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(0);
     let items = sqlx::query_as::<_, Item>(&format!(
         "SELECT {ITEM_COLS} FROM items WHERE seq > ? AND seq <= ? ORDER BY seq"
     ))
@@ -115,7 +122,7 @@ pub async fn pull(db: &Db, since: i64) -> Result<SyncResponse, sqlx::Error> {
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(SyncResponse { cursor, items, completions, server_time: now_ms() })
+    Ok(SyncResponse { epoch: epoch.to_string(), cursor, items, completions, server_time: now_ms() })
 }
 
 pub async fn all_items(db: &Db) -> Result<Vec<Item>, sqlx::Error> {

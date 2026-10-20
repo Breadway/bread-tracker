@@ -38,7 +38,7 @@ class SyncEngine {
     }
   }
 
-  Future<SyncStatus> _once() async {
+  Future<SyncStatus> _once({bool afterReset = false}) async {
     final token = await store.token;
     if (token == null) return SyncStatus.unpaired;
     final api = _apiFactory(store.serverUrl, token);
@@ -62,6 +62,22 @@ class SyncEngine {
     } on ApiException {
       return SyncStatus.offline;
     }
+
+    // The cursor only means something against the database it came from. If the server is a
+    // different database (new epoch), or went backwards (restored from an older copy), the
+    // phone's cursor is meaningless and the server may be missing rows the phone has. Start
+    // over: cursor 0 and push everything (last write wins makes that safe).
+    final epoch = res['epoch'] as String?;
+    final serverCursor = res['cursor'] as int;
+    final known = store.epoch;
+    final changed = (epoch != null && known != null && epoch != known) || serverCursor < store.cursor;
+    if (changed && !afterReset) {
+      await store.resetSync();
+      await db.markAllDirty();
+      if (epoch != null) await store.setEpoch(epoch);
+      return _once(afterReset: true);
+    }
+    if (epoch != null && known == null) await store.setEpoch(epoch);
 
     await db.transaction(() async {
       // Rows unchanged since we pushed them are now clean.

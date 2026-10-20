@@ -5,7 +5,7 @@
 # Optional secrets/settings go in .env (NOT committed):
 #   BREADTRACKER_BIND=127.0.0.1:7290            host bind (Aegis reaches it over Tailscale, see DEPLOY.md)
 #   BREADTRACKER_BACKUP_DIR=/var/backups/bread-tracker
-#   BREADTRACKER_FCM_KEY_FILE=/home/breadway/secrets/bread-tracker-fcm.json   Firebase service account
+#   BREADTRACKER_FCM_KEY_FILE=/path/to/secrets/bread-tracker-fcm.json   Firebase service account
 #   BREADTRACKER_UID / BREADTRACKER_GID         user the server runs as (default 10001:10001). The FCM key
 #                                               file must be readable by it: chown it to that uid, or set
 #                                               these to the file's owner (see DEPLOY.md).

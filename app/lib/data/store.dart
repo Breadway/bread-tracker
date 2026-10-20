@@ -20,7 +20,15 @@ class Store {
 
   int get cursor => prefs.getInt('cursor') ?? 0;
   Future<void> setCursor(int v) => prefs.setInt('cursor', v);
-  Future<void> resetSync() => prefs.remove('cursor');
+  /// Identity of the server database the cursor belongs to (null until first sync).
+  String? get epoch => prefs.getString('epoch');
+  Future<void> setEpoch(String v) => prefs.setString('epoch', v);
+
+  /// Forget the cursor and the server identity, so the next sync pulls everything.
+  Future<void> resetSync() async {
+    await prefs.remove('cursor');
+    await prefs.remove('epoch');
+  }
 
   bool get sound => prefs.getBool('sound') ?? true;
   Future<void> setSound(bool v) => prefs.setBool('sound', v);

@@ -54,6 +54,8 @@ class _PairScreenState extends ConsumerState<PairScreen> {
       await store.setServerUrl(server);
       await store.saveToken(token);
       await store.resetSync();
+      // A (re)paired server may be empty or rebuilt, so offer it everything we have.
+      await ref.read(dbProvider).markAllDirty();
       ref.invalidate(pairedProvider);
       ref.read(controllerProvider).syncNow();
       ref.read(pushProvider).register(requestPermission: true);

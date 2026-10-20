@@ -20,7 +20,22 @@ pub async fn connect(database_url: &str) -> anyhow::Result<Db> {
         .await?;
 
     sqlx::migrate!("../migrations").run(&pool).await?;
+    ensure_epoch(&pool).await?;
     Ok(pool)
+}
+
+/// Give the database a random identity the first time it is opened and keep it afterwards.
+/// Clients remember it: a different value means this is not the database they synced with
+/// (rebuilt or replaced server), so they must start over. Stored in `meta` as an integer
+/// small enough to survive JSON in any client.
+pub async fn ensure_epoch(db: &Db) -> anyhow::Result<()> {
+    use rand::Rng;
+    let epoch: i64 = rand::thread_rng().gen_range(1..(1i64 << 48));
+    sqlx::query("INSERT OR IGNORE INTO meta (key, val) VALUES ('epoch', ?)")
+        .bind(epoch)
+        .execute(db)
+        .await?;
+    Ok(())
 }
 
 /// Fresh in-memory database for tests (single connection so all queries share it).
@@ -28,5 +43,6 @@ pub async fn connect_memory() -> anyhow::Result<Db> {
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")?.foreign_keys(true);
     let pool = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await?;
     sqlx::migrate!("../migrations").run(&pool).await?;
+    ensure_epoch(&pool).await?;
     Ok(pool)
 }

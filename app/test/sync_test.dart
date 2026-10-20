@@ -16,6 +16,15 @@ class FakeServer {
   final comps = <String, Map<String, dynamic>>{};
   bool reject = false;
   bool down = false;
+  String epoch = 'epoch-1';
+
+  /// A rebuilt server: empty database, new identity, counter back at zero.
+  void rebuild(String newEpoch) {
+    seq = 0;
+    items.clear();
+    comps.clear();
+    epoch = newEpoch;
+  }
 
   Map<String, dynamic> sync(int since, List<Map<String, dynamic>> pi, List<Map<String, dynamic>> pc) {
     if (down) throw ApiException('Cannot reach the server');
@@ -31,7 +40,10 @@ class FakeServer {
       if (e != null && e['updated_at'] >= c['updated_at']) continue;
       comps[k] = {...c, 'seq': ++seq};
     }
+    // Mirror the real server: a cursor ahead of the database means "send everything".
+    if (since > seq) since = 0;
     return {
+      'epoch': epoch,
       'cursor': seq,
       'items': items.values.where((i) => i['seq'] > since).toList(),
       'completions': comps.values.where((c) => c['seq'] > since).toList(),
@@ -145,6 +157,84 @@ void main() {
     await expectLater(json.pushTest(), throwsA(isA<ApiException>().having((e) => e.message, 'message', 'nope')));
     final html = Api('http://x', token: 't', client: MockClient((_) async => http.Response('<html/>', 502)));
     await expectLater(html.pushTest(), throwsA(isA<ApiException>().having((e) => e.message, 'message', 'Server error 502')));
+  });
+
+  test('a rebuilt server (new epoch) receives everything the phone already had', () async {
+    final server = FakeServer();
+    final (db, sync, store) = await device(server);
+    await db.upsertItem(ItemsCompanion.insert(id: id1, kind: 'chore', name: 'Dishes', points: 10, updatedAt: 1000, dirty: const Value(true)));
+    await db.setCompletion(id1, '2026-10-19', true, 2000);
+    expect(await sync.sync(), SyncStatus.idle);
+    expect(store.epoch, 'epoch-1');
+    expect(await (db.select(db.items)..where((t) => t.dirty.equals(true))).get(), isEmpty, reason: 'clean after the first sync');
+
+    // The server is lost and rebuilt empty; its counter starts again from zero.
+    server.rebuild('epoch-2');
+    expect(await sync.sync(), SyncStatus.idle);
+    expect(server.epoch, 'epoch-2');
+    expect(server.items.keys, [id1], reason: 'the item was pushed again');
+    expect(server.comps.length, 1, reason: 'and so was the completion');
+    expect(store.epoch, 'epoch-2');
+    expect(store.cursor, server.seq);
+    expect(await (db.select(db.items)..where((t) => t.dirty.equals(true))).get(), isEmpty);
+  });
+
+  test('a restored older copy (same epoch, cursor went backwards) is repopulated and read again', () async {
+    final server = FakeServer();
+    final (db, sync, store) = await device(server);
+    for (var i = 0; i < 3; i++) {
+      final id = '1111111$i-1111-4111-8111-111111111111';
+      await db.upsertItem(ItemsCompanion.insert(id: id, kind: 'chore', name: 'c$i', points: 10, updatedAt: 1000 + i, dirty: const Value(true)));
+    }
+    await sync.sync();
+    expect(store.cursor, 3);
+
+    // Restore from a replica that only had the first item: counter goes back to 1, same epoch.
+    final keep = server.items.entries.first;
+    server.items
+      ..clear()
+      ..[keep.key] = {...keep.value, 'seq': 1};
+    server.seq = 1;
+    expect(await sync.sync(), SyncStatus.idle);
+    expect(server.items.length, 3, reason: 'rows missing from the restored copy came back from the phone');
+    expect(store.cursor, server.seq);
+
+    // Rows written elsewhere after the restore are seen even though their seq is below the old cursor.
+    server.items['22222222-2222-4222-8222-222222222222'] = {
+      'id': '22222222-2222-4222-8222-222222222222', 'kind': 'chore', 'name': 'from B', 'weekdays': 127,
+      'remind_time': null, 'points': 10, 'due_date': null, 'sort': 0, 'active': true,
+      'updated_at': 5000, 'deleted_at': null, 'seq': ++server.seq,
+    };
+    await sync.sync();
+    expect((await db.select(db.items).get()).map((i) => i.name), contains('from B'));
+  });
+
+  test('an unchanged server does not trigger a full re-push', () async {
+    final server = FakeServer();
+    final (db, sync, _) = await device(server);
+    await db.upsertItem(ItemsCompanion.insert(id: id1, kind: 'chore', name: 'Dishes', points: 10, updatedAt: 1000, dirty: const Value(true)));
+    await sync.sync();
+    final seqAfterFirst = server.seq;
+    await sync.sync();
+    await sync.sync();
+    expect(server.seq, seqAfterFirst, reason: 'nothing was pushed again');
+  });
+
+  test('pairing marks all local rows for a full push', () async {
+    final server = FakeServer();
+    final (db, _, store) = await device(server);
+    await db.upsertItem(ItemsCompanion.insert(id: id1, kind: 'chore', name: 'Dishes', points: 10, updatedAt: 1000));
+    await db.setCompletion(id1, '2026-10-19', true, 2000);
+    await (db.update(db.completions)).write(const CompletionsCompanion(dirty: Value(false)));
+    await store.setCursor(40);
+    await store.setEpoch('old');
+    // This is what the pairing screen does after a successful pair.
+    await store.resetSync();
+    await db.markAllDirty();
+    expect(store.cursor, 0);
+    expect(store.epoch, isNull);
+    expect(await (db.select(db.items)..where((t) => t.dirty.equals(true))).get(), hasLength(1));
+    expect(await (db.select(db.completions)..where((t) => t.dirty.equals(true))).get(), hasLength(1));
   });
 
   test('an edit made while a sync is in flight stays dirty', () async {

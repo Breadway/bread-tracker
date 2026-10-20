@@ -83,6 +83,9 @@ pub struct SyncRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SyncResponse {
+    /// Identity of this database; see `db::ensure_epoch`. Clients reset when it changes.
+    #[serde(default)]
+    pub epoch: String,
     pub cursor: i64,
     pub items: Vec<Item>,
     pub completions: Vec<Completion>,

@@ -267,3 +267,37 @@ async fn push_test_route_needs_a_registered_token() {
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(h.mock.sent.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn sync_reports_a_stable_epoch_that_differs_between_databases() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let (_, a) = call(&h.app, "GET", "/sync", Some(&tok), None).await;
+    let epoch = a["epoch"].as_str().unwrap().to_string();
+    assert!(!epoch.is_empty() && epoch != "0");
+    let now = store::now_ms();
+    let (_, b) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"items": [item(C1, "chore", "x", 127, None, now)]}))).await;
+    assert_eq!(b["epoch"], epoch, "writes do not change it");
+
+    // Opening the same database again keeps it; a different database gets its own.
+    bread_tracker_server::db::ensure_epoch(&h.state.db).await.unwrap();
+    let (_, c) = call(&h.app, "GET", "/sync", Some(&tok), None).await;
+    assert_eq!(c["epoch"], epoch);
+    let other = harness().await;
+    let tok2 = paired(&other).await;
+    let (_, d) = call(&other.app, "GET", "/sync", Some(&tok2), None).await;
+    assert_ne!(d["epoch"], epoch);
+}
+
+#[tokio::test]
+async fn a_cursor_ahead_of_the_database_gets_everything() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"items": [item(C1, "chore", "x", 127, None, now)]}))).await;
+    // A phone that synced against a later state of a database that was then restored from an older copy.
+    let (s, v) = call(&h.app, "GET", "/sync?since=999999", Some(&tok), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["items"].as_array().unwrap().len(), 1, "full pull instead of an empty one");
+    assert!(v["cursor"].as_i64().unwrap() < 999999, "cursor tells the client the database went backwards");
+}

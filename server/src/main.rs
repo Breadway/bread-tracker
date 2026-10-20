@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = listen.parse().context("parsing BREADTRACKER_LISTEN")?;
     let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("binding {addr}"))?;
     tracing::info!(%addr, "listening");
-    axum::serve(listener, api::router(state))
+    axum::serve(listener, api::router(state).into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("server error")

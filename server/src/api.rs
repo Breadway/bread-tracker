@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::auth::{self, DeviceId};
+use crate::auth::{self, ClientIp, DeviceId};
 use crate::error::{ApiError, ApiResult};
 use crate::model::{SyncRequest, SyncResponse};
 use crate::push::{Message, SendOutcome};
@@ -52,15 +52,23 @@ struct PairResp {
     token: String,
 }
 
-async fn pair(State(st): State<AppState>, Json(req): Json<PairReq>) -> ApiResult<Json<PairResp>> {
-    if !st.pair_limiter.check() {
+async fn pair(
+    State(st): State<AppState>,
+    ClientIp(src): ClientIp,
+    Json(req): Json<PairReq>,
+) -> ApiResult<Json<PairResp>> {
+    // Only failed attempts count, and only against the caller's own address.
+    if st.pair_limiter.is_blocked(src) {
         return Err(ApiError::TooManyRequests);
     }
     let name = if req.device_name.trim().is_empty() { "Android" } else { req.device_name.trim() };
     let name: String = name.chars().take(80).collect();
     match auth::redeem(&st.db, &req.code, &name).await? {
         Some((device_id, token)) => Ok(Json(PairResp { device_id, token })),
-        None => Err(ApiError::Unauthorized),
+        None => {
+            st.pair_limiter.record_failure(src);
+            Err(ApiError::Unauthorized)
+        }
     }
 }
 

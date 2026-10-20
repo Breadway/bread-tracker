@@ -237,6 +237,36 @@ void main() {
     expect(await (db.select(db.completions)..where((t) => t.dirty.equals(true))).get(), hasLength(1));
   });
 
+  test('default Api instances share one http client instead of opening one per call', () async {
+    final seen = <String>[];
+    final shared = MockClient((r) async {
+      seen.add('${r.method} ${r.url.path}');
+      return http.Response('{"cursor": 0, "items": [], "completions": [], "server_time": 0}', 200);
+    });
+    Api.sharedClient = shared;
+    addTearDown(() => Api.sharedClient = null);
+
+    // Two separately built Apis (different base/token) use the same client.
+    await Api('http://a', token: 't1').sync(0, [], []);
+    await Api('http://b', token: 't2').sync(0, [], []);
+    expect(seen, ['POST /sync', 'POST /sync']);
+
+    // A default SyncEngine builds an Api per pass; every pass still goes through it.
+    SharedPreferences.setMockInitialValues({});
+    final db = AppDb(NativeDatabase.memory());
+    final engine = SyncEngine(db, MemStore(await SharedPreferences.getInstance()));
+    for (var i = 0; i < 3; i++) {
+      expect(await engine.sync(), SyncStatus.idle);
+    }
+    expect(seen.length, 5);
+    await db.close();
+
+    // An injected client is used instead of the shared one.
+    final own = MockClient((r) async => http.Response('{}', 200));
+    await Api('http://c', token: 't', client: own).sync(0, [], []);
+    expect(seen.length, 5);
+  });
+
   test('an edit made while a sync is in flight stays dirty', () async {
     final server = FakeServer();
     final (db, sync, _) = await device(server);

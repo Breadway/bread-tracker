@@ -33,10 +33,19 @@ class AudioSfx extends Sfx {
   Future<void> init() async {
     try {
       for (var i = 0; i < 10; i++) {
-        _pools['tick$i'] = await AudioPool.createFromAsset(path: 'sfx/tick$i.wav', maxPlayers: 3);
+        _pools['tick$i'] = await AudioPool.createFromAsset(
+          path: 'sfx/tick$i.wav',
+          maxPlayers: 3,
+        );
       }
-      _pools['fanfare'] = await AudioPool.createFromAsset(path: 'sfx/fanfare.wav', maxPlayers: 1);
-      _pools['level'] = await AudioPool.createFromAsset(path: 'sfx/level.wav', maxPlayers: 1);
+      _pools['fanfare'] = await AudioPool.createFromAsset(
+        path: 'sfx/fanfare.wav',
+        maxPlayers: 1,
+      );
+      _pools['level'] = await AudioPool.createFromAsset(
+        path: 'sfx/level.wav',
+        maxPlayers: 1,
+      );
     } catch (_) {}
   }
 

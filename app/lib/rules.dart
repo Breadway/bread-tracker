@@ -4,7 +4,15 @@ library;
 
 const perfectDayBonus = 50;
 const xpPerLevel = 120;
-const ranks = ['Flour', 'Dough', 'Proofing', 'Rising', 'Baked', 'Golden Crust', 'Sourdough Master'];
+const ranks = [
+  'Flour',
+  'Dough',
+  'Proofing',
+  'Rising',
+  'Baked',
+  'Golden Crust',
+  'Sourdough Master',
+];
 
 String rankFor(int level) => ranks[(level - 1).clamp(0, ranks.length - 1)];
 
@@ -55,9 +63,15 @@ String fmtDay(DateTime d) =>
 int weekdayIndex(DateTime d) => d.weekday - 1;
 
 bool scheduledOn(RItem i, DateTime date) =>
-    i.active && (i.kind == 'chore' || i.kind == 'habit') && (i.weekdays & (1 << weekdayIndex(date))) != 0;
+    i.active &&
+    (i.kind == 'chore' || i.kind == 'habit') &&
+    (i.weekdays & (1 << weekdayIndex(date))) != 0;
 
-Stats computeStats(List<RItem> items, List<RCompletion> completions, DateTime today) {
+Stats computeStats(
+  List<RItem> items,
+  List<RCompletion> completions,
+  DateTime today,
+) {
   final live = {for (final i in items.where((i) => !i.deleted)) i.id: i};
   final done = <String, Set<String>>{};
   var xp = 0;
@@ -72,7 +86,8 @@ Stats computeStats(List<RItem> items, List<RCompletion> completions, DateTime to
   for (final ds in dates.toList()..sort()) {
     final date = parseDay(ds);
     final scheduled = live.values.where((i) => scheduledOn(i, date)).toList();
-    if (scheduled.isNotEmpty && scheduled.every((i) => done[i.id]?.contains(ds) ?? false)) {
+    if (scheduled.isNotEmpty &&
+        scheduled.every((i) => done[i.id]?.contains(ds) ?? false)) {
       xp += perfectDayBonus;
       perfect.add(ds);
     }
@@ -82,7 +97,9 @@ Stats computeStats(List<RItem> items, List<RCompletion> completions, DateTime to
   final todayStr = fmtDay(today);
   for (final item in live.values.where((i) => i.kind == 'habit')) {
     final set = done[item.id];
-    var day = (set?.contains(todayStr) ?? false) ? today : today.subtract(const Duration(days: 1));
+    var day = (set?.contains(todayStr) ?? false)
+        ? today
+        : today.subtract(const Duration(days: 1));
     var n = 0;
     while (set?.contains(fmtDay(day)) ?? false) {
       n++;

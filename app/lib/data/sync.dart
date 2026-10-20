@@ -7,8 +7,11 @@ import 'store.dart';
 enum SyncStatus { idle, syncing, offline, unpaired }
 
 class SyncEngine {
-  SyncEngine(this.db, this.store, {Api Function(String base, String? token)? apiFactory})
-      : _apiFactory = apiFactory ?? ((b, t) => Api(b, token: t));
+  SyncEngine(
+    this.db,
+    this.store, {
+    Api Function(String base, String? token)? apiFactory,
+  }) : _apiFactory = apiFactory ?? ((b, t) => Api(b, token: t));
   final AppDb db;
   final Store store;
   final Api Function(String, String?) _apiFactory;
@@ -40,8 +43,12 @@ class SyncEngine {
     if (token == null) return SyncStatus.unpaired;
     final api = _apiFactory(store.serverUrl, token);
 
-    final dirtyItems = await (db.select(db.items)..where((t) => t.dirty.equals(true))).get();
-    final dirtyComps = await (db.select(db.completions)..where((t) => t.dirty.equals(true))).get();
+    final dirtyItems = await (db.select(
+      db.items,
+    )..where((t) => t.dirty.equals(true))).get();
+    final dirtyComps = await (db.select(
+      db.completions,
+    )..where((t) => t.dirty.equals(true))).get();
 
     final Map<String, dynamic> res;
     try {
@@ -59,24 +66,44 @@ class SyncEngine {
     await db.transaction(() async {
       // Rows unchanged since we pushed them are now clean.
       for (final i in dirtyItems) {
-        await (db.update(db.items)..where((t) => t.id.equals(i.id) & t.updatedAt.equals(i.updatedAt)))
+        await (db.update(db.items)..where(
+              (t) => t.id.equals(i.id) & t.updatedAt.equals(i.updatedAt),
+            ))
             .write(const ItemsCompanion(dirty: Value(false)));
       }
       for (final c in dirtyComps) {
-        await (db.update(db.completions)
-              ..where((t) => t.itemId.equals(c.itemId) & t.date.equals(c.date) & t.updatedAt.equals(c.updatedAt)))
+        await (db.update(db.completions)..where(
+              (t) =>
+                  t.itemId.equals(c.itemId) &
+                  t.date.equals(c.date) &
+                  t.updatedAt.equals(c.updatedAt),
+            ))
             .write(const CompletionsCompanion(dirty: Value(false)));
       }
       for (final j in (res['items'] as List).cast<Map<String, dynamic>>()) {
-        final local = await (db.select(db.items)..where((t) => t.id.equals(j['id']))).getSingleOrNull();
-        if (local != null && local.dirty && local.updatedAt > (j['updated_at'] as int)) continue;
+        final local = await (db.select(
+          db.items,
+        )..where((t) => t.id.equals(j['id']))).getSingleOrNull();
+        if (local != null &&
+            local.dirty &&
+            local.updatedAt > (j['updated_at'] as int)) {
+          continue;
+        }
         await db.upsertItem(_itemCompanion(j));
       }
-      for (final j in (res['completions'] as List).cast<Map<String, dynamic>>()) {
-        final local = await (db.select(db.completions)
-              ..where((t) => t.itemId.equals(j['item_id']) & t.date.equals(j['date'])))
-            .getSingleOrNull();
-        if (local != null && local.dirty && local.updatedAt > (j['updated_at'] as int)) continue;
+      for (final j
+          in (res['completions'] as List).cast<Map<String, dynamic>>()) {
+        final local =
+            await (db.select(db.completions)..where(
+                  (t) =>
+                      t.itemId.equals(j['item_id']) & t.date.equals(j['date']),
+                ))
+                .getSingleOrNull();
+        if (local != null &&
+            local.dirty &&
+            local.updatedAt > (j['updated_at'] as int)) {
+          continue;
+        }
         await db.into(db.completions).insertOnConflictUpdate(_compCompanion(j));
       }
     });
@@ -85,44 +112,45 @@ class SyncEngine {
   }
 
   Map<String, dynamic> _itemJson(ItemRow i) => {
-        'id': i.id,
-        'kind': i.kind,
-        'name': i.name,
-        'weekdays': i.weekdays,
-        'remind_time': i.remindTime,
-        'points': i.points,
-        'due_date': i.dueDate,
-        'sort': i.sort,
-        'active': i.active,
-        'updated_at': i.updatedAt,
-        'deleted_at': i.deletedAt,
-      };
+    'id': i.id,
+    'kind': i.kind,
+    'name': i.name,
+    'weekdays': i.weekdays,
+    'remind_time': i.remindTime,
+    'points': i.points,
+    'due_date': i.dueDate,
+    'sort': i.sort,
+    'active': i.active,
+    'updated_at': i.updatedAt,
+    'deleted_at': i.deletedAt,
+  };
 
   Map<String, dynamic> _compJson(CompletionRow c) => {
-        'item_id': c.itemId,
-        'date': c.date,
-        'completed_at': c.completedAt,
-        'updated_at': c.updatedAt,
-        'deleted_at': c.deletedAt,
-      };
+    'item_id': c.itemId,
+    'date': c.date,
+    'completed_at': c.completedAt,
+    'updated_at': c.updatedAt,
+    'deleted_at': c.deletedAt,
+  };
 
   ItemsCompanion _itemCompanion(Map<String, dynamic> j) => ItemsCompanion(
-        id: Value(j['id']),
-        kind: Value(j['kind']),
-        name: Value(j['name']),
-        weekdays: Value(j['weekdays']),
-        remindTime: Value(j['remind_time']),
-        points: Value(j['points']),
-        dueDate: Value(j['due_date']),
-        sort: Value(j['sort']),
-        active: Value(j['active']),
-        updatedAt: Value(j['updated_at']),
-        deletedAt: Value(j['deleted_at']),
-        seq: Value(j['seq'] ?? 0),
-        dirty: const Value(false),
-      );
+    id: Value(j['id']),
+    kind: Value(j['kind']),
+    name: Value(j['name']),
+    weekdays: Value(j['weekdays']),
+    remindTime: Value(j['remind_time']),
+    points: Value(j['points']),
+    dueDate: Value(j['due_date']),
+    sort: Value(j['sort']),
+    active: Value(j['active']),
+    updatedAt: Value(j['updated_at']),
+    deletedAt: Value(j['deleted_at']),
+    seq: Value(j['seq'] ?? 0),
+    dirty: const Value(false),
+  );
 
-  CompletionsCompanion _compCompanion(Map<String, dynamic> j) => CompletionsCompanion(
+  CompletionsCompanion _compCompanion(Map<String, dynamic> j) =>
+      CompletionsCompanion(
         itemId: Value(j['item_id']),
         date: Value(j['date']),
         completedAt: Value(j['completed_at']),

@@ -7,8 +7,8 @@ import '../theme.dart';
 
 class _Particle {
   _Particle(this.pos, this.vel, this.size, this.color, this.shape)
-      : rot = math.Random().nextDouble() * 6,
-        spin = (math.Random().nextDouble() - .5) * .4;
+    : rot = math.Random().nextDouble() * 6,
+      spin = (math.Random().nextDouble() - .5) * .4;
   Offset pos, vel;
   final double size;
   final Color color;
@@ -33,22 +33,27 @@ class FxController extends ChangeNotifier {
   double _toastLeft = 0;
   bool reduceMotion = false;
 
-  bool get active => particles.isNotEmpty || floats.isNotEmpty || _toastLeft > 0;
+  bool get active =>
+      particles.isNotEmpty || floats.isNotEmpty || _toastLeft > 0;
 
   void burst(Offset origin, int count, double power, List<Color> colors) {
     if (reduceMotion) return;
     for (var i = 0; i < count; i++) {
       final a = _rng.nextDouble() * math.pi * 2;
       final s = (_rng.nextDouble() * .6 + .4) * power;
-      particles.add(_Particle(
-        origin,
-        Offset(math.cos(a) * s, math.sin(a) * s - power * .5),
-        _rng.nextDouble() * 4 + 3,
-        colors[i % colors.length],
-        i % 3,
-      ));
+      particles.add(
+        _Particle(
+          origin,
+          Offset(math.cos(a) * s, math.sin(a) * s - power * .5),
+          _rng.nextDouble() * 4 + 3,
+          colors[i % colors.length],
+          i % 3,
+        ),
+      );
     }
-    if (particles.length > 400) particles.removeRange(0, particles.length - 400);
+    if (particles.length > 400) {
+      particles.removeRange(0, particles.length - 400);
+    }
     notifyListeners();
   }
 
@@ -68,7 +73,10 @@ class FxController extends ChangeNotifier {
   /// Advance by [dt] seconds, where 1.0 is one 60 fps frame.
   void step(double dt, double secs, Size area) {
     for (final p in particles) {
-      p.vel = Offset(p.vel.dx * math.pow(.985, dt).toDouble(), p.vel.dy + .28 * dt);
+      p.vel = Offset(
+        p.vel.dx * math.pow(.985, dt).toDouble(),
+        p.vel.dy + .28 * dt,
+      );
       p.pos += p.vel * dt;
       p.rot += p.spin * dt;
       p.life -= .009 * dt;
@@ -87,7 +95,11 @@ class FxController extends ChangeNotifier {
 }
 
 class FxScope extends InheritedNotifier<FxController> {
-  const FxScope({super.key, required FxController controller, required super.child}) : super(notifier: controller);
+  const FxScope({
+    super.key,
+    required FxController controller,
+    required super.child,
+  }) : super(notifier: controller);
   static FxController of(BuildContext context) =>
       context.getInheritedWidgetOfExactType<FxScope>()!.notifier!;
 }
@@ -120,7 +132,9 @@ class _FxLayerState extends State<FxLayer> with SingleTickerProviderStateMixin {
   }
 
   void _onTick(Duration elapsed) {
-    final secs = _last == Duration.zero ? 1 / 60 : (elapsed - _last).inMicroseconds / 1e6;
+    final secs = _last == Duration.zero
+        ? 1 / 60
+        : (elapsed - _last).inMicroseconds / 1e6;
     _last = elapsed;
     final size = MediaQuery.sizeOf(context);
     widget.controller.step((secs * 60).clamp(0, 3), secs.clamp(0, .1), size);
@@ -141,40 +155,59 @@ class _FxLayerState extends State<FxLayer> with SingleTickerProviderStateMixin {
     final p = palOf(context);
     return FxScope(
       controller: c,
-      child: Stack(children: [
-        widget.child,
-        Positioned.fill(
-          child: IgnorePointer(
-            child: ListenableBuilder(
-              listenable: c,
-              builder: (_, _) => RepaintBoundary(child: CustomPaint(painter: _FxPainter(c, p))),
+      child: Stack(
+        children: [
+          widget.child,
+          Positioned.fill(
+            child: IgnorePointer(
+              child: ListenableBuilder(
+                listenable: c,
+                builder: (_, _) => RepaintBoundary(
+                  child: CustomPaint(painter: _FxPainter(c, p)),
+                ),
+              ),
             ),
           ),
-        ),
-        Positioned(
-          top: MediaQuery.paddingOf(context).top + 12,
-          left: 16,
-          right: 16,
-          child: IgnorePointer(
-            child: ListenableBuilder(
-              listenable: c,
-              builder: (_, _) => AnimatedSlide(
-                duration: const Duration(milliseconds: 280),
-                curve: Curves.easeOutBack,
-                offset: c.toast == null ? const Offset(0, -3) : Offset.zero,
-                child: Center(
-                  child: DecoratedBox(
-                    decoration: BoxDecoration(
-                      color: c.toastGold ? p.gold : p.accent,
-                      borderRadius: BorderRadius.circular(999),
-                      boxShadow: const [BoxShadow(color: Color(0x59000000), blurRadius: 24, offset: Offset(0, 8))],
-                    ),
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
-                      child: Text(
-                        c.toast ?? '',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(fontFamily: kFont, color: p.onAccent, fontWeight: FontWeight.w700, fontSize: 14, decoration: TextDecoration.none),
+          Positioned(
+            top: MediaQuery.paddingOf(context).top + 12,
+            left: 16,
+            right: 16,
+            child: IgnorePointer(
+              child: ListenableBuilder(
+                listenable: c,
+                builder: (_, _) => AnimatedSlide(
+                  duration: const Duration(milliseconds: 280),
+                  curve: Curves.easeOutBack,
+                  offset: c.toast == null ? const Offset(0, -3) : Offset.zero,
+                  child: Center(
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        color: c.toastGold ? p.gold : p.accent,
+                        borderRadius: BorderRadius.circular(999),
+                        boxShadow: const [
+                          BoxShadow(
+                            color: Color(0x59000000),
+                            blurRadius: 24,
+                            offset: Offset(0, 8),
+                          ),
+                        ],
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 20,
+                          vertical: 8,
+                        ),
+                        child: Text(
+                          c.toast ?? '',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            fontFamily: kFont,
+                            color: p.onAccent,
+                            fontWeight: FontWeight.w700,
+                            fontSize: 14,
+                            decoration: TextDecoration.none,
+                          ),
+                        ),
                       ),
                     ),
                   ),
@@ -182,8 +215,8 @@ class _FxLayerState extends State<FxLayer> with SingleTickerProviderStateMixin {
               ),
             ),
           ),
-        ),
-      ]),
+        ],
+      ),
     );
   }
 }
@@ -203,11 +236,25 @@ class _FxPainter extends CustomPainter {
       canvas.rotate(q.rot);
       switch (q.shape) {
         case 0:
-          canvas.drawRect(Rect.fromCenter(center: Offset.zero, width: q.size * 2, height: q.size), paint);
+          canvas.drawRect(
+            Rect.fromCenter(
+              center: Offset.zero,
+              width: q.size * 2,
+              height: q.size,
+            ),
+            paint,
+          );
         case 1:
           canvas.drawCircle(Offset.zero, q.size / 1.5, paint);
         default:
-          canvas.drawRect(Rect.fromCenter(center: Offset.zero, width: q.size, height: q.size * 2), paint);
+          canvas.drawRect(
+            Rect.fromCenter(
+              center: Offset.zero,
+              width: q.size,
+              height: q.size * 2,
+            ),
+            paint,
+          );
       }
       canvas.restore();
     }
@@ -222,12 +269,21 @@ class _FxPainter extends CustomPainter {
             fontWeight: FontWeight.w700,
             fontSize: 16 * scale,
             color: p.gold.withValues(alpha: (1 - t).clamp(0, 1)),
-            shadows: const [Shadow(color: Color(0x73000000), blurRadius: 6, offset: Offset(0, 1))],
+            shadows: const [
+              Shadow(
+                color: Color(0x73000000),
+                blurRadius: 6,
+                offset: Offset(0, 1),
+              ),
+            ],
           ),
         ),
         textDirection: TextDirection.ltr,
       )..layout();
-      tp.paint(canvas, f.pos + Offset(-tp.width / 2, -56 * Curves.easeOut.transform(t)));
+      tp.paint(
+        canvas,
+        f.pos + Offset(-tp.width / 2, -56 * Curves.easeOut.transform(t)),
+      );
     }
   }
 

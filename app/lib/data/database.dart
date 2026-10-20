@@ -47,32 +47,49 @@ class AppDb extends _$AppDb {
   Stream<List<ItemRow>> watchItems() =>
       (select(items)
             ..where((t) => t.deletedAt.isNull())
-            ..orderBy([(t) => OrderingTerm.asc(t.sort), (t) => OrderingTerm.asc(t.remindTime), (t) => OrderingTerm.asc(t.name)]))
+            ..orderBy([
+              (t) => OrderingTerm.asc(t.sort),
+              (t) => OrderingTerm.asc(t.remindTime),
+              (t) => OrderingTerm.asc(t.name),
+            ]))
           .watch();
 
   Stream<List<CompletionRow>> watchCompletions() =>
       (select(completions)..where((t) => t.deletedAt.isNull())).watch();
 
-  Future<void> upsertItem(ItemsCompanion c) => into(items).insertOnConflictUpdate(c);
+  Future<void> upsertItem(ItemsCompanion c) =>
+      into(items).insertOnConflictUpdate(c);
 
-  Future<void> setCompletion(String itemId, String date, bool done, int now) async {
-    final existing = await (select(completions)
-          ..where((t) => t.itemId.equals(itemId) & t.date.equals(date)))
-        .getSingleOrNull();
+  Future<void> setCompletion(
+    String itemId,
+    String date,
+    bool done,
+    int now,
+  ) async {
+    final existing =
+        await (select(completions)
+              ..where((t) => t.itemId.equals(itemId) & t.date.equals(date)))
+            .getSingleOrNull();
     if (existing == null && !done) return;
-    await into(completions).insertOnConflictUpdate(CompletionsCompanion(
-      itemId: Value(itemId),
-      date: Value(date),
-      completedAt: Value(done ? now : (existing?.completedAt ?? now)),
-      updatedAt: Value(now),
-      deletedAt: Value(done ? null : now),
-      seq: Value(existing?.seq ?? 0),
-      dirty: const Value(true),
-    ));
+    await into(completions).insertOnConflictUpdate(
+      CompletionsCompanion(
+        itemId: Value(itemId),
+        date: Value(date),
+        completedAt: Value(done ? now : (existing?.completedAt ?? now)),
+        updatedAt: Value(now),
+        deletedAt: Value(done ? null : now),
+        seq: Value(existing?.seq ?? 0),
+        dirty: const Value(true),
+      ),
+    );
   }
 
   Future<void> softDeleteItem(String id, int now) =>
       (update(items)..where((t) => t.id.equals(id))).write(
-        ItemsCompanion(deletedAt: Value(now), updatedAt: Value(now), dirty: const Value(true)),
+        ItemsCompanion(
+          deletedAt: Value(now),
+          updatedAt: Value(now),
+          dirty: const Value(true),
+        ),
       );
 }

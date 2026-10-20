@@ -17,7 +17,17 @@ class Pal {
     required this.brightness,
   });
 
-  final Color bg, surface, raised, line, fg, dim, accent, onAccent, good, gold, pink;
+  final Color bg,
+      surface,
+      raised,
+      line,
+      fg,
+      dim,
+      accent,
+      onAccent,
+      good,
+      gold,
+      pink;
   final Brightness brightness;
 
   static const dark = Pal(
@@ -50,38 +60,70 @@ class Pal {
     brightness: Brightness.light,
   );
 
-  List<Color> get confetti => [accent, gold, good, const Color(0xFF6F8FB5), pink, const Color(0xFFF4EAD8)];
+  List<Color> get confetti => [
+    accent,
+    gold,
+    good,
+    const Color(0xFF6F8FB5),
+    pink,
+    const Color(0xFFF4EAD8),
+  ];
 }
 
-Pal palOf(BuildContext context) => Theme.of(context).brightness == Brightness.dark ? Pal.dark : Pal.light;
+Pal palOf(BuildContext context) =>
+    Theme.of(context).brightness == Brightness.dark ? Pal.dark : Pal.light;
 
 const kFont = 'VarelaRound';
 
 ThemeData buildTheme(Pal p) {
-  final base = ThemeData(brightness: p.brightness, useMaterial3: true, fontFamily: kFont);
+  final base = ThemeData(
+    brightness: p.brightness,
+    useMaterial3: true,
+    fontFamily: kFont,
+  );
   return base.copyWith(
     scaffoldBackgroundColor: p.bg,
-    colorScheme: ColorScheme.fromSeed(seedColor: p.accent, brightness: p.brightness).copyWith(
-      primary: p.accent,
-      onPrimary: p.onAccent,
-      surface: p.surface,
-      onSurface: p.fg,
+    colorScheme:
+        ColorScheme.fromSeed(
+          seedColor: p.accent,
+          brightness: p.brightness,
+        ).copyWith(
+          primary: p.accent,
+          onPrimary: p.onAccent,
+          surface: p.surface,
+          onSurface: p.fg,
+        ),
+    textTheme: base.textTheme.apply(
+      bodyColor: p.fg,
+      displayColor: p.fg,
+      fontFamily: kFont,
     ),
-    textTheme: base.textTheme.apply(bodyColor: p.fg, displayColor: p.fg, fontFamily: kFont),
     dividerColor: p.line,
     inputDecorationTheme: InputDecorationTheme(
       filled: true,
       fillColor: p.surface,
       contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: p.line)),
-      enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: p.line)),
-      focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: p.accent, width: 2)),
+      border: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(6),
+        borderSide: BorderSide(color: p.line),
+      ),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(6),
+        borderSide: BorderSide(color: p.line),
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(6),
+        borderSide: BorderSide(color: p.accent, width: 2),
+      ),
     ),
     filledButtonTheme: FilledButtonThemeData(
       style: FilledButton.styleFrom(
         backgroundColor: p.accent,
         foregroundColor: p.onAccent,
-        textStyle: const TextStyle(fontFamily: kFont, fontWeight: FontWeight.w700),
+        textStyle: const TextStyle(
+          fontFamily: kFont,
+          fontWeight: FontWeight.w700,
+        ),
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
       ),
@@ -89,9 +131,13 @@ ThemeData buildTheme(Pal p) {
     navigationBarTheme: NavigationBarThemeData(
       backgroundColor: p.surface,
       indicatorColor: p.raised,
-      labelTextStyle: WidgetStatePropertyAll(TextStyle(fontFamily: kFont, fontSize: 12, color: p.dim)),
+      labelTextStyle: WidgetStatePropertyAll(
+        TextStyle(fontFamily: kFont, fontSize: 12, color: p.dim),
+      ),
       iconTheme: WidgetStateProperty.resolveWith(
-        (s) => IconThemeData(color: s.contains(WidgetState.selected) ? p.accent : p.dim),
+        (s) => IconThemeData(
+          color: s.contains(WidgetState.selected) ? p.accent : p.dim,
+        ),
       ),
     ),
   );

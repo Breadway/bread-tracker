@@ -3,7 +3,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 /// Device credentials (secure storage) and small preferences.
 class Store {
-  Store(this.prefs, [FlutterSecureStorage? secure]) : _secure = secure ?? const FlutterSecureStorage();
+  Store(this.prefs, [FlutterSecureStorage? secure])
+    : _secure = secure ?? const FlutterSecureStorage();
   final SharedPreferences prefs;
   final FlutterSecureStorage _secure;
 
@@ -14,7 +15,8 @@ class Store {
   Future<void> clearToken() => _secure.delete(key: 'token');
 
   String get serverUrl => prefs.getString('server') ?? defaultServer;
-  Future<void> setServerUrl(String v) => prefs.setString('server', v.trim().replaceAll(RegExp(r'/+$'), ''));
+  Future<void> setServerUrl(String v) =>
+      prefs.setString('server', v.trim().replaceAll(RegExp(r'/+$'), ''));
 
   int get cursor => prefs.getInt('cursor') ?? 0;
   Future<void> setCursor(int v) => prefs.setInt('cursor', v);

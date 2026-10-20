@@ -159,6 +159,19 @@ void main() {
     await tester.pump(const Duration(milliseconds: 200));
     await tester.tap(find.text('Shoot 50 free throws'));
     await tester.pump(const Duration(milliseconds: 200));
+    // The seed also has weekday-specific chores (see seededDb), so finish whatever is
+    // scheduled today before the last tick; otherwise this only passes on some weekdays.
+    const todaysExtras = {
+      DateTime.monday: ['Recycling'],
+      DateTime.wednesday: ['Worm Food'],
+      DateTime.friday: ['Put washing in machine', 'Clean bathroom'],
+      DateTime.saturday: ['Room clean'],
+    };
+    for (final name in todaysExtras[DateTime.now().weekday] ?? const <String>[]) {
+      await tester.ensureVisible(find.text(name));
+      await tester.tap(find.text(name));
+      await tester.pump(const Duration(milliseconds: 200));
+    }
     await tester.tap(find.text('Wash or dry dishes, or cook dinner'));
     await tester.pump(const Duration(milliseconds: 100));
     await tester.pump(const Duration(milliseconds: 300));

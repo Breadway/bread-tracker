@@ -8,6 +8,7 @@ import '../state.dart';
 import '../theme.dart';
 import 'items.dart';
 import 'pair.dart';
+import 'server_settings.dart';
 import 'widgets.dart';
 
 class SettingsScreen extends ConsumerWidget {
@@ -143,6 +144,8 @@ class SettingsScreen extends ConsumerWidget {
               ),
             ),
           ),
+          if (paired) const SectionHeader('Reminders'),
+          if (paired) const ServerSettingsSection(),
           const SectionHeader('Notifications'),
           ValueListenableBuilder<PushStatus>(
             valueListenable: ref.watch(pushProvider).status,

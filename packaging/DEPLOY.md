@@ -29,6 +29,8 @@ BREADTRACKER_FCM_SERVICE_ACCOUNT=/run/secrets/fcm.json
 
 Without it the server runs with push disabled (logged at startup).
 
+Optional: `BREADTRACKER_PUSH_MODE=data` makes reminders data-only so the app can add a Mark done button to every one (default `notification`). Read app/NOTIFICATIONS.md and test on a phone before turning it on. The compose file passes it through from `.env`.
+
 ## Backup and restore
 
 Litestream writes a file replica to `BREADTRACKER_BACKUP_DIR`. Restore into a scratch file to verify:

@@ -96,7 +96,59 @@ struct JwtClaims<'a> {
     exp: i64,
 }
 
+/// How reminders are delivered.
+/// `Notification`: FCM carries a notification block, so Android shows it itself even when the
+/// app is not running (no action buttons possible). `Data`: data only; the app builds the
+/// notification in a background handler so it can offer a Mark done action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PushMode {
+    #[default]
+    Notification,
+    Data,
+}
+
+impl PushMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "notification" => Some(Self::Notification),
+            "data" => Some(Self::Data),
+            _ => None,
+        }
+    }
+}
+
+pub const CHANNEL_ID: &str = "reminders";
+
+/// The FCM HTTP v1 request body for one message.
+pub fn fcm_payload(msg: &Message, mode: PushMode) -> serde_json::Value {
+    match mode {
+        PushMode::Notification => serde_json::json!({
+            "message": {
+                "token": msg.token,
+                "notification": { "title": msg.title, "body": msg.body },
+                "data": msg.data,
+                "android": { "priority": "HIGH", "notification": { "channel_id": CHANNEL_ID } }
+            }
+        }),
+        PushMode::Data => {
+            // Data values must be strings. The app turns this into a notification itself.
+            let mut data = msg.data.clone();
+            data.insert("title".into(), msg.title.clone());
+            data.insert("body".into(), msg.body.clone());
+            data.insert("channel_id".into(), CHANNEL_ID.into());
+            serde_json::json!({
+                "message": {
+                    "token": msg.token,
+                    "data": data,
+                    "android": { "priority": "HIGH" }
+                }
+            })
+        }
+    }
+}
+
 pub struct Fcm {
+    mode: PushMode,
     client: reqwest::Client,
     project_id: String,
     client_email: String,
@@ -106,10 +158,11 @@ pub struct Fcm {
 }
 
 impl Fcm {
-    pub fn from_file(path: &Path) -> anyhow::Result<Self> {
+    pub fn from_file(path: &Path, mode: PushMode) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let sa: ServiceAccount = serde_json::from_str(&raw).context("parsing service account json")?;
         Ok(Self {
+            mode,
             client: reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?,
             key: EncodingKey::from_rsa_pem(sa.private_key.as_bytes()).context("service account private key")?,
             project_id: sa.project_id,
@@ -166,14 +219,7 @@ impl PushSender for Fcm {
 
     async fn send(&self, msg: &Message) -> anyhow::Result<SendOutcome> {
         let access = self.access_token().await?;
-        let payload = serde_json::json!({
-            "message": {
-                "token": msg.token,
-                "notification": { "title": msg.title, "body": msg.body },
-                "data": msg.data,
-                "android": { "priority": "HIGH", "notification": { "channel_id": "reminders" } }
-            }
-        });
+        let payload = fcm_payload(msg, self.mode);
         let url = format!("https://fcm.googleapis.com/v1/projects/{}/messages:send", self.project_id);
         let resp = self.client.post(url).bearer_auth(access).json(&payload).send().await?;
         let status = resp.status();
@@ -393,4 +439,51 @@ pub fn spawn_scheduler(st: AppState) {
             n = n.wrapping_add(1);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg() -> Message {
+        Message {
+            token: "tok".into(),
+            title: "Recycling".into(),
+            body: "Chore due now".into(),
+            data: HashMap::from([
+                ("item_id".to_string(), "i1".to_string()),
+                ("date".to_string(), "2026-10-19".to_string()),
+                ("kind".to_string(), "chore".to_string()),
+            ]),
+        }
+    }
+
+    #[test]
+    fn notification_mode_keeps_the_existing_payload() {
+        let v = fcm_payload(&msg(), PushMode::Notification);
+        assert_eq!(v["message"]["notification"]["title"], "Recycling");
+        assert_eq!(v["message"]["notification"]["body"], "Chore due now");
+        assert_eq!(v["message"]["data"]["item_id"], "i1");
+        assert_eq!(v["message"]["android"]["priority"], "HIGH");
+        assert_eq!(v["message"]["android"]["notification"]["channel_id"], "reminders");
+    }
+
+    #[test]
+    fn data_mode_has_no_notification_block_and_carries_the_text_as_data() {
+        let v = fcm_payload(&msg(), PushMode::Data);
+        assert!(v["message"].get("notification").is_none(), "a notification block would make Android show it itself");
+        let d = &v["message"]["data"];
+        assert_eq!((d["title"].as_str(), d["body"].as_str()), (Some("Recycling"), Some("Chore due now")));
+        assert_eq!((d["item_id"].as_str(), d["date"].as_str(), d["kind"].as_str()), (Some("i1"), Some("2026-10-19"), Some("chore")));
+        assert_eq!(v["message"]["android"]["priority"], "HIGH", "high priority so it wakes the app");
+        assert!(d.as_object().unwrap().values().all(|x| x.is_string()), "FCM data values must be strings");
+    }
+
+    #[test]
+    fn push_mode_parsing() {
+        assert_eq!(PushMode::parse("DATA"), Some(PushMode::Data));
+        assert_eq!(PushMode::parse(" notification "), Some(PushMode::Notification));
+        assert_eq!(PushMode::parse("both"), None);
+        assert_eq!(PushMode::default(), PushMode::Notification);
+    }
 }

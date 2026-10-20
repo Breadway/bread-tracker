@@ -22,6 +22,7 @@ services:
     environment:
       BREADTRACKER_FCM_SERVICE_ACCOUNT: ${BREADTRACKER_FCM_SERVICE_ACCOUNT:-}
       BREADTRACKER_TRUSTED_PROXIES: ${BREADTRACKER_TRUSTED_PROXIES:-}
+      BREADTRACKER_PUSH_MODE: ${BREADTRACKER_PUSH_MODE:-notification}
     volumes:
       - bread-tracker-data:/var/lib/bread-tracker
       # FCM service account, mounted read-only when BREADTRACKER_FCM_KEY_FILE is set.

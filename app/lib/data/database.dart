@@ -39,7 +39,22 @@ class Completions extends Table {
 
 @DriftDatabase(tables: [Items, Completions])
 class AppDb extends _$AppDb {
-  AppDb([QueryExecutor? e]) : super(e ?? driftDatabase(name: 'tracker'));
+  AppDb([QueryExecutor? e])
+    : super(
+        e ??
+            driftDatabase(
+              name: 'tracker',
+              // The notification action runs in a second isolate on the same file, so a
+              // writer must wait for the other instead of failing with "database is locked".
+              native: DriftNativeOptions(
+                setup: (db) => db.execute('PRAGMA busy_timeout = 5000'),
+              ),
+            ),
+      );
+
+  /// Re-run watch queries. Another isolate (the notification action) writes to the same
+  /// file without telling this one, so call this when the app comes back to the foreground.
+  void refreshStreams() => markTablesUpdated([items, completions]);
 
   @override
   int get schemaVersion => 1;

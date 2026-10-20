@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use crate::auth::TrustedProxy;
+use crate::push::PushMode;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -16,6 +17,8 @@ pub struct Config {
     pub trusted_proxies: Vec<TrustedProxy>,
     /// Soft-deleted rows older than this many days are removed for good.
     pub tombstone_days: i64,
+    /// `notification` (default) or `data`; see `push::PushMode`.
+    pub push_mode: PushMode,
 }
 
 impl Config {
@@ -48,6 +51,14 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .filter(|d| *d >= 1)
                 .unwrap_or(180),
+            push_mode: get("BREADTRACKER_PUSH_MODE")
+                .map(|v| {
+                    PushMode::parse(&v).unwrap_or_else(|| {
+                        eprintln!("ignoring invalid BREADTRACKER_PUSH_MODE {v:?}, using notification");
+                        PushMode::Notification
+                    })
+                })
+                .unwrap_or_default(),
         }
     }
 

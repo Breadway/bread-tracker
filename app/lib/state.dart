@@ -72,6 +72,24 @@ final selectedDayProvider = NotifierProvider<SelectedDayNotifier, DateTime>(
   SelectedDayNotifier.new,
 );
 
+/// A request to show the Today screen on a given day, from a tapped notification.
+class OpenTodayRequest {
+  const OpenTodayRequest(this.date, this.serial);
+  final String? date;
+  final int serial;
+}
+
+class OpenTodayNotifier extends Notifier<OpenTodayRequest?> {
+  int _n = 0;
+  @override
+  OpenTodayRequest? build() => null;
+  void request(String? date) => state = OpenTodayRequest(date, ++_n);
+}
+
+final openTodayProvider = NotifierProvider<OpenTodayNotifier, OpenTodayRequest?>(
+  OpenTodayNotifier.new,
+);
+
 class SyncStatusNotifier extends Notifier<SyncStatus> {
   @override
   SyncStatus build() => SyncStatus.idle;

@@ -177,6 +177,10 @@ async fn settings_round_trip_and_validation() {
     let tok = paired(&h).await;
     let (_, v) = call(&h.app, "GET", "/settings", Some(&tok), None).await;
     assert_eq!(v["timezone"], "Australia/Perth");
+    assert_eq!(v["utc_offset_minutes"], 480, "Perth has no DST");
+    let (s, v) = call(&h.app, "PUT", "/settings", Some(&tok), Some(json!({"timezone": "Asia/Kolkata"}))).await;
+    assert_eq!((s, v["utc_offset_minutes"].as_i64()), (StatusCode::OK, Some(330)));
+    call(&h.app, "PUT", "/settings", Some(&tok), Some(json!({"timezone": "Australia/Perth"}))).await;
     let (s, v) = call(&h.app, "PUT", "/settings", Some(&tok), Some(json!({"quiet_start": "22:00", "quiet_end": "07:00", "reminders_enabled": false}))).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["quiet_start"], "22:00");

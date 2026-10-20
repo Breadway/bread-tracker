@@ -15,6 +15,37 @@ class ApiException implements Exception {
   String toString() => message;
 }
 
+/// The server-side reminder settings (`GET/PUT /settings`).
+class ServerSettings {
+  const ServerSettings({
+    required this.timezone,
+    required this.quietStart,
+    required this.quietEnd,
+    required this.remindersEnabled,
+    required this.utcOffsetMinutes,
+  });
+
+  factory ServerSettings.fromJson(Map<String, dynamic> j) => ServerSettings(
+    timezone: (j['timezone'] as String?) ?? '',
+    quietStart: (j['quiet_start'] as String?) ?? '',
+    quietEnd: (j['quiet_end'] as String?) ?? '',
+    remindersEnabled: (j['reminders_enabled'] as bool?) ?? true,
+    utcOffsetMinutes: (j['utc_offset_minutes'] as num?)?.toInt(),
+  );
+
+  final String timezone, quietStart, quietEnd;
+  final bool remindersEnabled;
+
+  /// The server timezone's current UTC offset; null when talking to an older server.
+  final int? utcOffsetMinutes;
+
+  bool get hasQuietHours => quietStart.isNotEmpty && quietEnd.isNotEmpty;
+
+  /// True when the server's day and the phone's day can disagree right now.
+  bool zoneDiffersFrom(Duration phoneOffset) =>
+      utcOffsetMinutes != null && utcOffsetMinutes != phoneOffset.inMinutes;
+}
+
 /// Thin client for the Bread Tracker server.
 ///
 /// An `Api` is cheap and short lived (the base URL and token can change), so it never owns
@@ -107,6 +138,14 @@ class Api {
 
   Future<void> setFcmToken(String? token) =>
       _send('PUT', '/device', {'fcm_token': token});
+
+  Future<ServerSettings> getSettings() async =>
+      ServerSettings.fromJson(await _send('GET', '/settings'));
+
+  /// Only the keys present in [patch] change. Keys: timezone, quiet_start, quiet_end,
+  /// reminders_enabled.
+  Future<ServerSettings> putSettings(Map<String, Object?> patch) async =>
+      ServerSettings.fromJson(await _send('PUT', '/settings', patch));
 
   Future<void> pushTest() => _send('POST', '/push/test');
 

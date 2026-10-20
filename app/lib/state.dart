@@ -30,7 +30,7 @@ final dbProvider = Provider<AppDb>((ref) {
 final syncEngineProvider = Provider<SyncEngine>(
   (ref) => SyncEngine(ref.watch(dbProvider), ref.watch(storeProvider)),
 );
-/// How the controller builds an [Api] for one-off calls such as sign out. Tests override it.
+/// How the app builds an [Api] for one-off calls (settings, sign out). Tests override it.
 final apiFactoryProvider = Provider<Api Function(String base, String token)>(
   (ref) => (base, token) => Api(base, token: token),
 );

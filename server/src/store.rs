@@ -148,6 +148,18 @@ pub async fn reminder_items(db: &Db) -> Result<Vec<Item>, sqlx::Error> {
     .await
 }
 
+/// Representative query plan for scheduler item selection. Kept as a testable statement
+/// because the partial index must match the scheduler predicate exactly.
+pub async fn reminder_items_query_plan(
+    db: &Db,
+) -> Result<Vec<(i64, i64, i64, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "EXPLAIN QUERY PLAN SELECT id FROM items WHERE active = 1 AND deleted_at IS NULL AND remind_time IS NOT NULL",
+    )
+    .fetch_all(db)
+    .await
+}
+
 pub async fn reminder_completions(
     db: &Db,
     date: &str,
@@ -173,7 +185,7 @@ pub async fn item_ids(
         return Ok(Default::default());
     }
     let placeholders = vec!["?"; ids.len()].join(",");
-    let sql = format!("SELECT id FROM items WHERE id IN ({placeholders}) AND deleted_at IS NULL");
+    let sql = format!("SELECT id FROM items WHERE id IN ({placeholders})");
     let mut q = sqlx::query_scalar::<_, String>(&sql);
     for id in ids {
         q = q.bind(id);

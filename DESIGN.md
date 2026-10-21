@@ -19,7 +19,7 @@ database live on Hestia; the Android app (Flutter) is offline-first and syncs to
 - `POST /sync {since, items, completions}` pushes local changes then returns every row with `seq > since` plus the new `cursor`, in one round trip. `GET /sync?since=` is pull only.
 - Conflicts: last write wins by `updated_at`; ties keep the server row. Timestamps more than a day in the future are clamped.
 - Batches are limited to 5000 rows and 2 MiB. A completion dated more than 7 days ahead of the server's UTC date, or before 2020, is rejected; `completed_at` is clamped like `updated_at`.
-- Housekeeping runs hourly in the scheduler: `reminders_sent` older than two days and expired pairing codes are deleted, and tombstoned items and completions are deleted for good after `BREADTRACKER_TOMBSTONE_DAYS` (default 180). A device that stays offline longer than that and still holds a row deleted elsewhere would keep it.
+- Housekeeping runs hourly in the scheduler: `reminders_sent` older than two days and expired pairing codes are deleted. Tombstoned items and completions are retained because the current cursor protocol has no per-device acknowledgement or forced-full-resync contract; pruning them could strand an offline client. A retention/pruning policy needs an explicit backward-compatible protocol decision before implementation.
 
 ## Auth
 
@@ -34,4 +34,3 @@ Messages are FCM HTTP v1 with notification + data (`item_id`, `date`, `kind`), A
 ## CI
 
 `.forgejo/workflows/check.yml` runs on pushes to `feature/**`, `fix/**` and `main`, on the self-hosted runner: server `cargo clippy -D warnings` and `cargo test --locked` (plus `cargo fmt --check`, report only until the code base is formatted once), app `flutter analyze` and `flutter test`, a separate `xp-vectors` job that validates `spec/xp_vectors.json` and runs the server and app rules tests against it side by side, and a `docker build` of `packaging/Containerfile` (built, not pushed). It does not run on pull requests, because the repo is public and the runner is self-hosted. The Flutter jobs need the toolchain at `~/.local/flutter` on the runner (see `scripts/android-env.sh`); they do not need `google-services.json` (only an APK build does, see the Android build notes in app/NOTIFICATIONS.md).
-

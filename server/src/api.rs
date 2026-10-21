@@ -101,19 +101,19 @@ async fn sync(
     for c in &req.completions {
         c.validate(today).map_err(ApiError::BadRequest)?;
     }
-    let incoming: std::collections::HashSet<&str> = req
-        .items
-        .iter()
-        .filter(|i| i.deleted_at.is_none())
-        .map(|i| i.id.as_str())
-        .collect();
+    let incoming: std::collections::HashSet<&str> =
+        req.items.iter().map(|i| i.id.as_str()).collect();
     let mut referenced: Vec<String> = req.completions.iter().map(|c| c.item_id.clone()).collect();
     referenced.extend(req.items.iter().map(|i| i.id.clone()));
     let existing = store::item_ids(&st.db, &referenced).await?;
     // A batch may carry a new item and its completion together. Validate references against
     // the union before any write, so malformed rows cannot partially apply.
     for c in &req.completions {
-        if !existing.contains(&c.item_id) && !incoming.contains(c.item_id.as_str()) {
+        // Tombstoned references are legitimate from offline old clients: a sibling
+        // device may have deleted the item after this completion was recorded.
+        let referenced_by_live_or_deleted =
+            existing.contains(&c.item_id) || incoming.contains(c.item_id.as_str());
+        if !referenced_by_live_or_deleted {
             return Err(ApiError::BadRequest(
                 "completion references an unknown item".into(),
             ));

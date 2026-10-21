@@ -1,5 +1,8 @@
 import 'package:drift/drift.dart' show Value, driftRuntimeOptions;
 import 'package:drift/native.dart';
+
+import 'dart:async';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:tracker/data/api.dart';
@@ -9,13 +12,19 @@ import 'package:tracker/data/sync.dart';
 
 /// A tiny in-memory stand-in for the server's last-write-wins sync.
 class FakeServer {
+  Completer<void>? requestStarted;
+  Completer<void>? releaseAuthLost;
   int seq = 0;
   final items = <String, Map<String, dynamic>>{};
   final comps = <String, Map<String, dynamic>>{};
   bool reject = false;
   bool down = false;
 
-  Map<String, dynamic> sync(int since, List<Map<String, dynamic>> pi, List<Map<String, dynamic>> pc) {
+  Map<String, dynamic> sync(
+    int since,
+    List<Map<String, dynamic>> pi,
+    List<Map<String, dynamic>> pc,
+  ) {
     if (down) throw ApiException('Cannot reach the server');
     if (reject) throw AuthLost();
     for (final i in pi) {
@@ -42,8 +51,18 @@ class FakeApi extends Api {
   FakeApi(this.server) : super('http://fake', token: 't');
   final FakeServer server;
   @override
-  Future<Map<String, dynamic>> sync(int since, List<Map<String, dynamic>> items, List<Map<String, dynamic>> completions) async =>
-      server.sync(since, items, completions);
+  Future<Map<String, dynamic>> sync(
+    int since,
+    List<Map<String, dynamic>> items,
+    List<Map<String, dynamic>> completions,
+  ) async {
+    if (server.releaseAuthLost != null) {
+      server.requestStarted!.complete();
+      await server.releaseAuthLost!.future;
+      throw AuthLost();
+    }
+    return server.sync(since, items, completions);
+  }
 }
 
 class MemStore extends Store {
@@ -69,66 +88,175 @@ Future<(AppDb, SyncEngine, MemStore)> device(FakeServer s) async {
 
 void main() {
   driftRuntimeOptions.dontWarnAboutMultipleDatabases = true;
-  test('two offline devices converge, last write wins, un-tick syncs', () async {
-    final server = FakeServer();
-    final (dbA, syncA, _) = await device(server);
-    final (dbB, syncB, _) = await device(server);
+  test(
+    'two offline devices converge, last write wins, un-tick syncs',
+    () async {
+      final server = FakeServer();
+      final (dbA, syncA, _) = await device(server);
+      final (dbB, syncB, _) = await device(server);
 
-    // Phone A creates a chore and ticks it while offline.
-    await dbA.upsertItem(ItemsCompanion.insert(id: id1, kind: 'chore', name: 'Dishes', points: 10, updatedAt: 1000, dirty: const Value(true)));
-    await dbA.setCompletion(id1, '2026-10-19', true, 2000);
-    expect(await syncA.sync(), SyncStatus.idle);
-    expect(server.items.length, 1);
-    expect(server.comps.length, 1);
+      // Phone A creates a chore and ticks it while offline.
+      await dbA.upsertItem(
+        ItemsCompanion.insert(
+          id: id1,
+          kind: 'chore',
+          name: 'Dishes',
+          points: 10,
+          updatedAt: 1000,
+          dirty: const Value(true),
+        ),
+      );
+      await dbA.setCompletion(id1, '2026-10-19', true, 2000);
+      expect(await syncA.sync(), SyncStatus.idle);
+      expect(server.items.length, 1);
+      expect(server.comps.length, 1);
 
-    // Device B pulls everything.
-    expect(await syncB.sync(), SyncStatus.idle);
-    expect((await dbB.select(dbB.items).get()).single.name, 'Dishes');
-    expect((await dbB.select(dbB.completions).get()).single.deletedAt, isNull);
+      // Device B pulls everything.
+      expect(await syncB.sync(), SyncStatus.idle);
+      expect((await dbB.select(dbB.items).get()).single.name, 'Dishes');
+      expect(
+        (await dbB.select(dbB.completions).get()).single.deletedAt,
+        isNull,
+      );
 
-    // B un-ticks later; A renames earlier (stale). Both offline, then sync.
-    await dbB.setCompletion(id1, '2026-10-19', false, 9000);
-    await dbB.upsertItem(ItemsCompanion(id: const Value(id1), kind: const Value('chore'), name: const Value('Dishes B'), points: const Value(10), updatedAt: const Value(3000), dirty: const Value(true)));
-    await dbA.upsertItem(ItemsCompanion(id: const Value(id1), kind: const Value('chore'), name: const Value('Stale name'), points: const Value(10), updatedAt: const Value(1500), dirty: const Value(true)));
-    await syncB.sync();
-    await syncA.sync();
+      // B un-ticks later; A renames earlier (stale). Both offline, then sync.
+      await dbB.setCompletion(id1, '2026-10-19', false, 9000);
+      await dbB.upsertItem(
+        ItemsCompanion(
+          id: const Value(id1),
+          kind: const Value('chore'),
+          name: const Value('Dishes B'),
+          points: const Value(10),
+          updatedAt: const Value(3000),
+          dirty: const Value(true),
+        ),
+      );
+      await dbA.upsertItem(
+        ItemsCompanion(
+          id: const Value(id1),
+          kind: const Value('chore'),
+          name: const Value('Stale name'),
+          points: const Value(10),
+          updatedAt: const Value(1500),
+          dirty: const Value(true),
+        ),
+      );
+      await syncB.sync();
+      await syncA.sync();
 
-    final a = await dbA.select(dbA.completions).getSingle();
-    expect(a.deletedAt, isNotNull, reason: 'the un-tick reached A');
-    expect((await dbA.select(dbA.items).getSingle()).name, 'Dishes B', reason: 'the older rename from A lost to the newer one from B');
-    // Nothing is left dirty once converged.
-    expect(await (dbA.select(dbA.items)..where((t) => t.dirty.equals(true))).get(), isEmpty);
-    expect(await (dbB.select(dbB.completions)..where((t) => t.dirty.equals(true))).get(), isEmpty);
-  });
+      final a = await dbA.select(dbA.completions).getSingle();
+      expect(a.deletedAt, isNotNull, reason: 'the un-tick reached A');
+      expect(
+        (await dbA.select(dbA.items).getSingle()).name,
+        'Dishes B',
+        reason: 'the older rename from A lost to the newer one from B',
+      );
+      // Nothing is left dirty once converged.
+      expect(
+        await (dbA.select(dbA.items)..where((t) => t.dirty.equals(true))).get(),
+        isEmpty,
+      );
+      expect(
+        await (dbB.select(
+          dbB.completions,
+        )..where((t) => t.dirty.equals(true))).get(),
+        isEmpty,
+      );
+    },
+  );
 
   test('offline keeps rows dirty; auth loss reports unpaired', () async {
     final server = FakeServer()..down = true;
     final (db, sync, store) = await device(server);
-    await db.upsertItem(ItemsCompanion.insert(id: id1, kind: 'habit', name: 'Read', points: 15, updatedAt: 1, dirty: const Value(true)));
+    await db.upsertItem(
+      ItemsCompanion.insert(
+        id: id1,
+        kind: 'habit',
+        name: 'Read',
+        points: 15,
+        updatedAt: 1,
+        dirty: const Value(true),
+      ),
+    );
     expect(await sync.sync(), SyncStatus.offline);
-    expect(await (db.select(db.items)..where((t) => t.dirty.equals(true))).get(), hasLength(1));
+    expect(
+      await (db.select(db.items)..where((t) => t.dirty.equals(true))).get(),
+      hasLength(1),
+    );
 
     server
       ..down = false
       ..reject = true;
     expect(await sync.sync(), SyncStatus.unpaired);
-    expect(await store.token, isNull, reason: 'a revoked token is forgotten, not retried forever');
-    expect(await sync.sync(), SyncStatus.unpaired, reason: 'and nothing is sent without a token');
-    expect(await (db.select(db.items)..where((t) => t.dirty.equals(true))).get(), hasLength(1), reason: 'local data is kept');
+    expect(
+      await store.token,
+      isNull,
+      reason: 'a revoked token is forgotten, not retried forever',
+    );
+    expect(
+      await sync.sync(),
+      SyncStatus.unpaired,
+      reason: 'and nothing is sent without a token',
+    );
+    expect(
+      await (db.select(db.items)..where((t) => t.dirty.equals(true))).get(),
+      hasLength(1),
+      reason: 'local data is kept',
+    );
 
     server.reject = false;
     await store.saveToken('new');
+    sync.revalidate();
     expect(await sync.sync(), SyncStatus.idle);
-    expect(await (db.select(db.items)..where((t) => t.dirty.equals(true))).get(), isEmpty);
+    expect(
+      await (db.select(db.items)..where((t) => t.dirty.equals(true))).get(),
+      isEmpty,
+    );
+  });
+
+  test('delayed old 401 cannot clear a newly paired token', () async {
+    final server = FakeServer()
+      ..requestStarted = Completer<void>()
+      ..releaseAuthLost = Completer<void>();
+    final (db, sync, store) = await device(server);
+    final pending = sync.sync();
+    await server.requestStarted!.future;
+    sync.invalidate();
+    await store.saveToken('new-token');
+    sync.revalidate();
+    final generation = sync.generationForTest;
+    server.releaseAuthLost!.complete();
+    expect(await pending, SyncStatus.unpaired);
+    expect(await store.token, 'new-token');
+    expect(sync.generationForTest, generation);
+    await db.close();
   });
 
   test('an edit made while a sync is in flight stays dirty', () async {
     final server = FakeServer();
     final (db, sync, _) = await device(server);
-    await db.upsertItem(ItemsCompanion.insert(id: id1, kind: 'chore', name: 'A', points: 10, updatedAt: 100, dirty: const Value(true)));
+    await db.upsertItem(
+      ItemsCompanion.insert(
+        id: id1,
+        kind: 'chore',
+        name: 'A',
+        points: 10,
+        updatedAt: 100,
+        dirty: const Value(true),
+      ),
+    );
     await sync.sync();
     // Local edit newer than what the server has; a pull that echoes the old row must not overwrite it.
-    await db.upsertItem(ItemsCompanion(id: const Value(id1), kind: const Value('chore'), name: const Value('B'), points: const Value(10), updatedAt: const Value(200), dirty: const Value(true)));
+    await db.upsertItem(
+      ItemsCompanion(
+        id: const Value(id1),
+        kind: const Value('chore'),
+        name: const Value('B'),
+        points: const Value(10),
+        updatedAt: const Value(200),
+        dirty: const Value(true),
+      ),
+    );
     server.items[id1] = {...server.items[id1]!, 'seq': ++server.seq};
     await sync.sync();
     expect((await db.select(db.items).getSingle()).name, 'B');

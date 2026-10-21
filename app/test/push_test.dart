@@ -46,10 +46,24 @@ class RegistrationApi extends Api {
   RegistrationApi() : super('https://example.invalid');
   bool offline = false;
   bool revoked = false;
+  Completer<void>? callStarted;
+  Completer<void>? releaseResponse;
+  Completer<void>? requestStarted;
+  Completer<void>? releaseAuthLost;
   final sent = <String?>[];
   @override
   Future<void> setFcmToken(String? token) async {
+    callStarted?.complete();
+    if (releaseResponse != null) {
+      await releaseResponse!.future;
+      throw AuthLost();
+    }
     if (offline) throw ApiException('offline');
+    if (releaseAuthLost != null) {
+      requestStarted!.complete();
+      await releaseAuthLost!.future;
+      throw AuthLost();
+    }
     if (revoked) throw AuthLost();
     sent.add(token);
   }
@@ -98,6 +112,19 @@ void main() {
     api.revoked = true;
     await push.register();
     expect(push.status.value, PushStatus.unpaired);
+  });
+
+  test('delayed old registration 401 cannot clear a new pairing', () async {
+    api
+      ..callStarted = Completer<void>()
+      ..releaseResponse = Completer<void>();
+    final pending = push.init();
+    await api.callStarted!.future;
+    store.credential = 'new-token';
+    api.releaseResponse!.complete();
+    await pending;
+    expect(store.credential, 'new-token');
+    expect(push.status.value, PushStatus.registering);
   });
 
   test('network and initialization failures can be retried', () async {

@@ -19,6 +19,7 @@ class SyncEngine {
   bool _again = false;
   int _generation = 0;
   bool _invalidated = false;
+  String? _token;
 
   void invalidate() {
     _generation++;
@@ -53,7 +54,9 @@ class SyncEngine {
   Future<SyncStatus> _once() async {
     final token = await store.token;
     if (token == null) return SyncStatus.unpaired;
-    if (_invalidated) revalidate();
+    if (_token != null && _token != token) _generation++;
+    _token = token;
+    if (_invalidated) _invalidated = false;
     final generation = _generation;
     final api = _apiFactory(store.serverUrl, token);
 
@@ -74,8 +77,14 @@ class SyncEngine {
     } on AuthLost {
       // The server no longer knows this token (device revoked). Forget it instead of
       // retrying a dead credential forever; local data is kept for the next pairing.
-      await store.clearToken();
-      _invalidated = true;
+      if (generation == _generation &&
+          !_invalidated &&
+          await store.token == token) {
+        await store.clearToken();
+        _invalidated = true;
+        _generation++;
+        return SyncStatus.unpaired;
+      }
       return SyncStatus.unpaired;
     } on ApiException {
       return SyncStatus.offline;

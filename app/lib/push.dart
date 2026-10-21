@@ -76,6 +76,7 @@ class FcmPushService implements PushService {
   }
 
   Future<void> _register(bool requestPermission) async {
+    String? requestToken;
     status.value = PushStatus.registering;
     try {
       if (!_ready) {
@@ -91,6 +92,7 @@ class FcmPushService implements PushService {
         return;
       }
       final token = await store.token;
+      requestToken = token;
       if (token == null) {
         status.value = PushStatus.unpaired;
         return;
@@ -103,6 +105,7 @@ class FcmPushService implements PushService {
       await _apiFactory(store.serverUrl, token).setFcmToken(fcm);
       status.value = PushStatus.ready;
     } on AuthLost {
+      if (requestToken == null || await store.token != requestToken) return;
       await store.clearToken();
       status.value = PushStatus.unpaired;
       _ready = false;

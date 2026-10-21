@@ -34,13 +34,20 @@ pub enum Revoked {
 /// Revoke a device by full id or by a unique prefix of at least 4 characters.
 pub async fn revoke(db: &Db, id_or_prefix: &str) -> Result<Revoked, sqlx::Error> {
     let key = id_or_prefix.trim();
-    if key.len() < 4 || key.contains(['%', '_']) {
+    if key.len() < 4 {
         return Ok(Revoked::NotFound);
     }
-    let matches: Vec<(String, String)> = sqlx::query_as("SELECT id, name FROM devices WHERE id = ?1 OR id LIKE ?1 || '%'")
-        .bind(key)
-        .fetch_all(db)
-        .await?;
+    // Prefix matching treats user input literally rather than as LIKE wildcards.
+    let escaped = key
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let matches: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, name FROM devices WHERE id = ?1 OR id LIKE ?2 ESCAPE '\\'")
+            .bind(key)
+            .bind(format!("{escaped}%"))
+            .fetch_all(db)
+            .await?;
     let exact = matches.iter().find(|(id, _)| id == key);
     let (id, name) = match (exact, matches.len()) {
         (Some(m), _) => m.clone(),
@@ -48,11 +55,19 @@ pub async fn revoke(db: &Db, id_or_prefix: &str) -> Result<Revoked, sqlx::Error>
         (None, 1) => matches[0].clone(),
         (None, n) => return Ok(Revoked::Ambiguous(n)),
     };
-    sqlx::query("DELETE FROM devices WHERE id = ?").bind(&id).execute(db).await?;
+    sqlx::query("DELETE FROM devices WHERE id = ?")
+        .bind(&id)
+        .execute(db)
+        .await?;
     Ok(Revoked::Removed(name))
 }
 
 /// Revoke exactly this device (sign out). Returns whether a row was removed.
 pub async fn revoke_self(db: &Db, id: &str) -> Result<bool, sqlx::Error> {
-    Ok(sqlx::query("DELETE FROM devices WHERE id = ?").bind(id).execute(db).await?.rows_affected() > 0)
+    Ok(sqlx::query("DELETE FROM devices WHERE id = ?")
+        .bind(id)
+        .execute(db)
+        .await?
+        .rows_affected()
+        > 0)
 }

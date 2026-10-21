@@ -1354,3 +1354,28 @@ async fn first_run_check_ignores_other_users_devices() {
     paired(&h).await;
     assert_eq!(auth::admin_device_count(&h.state.db).await.unwrap(), 1);
 }
+
+// ---- who am I ----
+
+#[tokio::test]
+async fn pair_and_me_say_which_account_the_device_belongs_to() {
+    let h = harness().await;
+    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    let (s, v) = call(&h.app, "POST", "/pair", None, Some(json!({"code": code}))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!((v["user_id"].as_i64(), v["name"].as_str()), (Some(1), Some("admin")));
+    let admin = v["token"].as_str().unwrap().to_string();
+
+    let (bob_id, bob) = user_with_device(&h, "Bob").await;
+    let (s, me) = call(&h.app, "GET", "/me", Some(&bob), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!((me["user_id"].as_i64(), me["name"].as_str(), me["is_admin"].as_bool()), (Some(bob_id), Some("Bob"), Some(false)));
+    let (_, me) = call(&h.app, "GET", "/me", Some(&admin), None).await;
+    assert_eq!((me["user_id"].as_i64(), me["is_admin"].as_bool()), (Some(1), Some(true)));
+    assert_eq!(call(&h.app, "GET", "/me", None, None).await.0, StatusCode::UNAUTHORIZED);
+
+    // A code made for Bob pairs as Bob.
+    let code = auth::create_pairing_code_for(&h.state.db, bob_id).await.unwrap();
+    let (_, v) = call(&h.app, "POST", "/pair", None, Some(json!({"code": code}))).await;
+    assert_eq!((v["user_id"].as_i64(), v["name"].as_str()), (Some(bob_id), Some("Bob")));
+}

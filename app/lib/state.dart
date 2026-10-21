@@ -3,6 +3,7 @@ import 'dart:async';
 import 'dart:ui';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_timezone/flutter_timezone.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import 'package:drift/drift.dart' show Value;
@@ -31,9 +32,19 @@ final syncEngineProvider = Provider<SyncEngine>(
   (ref) => SyncEngine(ref.watch(dbProvider), ref.watch(storeProvider)),
 );
 /// How the app builds an [Api] for one-off calls (settings, sign out). Tests override it.
-final apiFactoryProvider = Provider<Api Function(String base, String token)>(
+final apiFactoryProvider = Provider<Api Function(String base, String? token)>(
   (ref) => (base, token) => Api(base, token: token),
 );
+
+/// The phone's IANA timezone name (for example `Europe/Berlin`), or null when unknown.
+/// Tests override it; failures must never block signing up.
+final phoneTimezoneProvider = Provider<Future<String?> Function()>((ref) => () async {
+  try {
+    return (await FlutterTimezone.getLocalTimezone()).identifier;
+  } catch (_) {
+    return null;
+  }
+});
 final sfxProvider = Provider<Sfx>((ref) => NoSfx());
 final pushProvider = Provider<PushService>((ref) => NoPushService());
 final fxProvider = Provider<FxController>((ref) {
@@ -191,12 +202,71 @@ class AppController {
     }
   }
 
+  /// True when the rows already on this phone could belong to another account than the one
+  /// about to be joined, so joining may delete them and the user must be asked first. That is
+  /// the case when there is local data and the phone has a history: a recorded account, or a
+  /// token from before accounts were recorded. A phone that was only ever used offline has no
+  /// history; its data is simply uploaded to the new account.
+  Future<bool> localDataAtRisk() async {
+    final store = ref.read(storeProvider);
+    await ensureAccount();
+    if (store.account == null && await store.token == null) return false;
+    return await _db.hasLocalData();
+  }
+
+  /// Make this phone belong to [account] on [server], with [token] as its credential.
+  ///
+  /// The local database is one store shared by whoever signs in, so rows from a previous
+  /// account must never be mixed into the new one or pushed to it. If the account or server
+  /// differs from the recorded one, or the phone has a token from before accounts were
+  /// recorded (so the owner is unknown), the local items and ticks are deleted first. The same
+  /// account again keeps its data and offers it to the server, and a phone with no history
+  /// (offline use only) keeps its data and uploads it. Returns whether local data was deleted.
+  Future<bool> adoptAccount({
+    required String server,
+    required String token,
+    required AccountInfo account,
+  }) async {
+    final store = ref.read(storeProvider);
+    await ensureAccount(); // a pre-accounts phone learns whose data it holds before we decide
+    final prev = store.account;
+    final hadToken = await store.token != null;
+    final same = prev != null && prev.sameAs(server, account.userId);
+    final wipe = !same && (prev != null || hadToken);
+    if (wipe) await _db.clearAll();
+    await store.setServerUrl(server);
+    await store.saveToken(token);
+    await store.setAccount(Account(server, account.userId, account.name));
+    await store.resetSync();
+    // A new or rebuilt server may be empty, so offer it everything we keep.
+    if (!wipe) await _db.markAllDirty();
+    ref.invalidate(pairedProvider);
+    unawaited(syncNow());
+    unawaited(ref.read(pushProvider).register(requestPermission: true));
+    return wipe;
+  }
+
+  /// A phone paired before accounts were recorded does not know whose data it holds. Ask the
+  /// server once and remember it, so a later re-pair to the same account does not wipe.
+  /// Best effort: offline, revoked, or an old server leave things as they were.
+  Future<void> ensureAccount() async {
+    final store = ref.read(storeProvider);
+    if (store.account != null) return;
+    final token = await store.token;
+    if (token == null) return;
+    try {
+      final me = await ref.read(apiFactoryProvider)(store.serverUrl, token).me();
+      await store.setAccount(Account(store.serverUrl, me.userId, me.name));
+    } catch (_) {}
+  }
+
   /// Sign this phone out: ask the server to revoke the token (best effort, the phone may be
   /// offline), forget the token and sync cursor, and optionally delete the local data.
   /// Returns false when the server could not be told, so the caller can say the token may
   /// still be valid until revoked from the server.
   Future<bool> signOut({bool wipeLocal = false}) async {
     final store = ref.read(storeProvider);
+    await ensureAccount(); // remember whose data stays on the phone if it is kept
     final token = await store.token;
     var revoked = true;
     if (token != null) {
@@ -210,7 +280,10 @@ class AppController {
     }
     await store.clearToken();
     await store.resetSync();
-    if (wipeLocal) await _db.clearAll();
+    if (wipeLocal) {
+      await _db.clearAll();
+      await store.clearAccount();
+    }
     ref.read(syncStatusProvider.notifier).set(SyncStatus.unpaired);
     ref.invalidate(pairedProvider);
     unawaited(ref.read(pushProvider).register());

@@ -15,6 +15,32 @@ class ApiException implements Exception {
   String toString() => message;
 }
 
+/// The account a device belongs to, as the server reports it.
+class AccountInfo {
+  const AccountInfo({required this.userId, required this.name, this.token});
+  final int userId;
+  final String name;
+
+  /// Present only in replies that create a device (`/pair`, `/signup`).
+  final String? token;
+
+  factory AccountInfo.fromJson(Map<String, dynamic> j) {
+    final id = (j['user_id'] as num?)?.toInt();
+    final name = j['name'] as String?;
+    if (id == null || name == null) {
+      throw ApiException('This server is too old for this version of the app');
+    }
+    return AccountInfo(userId: id, name: name, token: j['token'] as String?);
+  }
+}
+
+/// A short-lived code that adds another device to the signed-in account.
+class PairCode {
+  const PairCode(this.code, this.expiresInSecs);
+  final String code;
+  final int expiresInSecs;
+}
+
 /// The server-side reminder settings (`GET/PUT /settings`).
 class ServerSettings {
   const ServerSettings({
@@ -118,12 +144,33 @@ class Api {
     return decoded.cast<String, dynamic>();
   }
 
-  Future<String> pair(String code, String deviceName) async {
-    final r = await _send('POST', '/pair', {
-      'code': code,
+  /// Add this device to the account the code was made for.
+  Future<AccountInfo> pair(String code, String deviceName) async => AccountInfo.fromJson(
+    await _send('POST', '/pair', {'code': code, 'device_name': deviceName}),
+  );
+
+  /// Create an account from an invite code. [timezone] is the phone's IANA zone, if known.
+  Future<AccountInfo> signup({
+    required String invite,
+    required String name,
+    required String deviceName,
+    String? timezone,
+  }) async => AccountInfo.fromJson(
+    await _send('POST', '/signup', {
+      'invite': invite,
+      'name': name,
       'device_name': deviceName,
-    });
-    return r['token'] as String;
+      if (timezone != null && timezone.isNotEmpty) 'timezone': timezone,
+    }),
+  );
+
+  /// Who this token belongs to.
+  Future<AccountInfo> me() async => AccountInfo.fromJson(await _send('GET', '/me'));
+
+  /// A code for adding another device to this account.
+  Future<PairCode> newPairCode() async {
+    final r = await _send('POST', '/pair-code');
+    return PairCode(r['code'] as String, (r['expires_in_secs'] as num?)?.toInt() ?? 900);
   }
 
   Future<Map<String, dynamic>> sync(

@@ -28,6 +28,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sync", get(pull).post(sync))
         .route("/device", put(set_device).delete(sign_out))
         .route("/pair-code", post(new_pair_code))
+        .route("/me", get(me))
         .route("/stats", get(stats))
         .route("/settings", get(get_settings).put(put_settings))
         .route("/push/test", post(push_test))
@@ -54,6 +55,10 @@ struct PairReq {
 struct PairResp {
     device_id: String,
     token: String,
+    /// Which account the new device joined. Added for the app, which must notice when a phone
+    /// that held one account's data is paired to another. Older clients ignore the fields.
+    user_id: i64,
+    name: String,
 }
 
 async fn pair(
@@ -68,12 +73,33 @@ async fn pair(
     let name = if req.device_name.trim().is_empty() { "Android" } else { req.device_name.trim() };
     let name: String = name.chars().take(80).collect();
     match auth::redeem(&st.db, &req.code, &name).await? {
-        Some((device_id, token)) => Ok(Json(PairResp { device_id, token })),
+        Some((device_id, token)) => {
+            let (user_id, name): (i64, String) = sqlx::query_as(
+                "SELECT u.id, u.name FROM devices d JOIN users u ON u.id = d.user_id WHERE d.id = ?",
+            )
+            .bind(&device_id)
+            .fetch_one(&st.db)
+            .await?;
+            Ok(Json(PairResp { device_id, token, user_id, name }))
+        }
         None => {
             st.pair_limiter.record_failure(src);
             Err(ApiError::Unauthorized)
         }
     }
+}
+
+#[derive(Serialize)]
+struct MeResp {
+    user_id: i64,
+    name: String,
+    is_admin: bool,
+}
+
+/// Who the caller is. Lets an app that was paired before accounts existed learn its account.
+async fn me(State(st): State<AppState>, Extension(UserId(uid)): Extension<UserId>) -> ApiResult<Json<MeResp>> {
+    let u = users::find_by_id(&st.db, uid).await?.ok_or(ApiError::Unauthorized)?;
+    Ok(Json(MeResp { user_id: u.id, name: u.name, is_admin: u.is_admin }))
 }
 
 #[derive(Serialize)]

@@ -48,7 +48,8 @@ void main() {
       return http.Response('{"ok":true}', 200);
     }));
     expect(await c.read(controllerProvider).signOut(), isTrue);
-    expect(calls, ['DELETE /device Bearer tok']);
+    // The account is looked up first (best effort) so kept data stays attributed to it.
+    expect(calls, ['GET /me Bearer tok', 'DELETE /device Bearer tok']);
     expect(await store.token, isNull);
     expect(store.cursor, 0);
     expect(await db.select(db.items).get(), hasLength(1));

@@ -47,7 +47,10 @@ void main() {
       expect(a.notificationId, b.notificationId);
       expect(a.notificationId, isNot(c.notificationId));
       expect(a.notificationId, greaterThanOrEqualTo(0));
+      expect(a.notificationId, lessThan(0x80000000));
+      expect(ReminderPayload.decode(a.encode())!.notificationId, a.notificationId);
     });
+
 
     test('the notification carries a Mark done action that does not open the app', () {
       final a = reminderNotificationDetails().android!.actions!.single;

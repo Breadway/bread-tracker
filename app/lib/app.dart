@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'fx/fx.dart';
 import 'reminders.dart';
+import 'push.dart';
 import 'state.dart';
 import 'theme.dart';
 import 'ui/pair.dart';
@@ -80,9 +81,13 @@ class _ShellState extends ConsumerState<Shell> with WidgetsBindingObserver {
     final ctl = ref.read(controllerProvider);
     ctl.syncNow();
     ref.read(pushProvider).register();
-    _taps = ref.read(pushProvider).taps.listen(
-      (p) => ref.read(openTodayProvider.notifier).request(p.date),
-    );
+    final push = ref.read(pushProvider);
+    _taps = push.taps.listen((p) {
+      ref.read(openTodayProvider.notifier).request(p.date);
+      final push = ref.read(pushProvider);
+      if (push is FcmPushService) push.acknowledgeTap(p);
+    });
+    if (push is FcmPushService) push.replayPendingTap();
     _poll = Timer.periodic(const Duration(seconds: 60), (_) => ctl.syncNow());
     _conn = Connectivity().onConnectivityChanged.listen((r) {
       if (r.any((c) => c != ConnectivityResult.none)) {
@@ -116,7 +121,9 @@ class _ShellState extends ConsumerState<Shell> with WidgetsBindingObserver {
     if (r == null) return;
     final d = r.date == null ? null : DateTime.tryParse(r.date!);
     if (d != null) {
-      ref.read(selectedDayProvider.notifier).select(DateTime.utc(d.year, d.month, d.day));
+      ref
+          .read(selectedDayProvider.notifier)
+          .select(DateTime.utc(d.year, d.month, d.day));
     }
     setState(() => _tab = 0);
   }

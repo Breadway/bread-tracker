@@ -57,10 +57,10 @@ class FcmPushService implements PushService {
     this.store, {
     PushDevice? device,
     Api Function(String, String)? apiFactory,
-  }) : _device = device ?? FirebasePushDevice(),
+  }) : device = device ?? FirebasePushDevice(),
        _apiFactory = apiFactory ?? ((base, token) => Api(base, token: token));
   final Store store;
-  final PushDevice _device;
+  final PushDevice device;
   final Api Function(String, String) _apiFactory;
   @override
   final ValueNotifier<PushStatus> status = ValueNotifier(
@@ -71,7 +71,17 @@ class FcmPushService implements PushService {
   StreamSubscription<String>? _refresh;
 
   @override
-  Stream<ReminderPayload> get taps => _device.taps;
+  Stream<ReminderPayload> get taps => device.taps;
+
+  void acknowledgeTap(ReminderPayload payload) {
+    final d = device;
+    if (d is FirebasePushDevice) d.acknowledgeTap(payload);
+  }
+
+  void replayPendingTap() {
+    final d = device;
+    if (d is FirebasePushDevice) d.replayPendingTap();
+  }
 
   @override
   Future<void> init() => register();
@@ -90,14 +100,14 @@ class FcmPushService implements PushService {
     status.value = PushStatus.registering;
     try {
       if (!_ready) {
-        await _device.initialize();
-        _refresh = _device.tokens.listen(
+        await device.initialize();
+        _refresh = device.tokens.listen(
           (_) => unawaited(register()),
           onError: (Object _) => status.value = PushStatus.failed,
         );
         _ready = true;
       }
-      if (!await _device.permitted(request: requestPermission)) {
+      if (!await device.permitted(request: requestPermission)) {
         status.value = PushStatus.denied;
         return;
       }
@@ -106,7 +116,7 @@ class FcmPushService implements PushService {
         status.value = PushStatus.unpaired;
         return;
       }
-      final fcm = await _device.token();
+      final fcm = await device.token();
       if (fcm == null || fcm.isEmpty) {
         status.value = PushStatus.failed;
         return;
@@ -114,6 +124,7 @@ class FcmPushService implements PushService {
       await _apiFactory(store.serverUrl, token).setFcmToken(fcm);
       status.value = PushStatus.ready;
     } on AuthLost {
+      await store.clearToken();
       status.value = PushStatus.unpaired;
     } catch (_) {
       status.value = PushStatus.failed;
@@ -122,18 +133,24 @@ class FcmPushService implements PushService {
 
   void dispose() {
     _refresh?.cancel();
-    _device.dispose();
+    device.dispose();
   }
 }
 
 class FirebasePushDevice implements PushDevice {
   static const channelId = reminderChannelId;
   final _local = FlutterLocalNotificationsPlugin();
-  final _taps = StreamController<ReminderPayload>.broadcast();
+  final StreamController<ReminderPayload> _taps =
+      StreamController<ReminderPayload>.broadcast();
+  ReminderPayload? _pendingLaunch;
   StreamSubscription<RemoteMessage>? _foreground, _opened;
 
   @override
   Stream<ReminderPayload> get taps => _taps.stream;
+
+  void acknowledgeTap(ReminderPayload payload) {
+    if (_pendingLaunch == payload) _pendingLaunch = null;
+  }
 
   @override
   Future<void> initialize() async {
@@ -144,7 +161,7 @@ class FirebasePushDevice implements PushDevice {
       onResponse: (r) {
         if (r.actionId != null && r.actionId!.isNotEmpty) return;
         final p = ReminderPayload.decode(r.payload);
-        if (p != null) _taps.add(p);
+        if (p != null) _rememberTap(p);
       },
     );
     final android = _local
@@ -173,7 +190,7 @@ class FirebasePushDevice implements PushDevice {
     await _opened?.cancel();
     _opened = FirebaseMessaging.onMessageOpenedApp.listen((m) {
       final p = ReminderPayload.fromData(m.data);
-      if (p != null) _taps.add(p);
+      if (p != null) _rememberTap(p);
     });
 
     // App launched by a notification tap while it was not running.
@@ -188,7 +205,24 @@ class FirebasePushDevice implements PushDevice {
         ? ReminderPayload.decode(local?.notificationResponse?.payload)
         : null;
     final launch = fromFcm ?? fromLocal;
-    if (launch != null) scheduleMicrotask(() => _taps.add(launch));
+    if (launch != null) _pendingLaunch = launch;
+    if (_pendingLaunch case final pending?) _rememberTap(pending);
+  }
+
+  void _rememberTap(ReminderPayload payload) {
+    _pendingLaunch = payload;
+    if (_taps.hasListener) {
+      _pendingLaunch = null;
+      _taps.add(payload);
+    }
+  }
+
+  void replayPendingTap() {
+    final pending = _pendingLaunch;
+    if (pending != null && _taps.hasListener) {
+      _pendingLaunch = null;
+      _taps.add(pending);
+    }
   }
 
   @override
@@ -238,6 +272,7 @@ class FirebasePushDevice implements PushDevice {
   void dispose() {
     _foreground?.cancel();
     _opened?.cancel();
+    _pendingLaunch = null;
     _taps.close();
   }
 }

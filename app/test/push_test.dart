@@ -12,6 +12,8 @@ class MemoryStore extends Store {
   String? credential = 'paired';
   @override
   Future<String?> get token async => credential;
+  @override
+  Future<void> clearToken() async => credential = null;
 }
 
 class FakeDevice implements PushDevice {
@@ -39,6 +41,17 @@ class FakeDevice implements PushDevice {
   Stream<ReminderPayload> get taps => const Stream.empty();
   @override
   void dispose() => unawaited(events.close());
+}
+
+class ColdStartDevice extends FakeDevice {
+  final controller = StreamController<ReminderPayload>.broadcast();
+  ReminderPayload? pending;
+  @override
+  Stream<ReminderPayload> get taps => controller.stream;
+  void deliver(ReminderPayload payload) {
+    pending = payload;
+    if (controller.hasListener) controller.add(payload);
+  }
 }
 
 class RegistrationApi extends Api {
@@ -138,4 +151,34 @@ void main() {
     expect(device.prompts, 1);
     expect(push.status.value, PushStatus.ready);
   });
+
+  test('a cold-start payload survives until the consumer attaches', () async {
+    final pending = const ReminderPayload(
+      itemId: 'item',
+      date: '2026-10-21',
+      kind: 'chore',
+    );
+    final device = ColdStartDevice();
+    device.deliver(pending);
+    final delivered = <ReminderPayload>[];
+    final sub = device.taps.listen(delivered.add);
+    if (device.pending case final value?) {
+      device.pending = null;
+      device.controller.add(value);
+    }
+    await Future<void>.delayed(Duration.zero);
+    expect(delivered.single.itemId, 'item');
+    await sub.cancel();
+    await device.controller.close();
+  });
+
+  test(
+    'AuthLost during push registration clears the dead pairing credential',
+    () async {
+      api.revoked = true;
+      await push.init();
+      expect(push.status.value, PushStatus.unpaired);
+      expect(await store.token, isNull);
+    },
+  );
 }

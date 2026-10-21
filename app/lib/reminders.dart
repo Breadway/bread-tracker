@@ -1,6 +1,6 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:ui' show DartPluginRegistrant;
+import 'dart:convert';
 
 import 'package:drift/drift.dart' show BooleanExpressionOperators;
 import 'package:firebase_core/firebase_core.dart';
@@ -63,7 +63,14 @@ class ReminderPayload {
   }
 
   /// A stable notification id, so a repeat for the same item and day replaces itself.
-  int get notificationId => Object.hash(itemId, date) & 0x7fffffff;
+  int get notificationId {
+    // Stable FNV-1a over UTF-8, constrained to Flutter's non-negative int range.
+    var hash = 0x811c9dc5;
+    for (final byte in utf8.encode('$itemId|$date')) {
+      hash = ((hash ^ byte) * 0x01000193) & 0x7fffffff;
+    }
+    return hash;
+  }
 }
 
 /// Details for a reminder notification, with the Mark done action.

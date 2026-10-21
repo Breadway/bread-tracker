@@ -145,6 +145,24 @@ class FirebasePushDevice implements PushDevice {
   ReminderPayload? _pendingLaunch;
   StreamSubscription<RemoteMessage>? _foreground, _opened;
 
+  /// Tests exercise this exact production buffering/replay code with a delayed
+  /// launch-data provider, matching Firebase initialization completing after Shell.
+  FirebasePushDevice({
+    @visibleForTesting Future<ReminderPayload?> Function()? initialTap,
+  }) : _initialTap = initialTap ?? _firebaseInitialTap;
+  final Future<ReminderPayload?> Function() _initialTap;
+
+  static Future<ReminderPayload?> _firebaseInitialTap() async {
+    final message = await FirebaseMessaging.instance.getInitialMessage();
+    if (message != null) return ReminderPayload.fromData(message.data);
+    final local = await FlutterLocalNotificationsPlugin()
+        .getNotificationAppLaunchDetails();
+    return (local?.didNotificationLaunchApp ?? false) &&
+            (local?.notificationResponse?.actionId ?? '').isEmpty
+        ? ReminderPayload.decode(local?.notificationResponse?.payload)
+        : null;
+  }
+
   @override
   Stream<ReminderPayload> get taps => _taps.stream;
 
@@ -194,17 +212,18 @@ class FirebasePushDevice implements PushDevice {
     });
 
     // App launched by a notification tap while it was not running.
-    final fcmLaunch = await FirebaseMessaging.instance.getInitialMessage();
-    final fromFcm = fcmLaunch == null
-        ? null
-        : ReminderPayload.fromData(fcmLaunch.data);
-    final local = await _local.getNotificationAppLaunchDetails();
-    final fromLocal =
-        (local?.didNotificationLaunchApp ?? false) &&
-            (local?.notificationResponse?.actionId ?? '').isEmpty
-        ? ReminderPayload.decode(local?.notificationResponse?.payload)
-        : null;
-    final launch = fromFcm ?? fromLocal;
+    await _captureInitialTap();
+  }
+
+  @visibleForTesting
+  Future<void> captureInitialTapForTest(
+    Future<ReminderPayload?> Function() initialTap,
+  ) => _captureInitialTap(initialTap);
+
+  Future<void> _captureInitialTap([
+    Future<ReminderPayload?> Function()? initialTap,
+  ]) async {
+    final launch = await (initialTap ?? _initialTap)();
     if (launch != null) _pendingLaunch = launch;
     if (_pendingLaunch case final pending?) _rememberTap(pending);
   }

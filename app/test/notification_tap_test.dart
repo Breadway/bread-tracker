@@ -29,40 +29,98 @@ class TapPush extends NoPushService {
 void main() {
   driftRuntimeOptions.dontWarnAboutMultipleDatabases = true;
 
-  testWidgets('tapping a reminder opens Today on the reminded day', (tester) async {
+  testWidgets('tapping a reminder opens Today on the reminded day', (
+    tester,
+  ) async {
     SharedPreferences.setMockInitialValues({});
     final prefs = await SharedPreferences.getInstance();
     final push = TapPush();
-    final container = ProviderContainer(overrides: [
-      prefsProvider.overrideWithValue(prefs),
-      storeProvider.overrideWithValue(NoTokenStore(prefs)),
-      dbProvider.overrideWithValue(AppDb(NativeDatabase.memory())),
-      pairedProvider.overrideWith((ref) async => true),
-      pushProvider.overrideWithValue(push),
-    ]);
+    final container = ProviderContainer(
+      overrides: [
+        prefsProvider.overrideWithValue(prefs),
+        storeProvider.overrideWithValue(NoTokenStore(prefs)),
+        dbProvider.overrideWithValue(AppDb(NativeDatabase.memory())),
+        pairedProvider.overrideWith((ref) async => true),
+        pushProvider.overrideWithValue(push),
+      ],
+    );
     addTearDown(container.dispose);
     tester.view.physicalSize = const Size(1080, 2340);
     tester.view.devicePixelRatio = 2.625;
     addTearDown(tester.view.reset);
-    await tester.pumpWidget(UncontrolledProviderScope(container: container, child: const TrackerApp()));
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const TrackerApp(),
+      ),
+    );
     await tester.pump(const Duration(milliseconds: 600));
 
     // Go to Settings, then a reminder for an earlier day is tapped.
     await tester.tap(find.text('Settings').last);
     await tester.pump(const Duration(milliseconds: 300));
-    expect(tester.widget<NavigationBar>(find.byType(NavigationBar)).selectedIndex, 3);
+    expect(
+      tester.widget<NavigationBar>(find.byType(NavigationBar)).selectedIndex,
+      3,
+    );
 
-    push.controller.add(const ReminderPayload(itemId: 'i', date: '2026-10-12', kind: 'chore'));
+    push.controller.add(
+      const ReminderPayload(itemId: 'i', date: '2026-10-12', kind: 'chore'),
+    );
     await tester.pump(const Duration(milliseconds: 100));
-    expect(tester.widget<NavigationBar>(find.byType(NavigationBar)).selectedIndex, 0, reason: 'Today tab');
+    expect(
+      tester.widget<NavigationBar>(find.byType(NavigationBar)).selectedIndex,
+      0,
+      reason: 'Today tab',
+    );
     expect(container.read(selectedDayProvider), DateTime.utc(2026, 10, 12));
 
     // A later tap for the same day still navigates again.
     await tester.tap(find.text('Settings').last);
     await tester.pump(const Duration(milliseconds: 300));
-    push.controller.add(const ReminderPayload(itemId: 'i', date: '2026-10-12', kind: 'chore'));
+    push.controller.add(
+      const ReminderPayload(itemId: 'i', date: '2026-10-12', kind: 'chore'),
+    );
     await tester.pump(const Duration(milliseconds: 100));
-    expect(tester.widget<NavigationBar>(find.byType(NavigationBar)).selectedIndex, 0);
+    expect(
+      tester.widget<NavigationBar>(find.byType(NavigationBar)).selectedIndex,
+      0,
+    );
     await tester.pump(const Duration(seconds: 1));
   });
+
+  test(
+    'production push device replays and acknowledges a delayed cold-start tap',
+    () async {
+      final gate = Completer<ReminderPayload?>();
+      final taps = <ReminderPayload>[];
+      var acknowledged = false;
+      final d = FirebasePushDevice();
+      d.taps.listen((payload) {
+        taps.add(payload);
+        d.acknowledgeTap(payload);
+        acknowledged = true;
+      });
+      final capture = d.captureInitialTapForTest(() => gate.future);
+      gate.complete(
+        const ReminderPayload(
+          itemId: 'cold',
+          date: '2026-10-12',
+          kind: 'chore',
+        ),
+      );
+      await capture;
+      d.replayPendingTap();
+      await Future<void>.delayed(Duration.zero);
+      expect(taps, [
+        const ReminderPayload(
+          itemId: 'cold',
+          date: '2026-10-12',
+          kind: 'chore',
+        ),
+      ]);
+      expect(acknowledged, isTrue);
+      d.dispose();
+    },
+  );
 }

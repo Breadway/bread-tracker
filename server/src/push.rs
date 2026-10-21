@@ -264,7 +264,6 @@ pub fn due_reminders(
         .filter(|i| i.kind == "todo")
         .map(|i| i.id.as_str())
         .collect();
-
     let mut out = Vec::new();
     for day in [today - ChronoDuration::days(1), today] {
         let date = day.format("%Y-%m-%d").to_string();

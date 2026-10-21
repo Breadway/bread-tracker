@@ -36,3 +36,11 @@ Messages are FCM HTTP v1, Android channel `reminders`, high priority, with data 
 **Mark done** runs in a background isolate without opening the app. It writes the same dirty completion row that ticking the item would (nothing if the item is deleted or already done; a to-do counts as done if completed on any day), then tries a sync with a 25 s limit. If the phone is offline the row stays dirty and syncs when the app next runs. The app re-reads the database when it returns to the foreground, because the background isolate writes to the same file.
 
 Reminders fire once per item per day. Repeat, overdue to-do reminders and snooze are not implemented: they need new server state (a reminder count or snooze time per item and day) and a decision on how persistent reminders should be, so they are left for a separate change.
+## CI
+
+`.forgejo/workflows/check.yml` runs on pushes to `feature/**`, `fix/**` and `main`, on the self-hosted runner: server `cargo clippy -D warnings` and `cargo test --locked` (plus `cargo fmt --check`), app `flutter analyze` and `flutter test`, a separate XP-vectors job, and a `docker build` of `packaging/Containerfile` (built, not pushed). The Flutter jobs need the toolchain at `~/.local/flutter` on the runner and do not need `google-services.json`.
+Messages are FCM HTTP v1 with notification + data (`item_id`, `date`, `kind`), Android channel `reminders`, high priority. The app's "Mark done" action uses the data to write the completion.
+
+## CI
+
+`.forgejo/workflows/check.yml` runs on pushes to `feature/**`, `fix/**` and `main`, on the self-hosted runner: server `cargo clippy -D warnings` and `cargo test --locked` (plus `cargo fmt --check`, report only until the code base is formatted once), app `flutter analyze` and `flutter test`, a separate `xp-vectors` job that validates `spec/xp_vectors.json` and runs the server and app rules tests against it side by side, and a `docker build` of `packaging/Containerfile` (built, not pushed). It does not run on pull requests, because the repo is public and the runner is self-hosted. The Flutter jobs need the toolchain at `~/.local/flutter` on the runner (see `scripts/android-env.sh`); they do not need `google-services.json` (only an APK build does, see the Android build notes in app/NOTIFICATIONS.md).

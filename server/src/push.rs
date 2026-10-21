@@ -162,7 +162,6 @@ impl Fcm {
         let raw = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let sa: ServiceAccount = serde_json::from_str(&raw).context("parsing service account json")?;
         Ok(Self {
-            mode,
             client: reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?,
             key: EncodingKey::from_rsa_pem(sa.private_key.as_bytes()).context("service account private key")?,
             project_id: sa.project_id,
@@ -188,7 +187,9 @@ impl Fcm {
             exp: now + 3600,
         };
         let jwt = jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &self.key)?;
-        let body = format!("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion={jwt}");
+        let body = format!(
+            "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion={jwt}"
+        );
         let resp = self
             .client
             .post(&self.token_uri)
@@ -276,7 +277,11 @@ pub fn due_reminders(
 
     let mut out = Vec::new();
     for it in items.iter().filter(|i| i.active && i.deleted_at.is_none()) {
-        let Some(rt) = it.remind_time.as_deref().and_then(|t| NaiveTime::parse_from_str(t, "%H:%M").ok()) else {
+        let Some(rt) = it
+            .remind_time
+            .as_deref()
+            .and_then(|t| NaiveTime::parse_from_str(t, "%H:%M").ok())
+        else {
             continue;
         };
         let applies = match it.kind.as_str() {
@@ -284,7 +289,10 @@ pub fn due_reminders(
             "todo" => it.due_date.as_deref() == Some(date.as_str()),
             _ => false,
         };
-        if !applies || done.contains(it.id.as_str()) || sent.contains(&(it.id.clone(), date.clone())) {
+        if !applies
+            || done.contains(it.id.as_str())
+            || sent.contains(&(it.id.clone(), date.clone()))
+        {
             continue;
         }
         let at = today.and_time(rt);
@@ -292,7 +300,12 @@ pub fn due_reminders(
         if late < 0 || late > grace_mins {
             continue;
         }
-        out.push(Due { item_id: it.id.clone(), name: it.name.clone(), kind: it.kind.clone(), date: date.clone() });
+        out.push(Due {
+            item_id: it.id.clone(),
+            name: it.name.clone(),
+            kind: it.kind.clone(),
+            date: date.clone(),
+        });
     }
     out
 }
@@ -316,7 +329,8 @@ pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize
     if !st.push.enabled() || store::get_setting(&st.db, "reminders_enabled").await? != "1" {
         return Ok(0);
     }
-    let tz = Tz::from_str(&store::get_setting(&st.db, "timezone").await?).unwrap_or(chrono_tz::Australia::Perth);
+    let tz = Tz::from_str(&store::get_setting(&st.db, "timezone").await?)
+        .unwrap_or(chrono_tz::Australia::Perth);
     let quiet = parse_quiet(
         &store::get_setting(&st.db, "quiet_start").await?,
         &store::get_setting(&st.db, "quiet_end").await?,
@@ -330,21 +344,31 @@ pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize
         .into_iter()
         .filter(|c| c.date == date)
         .collect();
-    let sent: HashSet<(String, String)> = sqlx::query_as::<_, (String, String)>("SELECT item_id, date FROM reminders_sent WHERE date = ?")
-        .bind(&date)
-        .fetch_all(&st.db)
-        .await?
-        .into_iter()
-        .collect();
+    let sent: HashSet<(String, String)> = sqlx::query_as::<_, (String, String)>(
+        "SELECT item_id, date FROM reminders_sent WHERE date = ?",
+    )
+    .bind(&date)
+    .fetch_all(&st.db)
+    .await?
+    .into_iter()
+    .collect();
 
-    let due = due_reminders(now, &items, &completions, &sent, st.config.reminder_grace_mins, quiet);
+    let due = due_reminders(
+        now,
+        &items,
+        &completions,
+        &sent,
+        st.config.reminder_grace_mins,
+        quiet,
+    );
     if due.is_empty() {
         return Ok(0);
     }
-    let devices: Vec<(String, String)> =
-        sqlx::query_as("SELECT id, fcm_token FROM devices WHERE fcm_token IS NOT NULL AND fcm_token != ''")
-            .fetch_all(&st.db)
-            .await?;
+    let devices: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, fcm_token FROM devices WHERE fcm_token IS NOT NULL AND fcm_token != ''",
+    )
+    .fetch_all(&st.db)
+    .await?;
     if devices.is_empty() {
         return Ok(0); // not marked sent, so it can still go out after a device registers
     }
@@ -376,12 +400,14 @@ pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize
             }
         }
         if delivered {
-            sqlx::query("INSERT OR IGNORE INTO reminders_sent (item_id, date, sent_at) VALUES (?, ?, ?)")
-                .bind(&d.item_id)
-                .bind(&d.date)
-                .bind(now_ms())
-                .execute(&st.db)
-                .await?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO reminders_sent (item_id, date, sent_at) VALUES (?, ?, ?)",
+            )
+            .bind(&d.item_id)
+            .bind(&d.date)
+            .bind(now_ms())
+            .execute(&st.db)
+            .await?;
             count += 1;
         }
     }

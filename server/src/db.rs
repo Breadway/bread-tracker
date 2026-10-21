@@ -26,7 +26,10 @@ pub async fn connect(database_url: &str) -> anyhow::Result<Db> {
 /// Fresh in-memory database for tests (single connection so all queries share it).
 pub async fn connect_memory() -> anyhow::Result<Db> {
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")?.foreign_keys(true);
-    let pool = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await?;
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await?;
     sqlx::migrate!("../migrations").run(&pool).await?;
     Ok(pool)
 }

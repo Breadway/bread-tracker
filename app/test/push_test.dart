@@ -11,6 +11,10 @@ class MemoryStore extends Store {
   String? credential = 'paired';
   @override
   Future<String?> get token async => credential;
+  @override
+  Future<void> clearToken() async => credential = null;
+  @override
+  Future<void> saveToken(String token) async => credential = token;
 }
 
 class FakeDevice implements PushDevice {
@@ -58,6 +62,7 @@ void main() {
   late FcmPushService push;
 
   setUp(() async {
+    TestWidgetsFlutterBinding.ensureInitialized();
     SharedPreferences.setMockInitialValues({});
     store = MemoryStore(await SharedPreferences.getInstance());
     device = FakeDevice();

@@ -47,11 +47,13 @@ class FcmPushService implements PushService {
     this.store, {
     PushDevice? device,
     Api Function(String, String)? apiFactory,
+    this.onAuthLost,
   }) : _device = device ?? FirebasePushDevice(),
        _apiFactory = apiFactory ?? ((base, token) => Api(base, token: token));
   final Store store;
   final PushDevice _device;
   final Api Function(String, String) _apiFactory;
+  final void Function()? onAuthLost;
   @override
   final ValueNotifier<PushStatus> status = ValueNotifier(
     PushStatus.unavailable,
@@ -101,7 +103,10 @@ class FcmPushService implements PushService {
       await _apiFactory(store.serverUrl, token).setFcmToken(fcm);
       status.value = PushStatus.ready;
     } on AuthLost {
+      await store.clearToken();
       status.value = PushStatus.unpaired;
+      _ready = false;
+      onAuthLost?.call();
     } catch (_) {
       status.value = PushStatus.failed;
     }

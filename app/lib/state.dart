@@ -28,11 +28,17 @@ final dbProvider = Provider<AppDb>((ref) {
   return db;
 });
 final syncEngineProvider = Provider<SyncEngine>(
-  (ref) => SyncEngine(ref.watch(dbProvider), ref.watch(storeProvider)),
+  (ref) => SyncEngine(
+    ref.watch(dbProvider),
+    ref.watch(storeProvider),
+    apiFactory: ref.watch(apiFactoryProvider),
+  ),
 );
+
 /// How the controller builds an [Api] for one-off calls such as sign out. Tests override it.
 final apiFactoryProvider = Provider<Api Function(String base, String token)>(
-  (ref) => (base, token) => Api(base, token: token),
+  (ref) =>
+      (base, token) => Api(base, token: token),
 );
 final sfxProvider = Provider<Sfx>((ref) => NoSfx());
 final pushProvider = Provider<PushService>((ref) => NoPushService());
@@ -144,6 +150,8 @@ class AppController {
   AppController(this.ref);
   final Ref ref;
   Timer? _syncTimer;
+  int _authGeneration = 0;
+  bool _signedOut = false;
   int _combo = 0;
   DateTime _lastTick = DateTime.fromMillisecondsSinceEpoch(0);
 
@@ -152,12 +160,18 @@ class AppController {
   static int nowMs() => DateTime.now().millisecondsSinceEpoch;
 
   void scheduleSync() {
+    if (_signedOut) return;
     _syncTimer?.cancel();
     _syncTimer = Timer(const Duration(milliseconds: 1500), syncNow);
   }
 
   Future<void> syncNow() async {
+    final generation = _authGeneration;
     final status = await ref.read(syncEngineProvider).sync();
+    if (generation != _authGeneration || _signedOut) return;
+    if (status == SyncStatus.unpaired) {
+      ref.invalidate(pairedProvider);
+    }
     if (status != SyncStatus.syncing) {
       ref.read(syncStatusProvider.notifier).set(status);
     }
@@ -172,6 +186,10 @@ class AppController {
   /// Returns false when the server could not be told, so the caller can say the token may
   /// still be valid until revoked from the server.
   Future<bool> signOut({bool wipeLocal = false}) async {
+    _authGeneration++;
+    _signedOut = true;
+    _syncTimer?.cancel();
+    ref.read(syncEngineProvider).invalidate();
     final store = ref.read(storeProvider);
     final token = await store.token;
     var revoked = true;
@@ -191,6 +209,12 @@ class AppController {
     ref.invalidate(pairedProvider);
     unawaited(ref.read(pushProvider).register());
     return revoked;
+  }
+
+  void pairedAgain() {
+    _authGeneration++;
+    _signedOut = false;
+    ref.read(syncEngineProvider).revalidate();
   }
 
   Future<void> toggle(ItemRow item, DateTime date, {Offset? at}) async {

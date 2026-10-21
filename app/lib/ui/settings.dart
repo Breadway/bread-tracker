@@ -204,6 +204,9 @@ class SettingsScreen extends ConsumerWidget {
               } on ApiException catch (e) {
                 toast(e.message);
               } on AuthLost catch (e) {
+                await store.clearToken();
+                ref.invalidate(pairedProvider);
+                await ref.read(pushProvider).register();
                 toast(e.toString());
               }
             },

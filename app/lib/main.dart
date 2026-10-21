@@ -7,6 +7,7 @@ import 'data/store.dart';
 import 'fx/sfx.dart';
 import 'push.dart';
 import 'state.dart';
+import 'ui/pair.dart' show pairedProvider;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -16,16 +17,20 @@ Future<void> main() async {
     ..sound = store.sound
     ..haptics = store.haptics;
   await sfx.init();
-  final push = FcmPushService(store);
+  late final ProviderContainer container;
+  final push = FcmPushService(
+    store,
+    onAuthLost: () => container.invalidate(pairedProvider),
+  );
+  container = ProviderContainer(
+    overrides: [
+      prefsProvider.overrideWithValue(prefs),
+      sfxProvider.overrideWithValue(sfx),
+      pushProvider.overrideWithValue(push),
+    ],
+  );
   runApp(
-    ProviderScope(
-      overrides: [
-        prefsProvider.overrideWithValue(prefs),
-        sfxProvider.overrideWithValue(sfx),
-        pushProvider.overrideWithValue(push),
-      ],
-      child: const TrackerApp(),
-    ),
+    UncontrolledProviderScope(container: container, child: const TrackerApp()),
   );
   // Never hold the first frame behind Firebase or a network request.
   push.init();

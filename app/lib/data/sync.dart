@@ -10,13 +10,25 @@ class SyncEngine {
   SyncEngine(
     this.db,
     this.store, {
-    Api Function(String base, String? token)? apiFactory,
+    Api Function(String base, String token)? apiFactory,
   }) : _apiFactory = apiFactory ?? ((b, t) => Api(b, token: t));
   final AppDb db;
   final Store store;
-  final Api Function(String, String?) _apiFactory;
+  final Api Function(String, String) _apiFactory;
   bool _running = false;
   bool _again = false;
+  int _generation = 0;
+  bool _invalidated = false;
+
+  void invalidate() {
+    _generation++;
+    _invalidated = true;
+  }
+
+  void revalidate() {
+    _generation++;
+    _invalidated = false;
+  }
 
   /// Push dirty rows, pull everything newer than the cursor. Safe to call often;
   /// overlapping calls collapse into one follow-up pass.
@@ -41,6 +53,8 @@ class SyncEngine {
   Future<SyncStatus> _once() async {
     final token = await store.token;
     if (token == null) return SyncStatus.unpaired;
+    if (_invalidated) revalidate();
+    final generation = _generation;
     final api = _apiFactory(store.serverUrl, token);
 
     final dirtyItems = await (db.select(
@@ -61,10 +75,13 @@ class SyncEngine {
       // The server no longer knows this token (device revoked). Forget it instead of
       // retrying a dead credential forever; local data is kept for the next pairing.
       await store.clearToken();
+      _invalidated = true;
       return SyncStatus.unpaired;
     } on ApiException {
       return SyncStatus.offline;
     }
+
+    if (generation != _generation || _invalidated) return SyncStatus.unpaired;
 
     await db.transaction(() async {
       // Rows unchanged since we pushed them are now clean.

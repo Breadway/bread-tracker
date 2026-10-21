@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(parent) = config.database_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).ok();
     }
-    let db = db::connect(&config.database_url()).await.context("opening database")?;
+    let db = db::connect_with_admin(&config.database_url(), config.admin_name.as_deref()).await.context("opening database")?;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {

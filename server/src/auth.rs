@@ -43,16 +43,23 @@ fn normalize_code(code: &str) -> String {
         .to_ascii_uppercase()
 }
 
-/// Create a pairing code valid for 15 minutes. Returned in `XXXX-XXXX` form.
+/// Create a pairing code valid for 15 minutes for the first (admin) user. Returned in
+/// `XXXX-XXXX` form.
 pub async fn create_pairing_code(db: &Db) -> Result<String, sqlx::Error> {
+    create_pairing_code_for(db, crate::users::ADMIN_ID).await
+}
+
+/// Create a pairing code that adds a device to `user_id`'s account.
+pub async fn create_pairing_code_for(db: &Db, user_id: i64) -> Result<String, sqlx::Error> {
     let mut rng = rand::thread_rng();
     let raw: String = (0..8).map(|_| CODE_ALPHABET[rng.gen_range(0..CODE_ALPHABET.len())] as char).collect();
     sqlx::query("DELETE FROM pairing_codes WHERE expires_at < ?")
         .bind(now_ms())
         .execute(db)
         .await?;
-    sqlx::query("INSERT INTO pairing_codes (code_hash, expires_at) VALUES (?, ?)")
+    sqlx::query("INSERT INTO pairing_codes (code_hash, user_id, expires_at) VALUES (?, ?, ?)")
         .bind(hash(&raw))
+        .bind(user_id)
         .bind(now_ms() + CODE_TTL_MS)
         .execute(db)
         .await?;
@@ -61,21 +68,22 @@ pub async fn create_pairing_code(db: &Db) -> Result<String, sqlx::Error> {
 
 /// Redeem a code (single use). Returns `(device_id, token)` on success.
 pub async fn redeem(db: &Db, code: &str, device_name: &str) -> Result<Option<(String, String)>, sqlx::Error> {
-    let used: Option<String> = sqlx::query_scalar(
-        "DELETE FROM pairing_codes WHERE code_hash = ? AND expires_at > ? RETURNING code_hash",
+    let used: Option<i64> = sqlx::query_scalar(
+        "DELETE FROM pairing_codes WHERE code_hash = ? AND expires_at > ? RETURNING user_id",
     )
     .bind(hash(&normalize_code(code)))
     .bind(now_ms())
     .fetch_optional(db)
     .await?;
-    if used.is_none() {
+    let Some(user_id) = used else {
         return Ok(None);
-    }
+    };
     let id = uuid::Uuid::new_v4().to_string();
     let token = random_token();
     let now = now_ms();
-    sqlx::query("INSERT INTO devices (id, name, token_hash, created_at, last_seen) VALUES (?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO devices (id, user_id, name, token_hash, created_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)")
         .bind(&id)
+        .bind(user_id)
         .bind(device_name)
         .bind(hash(&token))
         .bind(now)

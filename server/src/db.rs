@@ -8,6 +8,11 @@ use sqlx::SqlitePool;
 pub type Db = SqlitePool;
 
 pub async fn connect(database_url: &str) -> anyhow::Result<Db> {
+    connect_with_admin(database_url, None).await
+}
+
+/// Like [`connect`], and names the first (admin) user if it still has its placeholder name.
+pub async fn connect_with_admin(database_url: &str, admin_name: Option<&str>) -> anyhow::Result<Db> {
     let opts = SqliteConnectOptions::from_str(database_url)?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
@@ -21,6 +26,9 @@ pub async fn connect(database_url: &str) -> anyhow::Result<Db> {
 
     sqlx::migrate!("../migrations").run(&pool).await?;
     ensure_epoch(&pool).await?;
+    if let Some(name) = admin_name {
+        crate::users::apply_admin_name(&pool, name).await?;
+    }
     Ok(pool)
 }
 

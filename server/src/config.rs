@@ -19,6 +19,8 @@ pub struct Config {
     pub tombstone_days: i64,
     /// `notification` (default) or `data`; see `push::PushMode`.
     pub push_mode: PushMode,
+    /// Name for the first (admin) user, who owns all data that existed before multi-user.
+    pub admin_name: Option<String>,
 }
 
 impl Config {
@@ -59,6 +61,7 @@ impl Config {
                     })
                 })
                 .unwrap_or_default(),
+            admin_name: get("BREADTRACKER_ADMIN_NAME"),
         }
     }
 

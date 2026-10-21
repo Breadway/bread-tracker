@@ -405,7 +405,8 @@ pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize
             }
         }
         if delivered {
-            sqlx::query("INSERT OR IGNORE INTO reminders_sent (item_id, date, sent_at) VALUES (?, ?, ?)")
+            sqlx::query("INSERT OR IGNORE INTO reminders_sent (user_id, item_id, date, sent_at) VALUES (?, ?, ?, ?)")
+                .bind(crate::users::ADMIN_ID)
                 .bind(&d.item_id)
                 .bind(&d.date)
                 .bind(now_ms())

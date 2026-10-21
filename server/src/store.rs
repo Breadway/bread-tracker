@@ -4,6 +4,7 @@ use sqlx::SqliteConnection;
 
 use crate::db::Db;
 use crate::model::{Completion, Item, SyncResponse};
+use crate::users::ADMIN_ID;
 
 const DAY_MS: i64 = 86_400_000;
 
@@ -25,7 +26,8 @@ pub async fn apply_push(db: &Db, items: &[Item], completions: &[Completion]) -> 
 
     for it in items {
         let updated = it.updated_at.min(ceiling);
-        let existing: Option<i64> = sqlx::query_scalar("SELECT updated_at FROM items WHERE id = ?")
+        let existing: Option<i64> = sqlx::query_scalar("SELECT updated_at FROM items WHERE user_id = ? AND id = ?")
+            .bind(ADMIN_ID)
             .bind(&it.id)
             .fetch_optional(&mut *tx)
             .await?;
@@ -34,14 +36,15 @@ pub async fn apply_push(db: &Db, items: &[Item], completions: &[Completion]) -> 
         }
         let seq = next_seq(&mut tx).await?;
         sqlx::query(
-            "INSERT INTO items (id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, seq)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(id) DO UPDATE SET
+            "INSERT INTO items (user_id, id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, seq)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(user_id, id) DO UPDATE SET
                kind = excluded.kind, name = excluded.name, weekdays = excluded.weekdays,
                remind_time = excluded.remind_time, points = excluded.points, due_date = excluded.due_date,
                sort = excluded.sort, active = excluded.active, updated_at = excluded.updated_at,
                deleted_at = excluded.deleted_at, seq = excluded.seq",
         )
+        .bind(ADMIN_ID)
         .bind(&it.id)
         .bind(&it.kind)
         .bind(it.name.trim())
@@ -61,7 +64,8 @@ pub async fn apply_push(db: &Db, items: &[Item], completions: &[Completion]) -> 
     for c in completions {
         let updated = c.updated_at.min(ceiling);
         let existing: Option<i64> =
-            sqlx::query_scalar("SELECT updated_at FROM completions WHERE item_id = ? AND date = ?")
+            sqlx::query_scalar("SELECT updated_at FROM completions WHERE user_id = ? AND item_id = ? AND date = ?")
+                .bind(ADMIN_ID)
                 .bind(&c.item_id)
                 .bind(&c.date)
                 .fetch_optional(&mut *tx)
@@ -71,12 +75,13 @@ pub async fn apply_push(db: &Db, items: &[Item], completions: &[Completion]) -> 
         }
         let seq = next_seq(&mut tx).await?;
         sqlx::query(
-            "INSERT INTO completions (item_id, date, completed_at, updated_at, deleted_at, seq)
-             VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(item_id, date) DO UPDATE SET
+            "INSERT INTO completions (user_id, item_id, date, completed_at, updated_at, deleted_at, seq)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(user_id, item_id, date) DO UPDATE SET
                completed_at = excluded.completed_at, updated_at = excluded.updated_at,
                deleted_at = excluded.deleted_at, seq = excluded.seq",
         )
+        .bind(ADMIN_ID)
         .bind(&c.item_id)
         .bind(&c.date)
         .bind(c.completed_at.min(ceiling))

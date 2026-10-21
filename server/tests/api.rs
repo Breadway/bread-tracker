@@ -553,10 +553,10 @@ async fn prune_removes_only_what_can_never_matter_again() {
         "items": [gone, fresh_gone, item(H1, "habit", "Kept", 127, None, now)],
         "completions": [comp(C1, "2026-01-01", old, Some(old)), comp(C2, "2026-10-01", recent, Some(recent)), comp(H1, "2026-10-19", now, None)]
     }))).await;
-    sqlx::query("INSERT INTO reminders_sent (item_id, date, sent_at) VALUES (?, '2020-01-01', 0), (?, ?, 0)")
+    sqlx::query("INSERT INTO reminders_sent (user_id, item_id, date, sent_at) VALUES (1, ?, '2020-01-01', 0), (1, ?, ?, 0)")
         .bind(H1).bind(H1).bind(Utc::now().format("%Y-%m-%d").to_string())
         .execute(&h.state.db).await.unwrap();
-    sqlx::query("INSERT INTO pairing_codes (code_hash, expires_at) VALUES ('expired', ?), ('live', ?)")
+    sqlx::query("INSERT INTO pairing_codes (code_hash, user_id, expires_at) VALUES ('expired', 1, ?), ('live', 1, ?)")
         .bind(now - 1000).bind(now + 600_000)
         .execute(&h.state.db).await.unwrap();
 
@@ -606,7 +606,7 @@ async fn ambiguous_prefix_revokes_nothing() {
     paired(&h).await;
     paired(&h).await;
     for (id, n) in [("aaaa1111-0000-4000-8000-000000000001", 1), ("aaaa1111-0000-4000-8000-000000000002", 2)] {
-        sqlx::query("INSERT INTO devices (id, name, token_hash, created_at, last_seen) VALUES (?, ?, ?, 0, 0)")
+        sqlx::query("INSERT INTO devices (id, user_id, name, token_hash, created_at, last_seen) VALUES (?, 1, ?, ?, 0, 0)")
             .bind(id).bind(format!("d{n}")).bind(format!("hash{n}"))
             .execute(&h.state.db).await.unwrap();
     }

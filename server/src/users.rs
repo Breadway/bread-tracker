@@ -123,6 +123,42 @@ pub async fn remove(db: &Db, user_id: i64) -> Result<Result<Removed, RemoveError
     Ok(Ok(Removed { name, devices: counts[0], items: counts[1], completions: counts[2] }))
 }
 
+/// Everything stored for a user as one JSON document: the account, settings, devices (names
+/// and times only, never tokens), items and completions with their tombstones. The server
+/// route and the CLI both use this, so they cannot drift. `None` when the user does not exist.
+pub async fn export(db: &Db, user_id: i64) -> Result<Option<serde_json::Value>, sqlx::Error> {
+    let Some(u) = find_by_id(db, user_id).await? else { return Ok(None) };
+    let user = crate::store::UserDb::new(db, user_id);
+    let settings = user.settings().await?;
+    let devices: Vec<(String, i64, i64)> =
+        sqlx::query_as("SELECT name, created_at, last_seen FROM devices WHERE user_id = ? ORDER BY created_at, id")
+            .bind(user_id)
+            .fetch_all(db)
+            .await?;
+    let mut items = user.all_items().await?;
+    items.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut completions = user.all_completions().await?;
+    completions.sort_by(|a, b| (&a.item_id, &a.date).cmp(&(&b.item_id, &b.date)));
+    Ok(Some(serde_json::json!({
+        "format": "bread-tracker-export",
+        "version": 1,
+        "exported_at": crate::store::now_ms(),
+        "account": { "name": u.name, "created_at": u.created_at },
+        "settings": {
+            "timezone": settings.timezone,
+            "quiet_start": settings.quiet_start,
+            "quiet_end": settings.quiet_end,
+            "reminders_enabled": settings.reminders_enabled,
+        },
+        "devices": devices
+            .into_iter()
+            .map(|(name, created_at, last_seen)| serde_json::json!({"name": name, "created_at": created_at, "last_seen": last_seen}))
+            .collect::<Vec<_>>(),
+        "items": items,
+        "completions": completions,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::valid_name;

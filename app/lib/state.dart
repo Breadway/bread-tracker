@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'dart:ui';
 
@@ -254,6 +255,34 @@ class AppController {
       final me = await ref.read(apiFactoryProvider)(store.serverUrl, token).me();
       await store.setAccount(Account(store.serverUrl, me.userId, me.name));
     } catch (_) {}
+  }
+
+  /// Delete the signed-in account on the server (it must be confirmed with the account name),
+  /// then forget everything about it on this phone: token, cursor, account and the local items
+  /// and ticks. The local data is only deleted after the server confirmed, so a failed or
+  /// refused request (offline, admin account, wrong name) leaves the phone as it was.
+  /// Throws [ApiException] or [AuthLost] from the request.
+  Future<void> deleteAccount(String confirm) async {
+    final store = ref.read(storeProvider);
+    final token = await store.token;
+    if (token == null) throw ApiException('Not signed in');
+    await ref.read(apiFactoryProvider)(store.serverUrl, token).deleteAccount(confirm);
+    await store.clearToken();
+    await store.resetSync();
+    await store.clearAccount();
+    await _db.clearAll();
+    ref.read(syncStatusProvider.notifier).set(SyncStatus.unpaired);
+    ref.invalidate(pairedProvider);
+    unawaited(ref.read(pushProvider).register());
+  }
+
+  /// The account's data as pretty printed JSON, for the user to keep.
+  Future<String> exportJson() async {
+    final store = ref.read(storeProvider);
+    final token = await store.token;
+    if (token == null) throw ApiException('Not signed in');
+    final doc = await ref.read(apiFactoryProvider)(store.serverUrl, token).exportData();
+    return const JsonEncoder.withIndent('  ').convert(doc);
   }
 
   /// Sign this phone out: ask the server to revoke the token (best effort, the phone may be

@@ -177,3 +177,21 @@ fn disable_and_enable_keep_all_data_and_protect_the_admin() {
     assert!(!run(&db, &["user", "disable", "ghost"]).status.success());
     assert!(!run(&db, &["user", "disable"]).status.success());
 }
+
+#[test]
+fn export_prints_one_users_data_as_json_and_nothing_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.db");
+    run(&db, &["user", "list"]);
+    add_user(&db, "Bob");
+    add_user(&db, "Cy");
+    let o = run(&db, &["user", "export", "bob"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).expect("stdout is exactly one JSON document");
+    assert_eq!(v["account"]["name"], "Bob");
+    assert_eq!(v["items"].as_array().unwrap().len(), 1);
+    assert_eq!(v["items"][0]["id"], "item-Bob");
+    assert!(!out(&o).contains("Cy") && !out(&o).contains("hash-"), "no other user's data and no token hashes");
+    assert!(!run(&db, &["user", "export", "ghost"]).status.success());
+    assert!(!run(&db, &["user", "export"]).status.success());
+}

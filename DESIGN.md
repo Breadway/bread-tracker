@@ -1,7 +1,8 @@
 # Bread Tracker design
 
 Separate from the Nextcloud Chores calendar and the Gotify cron reminders. Server and
-database live on Hestia; the Android app (Flutter) is offline-first and syncs to it.
+database live on Hestia; the Android app (Flutter) is offline-first and syncs to it. The server
+is shared: each person has their own account, fully isolated from the others (see Users below).
 
 ## Rules (shared by server `server/src/xp.rs` and the app; vectors in `spec/xp_vectors.json`)
 
@@ -14,7 +15,7 @@ database live on Hestia; the Android app (Flutter) is offline-first and syncs to
 
 ## Sync
 
-- Rows: `items` and `completions` (key `item_id` + `date`). Every row has `updated_at` (client unix ms) and `deleted_at` (tombstone, so an un-tick or delete syncs).
+- Rows: `items` (key `user_id` + `id`) and `completions` (key `user_id` + `item_id` + `date`); every request only sees the caller's own rows. Every row has `updated_at` (client unix ms) and `deleted_at` (tombstone, so an un-tick or delete syncs).
 - Server assigns a monotonic `seq` to every accepted write. The cursor is a `seq`, so clock skew cannot lose rows.
 - `POST /sync {since, items, completions}` pushes local changes then returns every row with `seq > since` plus the new `cursor`, in one round trip. `GET /sync?since=` is pull only.
 - **Epoch.** The server stores a random `epoch` in `meta` the first time a database is opened and returns it in every sync response. The app remembers it next to the cursor. If it changes (the server was rebuilt or replaced), or the server's cursor is lower than the app's (the database was restored from an older replica, which keeps the same epoch), the app resets its cursor to 0, marks every local row dirty and syncs again, so a fresh or older server gets the phone's data back. Pairing does the same reset. Last write wins by `updated_at` makes the full push safe. A request whose `since` is ahead of the database is answered as if `since` were 0. A server without an epoch (older version) is treated as unchanged.
@@ -24,9 +25,16 @@ database live on Hestia; the Android app (Flutter) is offline-first and syncs to
 
 ## Auth
 
-Single user. `bread-tracker-server pair` prints a one-time code (valid 15 minutes, stored hashed). `POST /pair {code, device_name}` returns a bearer token once; only its SHA-256 is stored. Pairing is limited to 5 failed attempts per 10 minutes per client address; successful pairings are not counted and one address being blocked does not affect another. The client address is the TCP peer, or the `X-Forwarded-For` client when the peer is listed in `BREADTRACKER_TRUSTED_PROXIES`. All other routes except `/healthz` need `Authorization: Bearer <token>`.
+Every account has one or more devices. A device holds a bearer token; only its SHA-256 is stored, and the token identifies exactly one device and so exactly one user. There are two ways to get a device:
 
-Devices can be listed and revoked: `bread-tracker-server devices` prints id, name, pairing and last-seen time and whether push is registered; `bread-tracker-server revoke <id>` deletes a device by id or unique prefix (at least 4 characters). A revoked token gets 401 on its next request. The app has a Sign out action in Settings that calls `DELETE /device` (revokes only the calling device), forgets the token and cursor, and optionally deletes local data. When any request gets 401 the app forgets the dead token and shows the pairing screen again, keeping local data. Tokens still do not expire or rotate.
+- **Join with an invite** (a new account): `POST /signup {invite, name, device_name?, timezone?}`, public, see "Invites and signup" below.
+- **Pair with a code** (another device for an existing account): `bread-tracker-server pair [--user <name>]` prints a one-time code (valid 15 minutes, stored hashed, bound to that user; the admin's when no user is given), or a signed-in device asks `POST /pair-code` for one for its own account. `POST /pair {code, device_name}` returns a bearer token once, plus the account's `user_id` and `name`.
+
+Pairing is limited to 5 failed attempts per 10 minutes per client address; successful pairings are not counted and one address being blocked does not affect another. The client address is the TCP peer, or the `X-Forwarded-For` client when the peer is listed in `BREADTRACKER_TRUSTED_PROXIES`. All other routes except `/healthz`, `/pair` and `/signup` need `Authorization: Bearer <token>`.
+
+Devices can be listed and revoked: `bread-tracker-server devices [--user <name>]` prints id, owner, name, pairing and last-seen time and whether push is registered; `bread-tracker-server revoke <id>` deletes a device by id or unique prefix (at least 4 characters). A revoked token gets 401 on its next request, as does the token of a removed user; a disabled user's tokens get 403. The app has a Sign out action in Settings that calls `DELETE /device` (revokes only the calling device), forgets the token and cursor, and optionally deletes local data. When any request gets 401 the app forgets the dead token and shows the pairing screen again, keeping local data. Tokens still do not expire or rotate.
+
+The first user, the admin, is the original single owner: migration 0002 gave them all pre-existing data. There is no HTTP route that grants or uses admin powers; administration is the command line on the server.
 
 ## Reminders
 
@@ -45,7 +53,7 @@ Reminders fire once per item per day. Repeat, overdue to-do reminders and snooze
 
 Every owned row belongs to a user: `items`, `completions`, `devices`, `reminders_sent` and `pairing_codes` carry a `user_id` referencing `users(id)` with `ON DELETE CASCADE`, so removing a user removes only their data. Keys are per user: items are `(user_id, id)`, completions `(user_id, item_id, date)`, reminders `(user_id, item_id, date)`. A client pushing an item id that another user also holds therefore creates or updates its own row and cannot touch the other one. Device token hashes stay globally unique. `meta.seq` remains one global counter; each user's own `seq` values have gaps, which is harmless because a cursor only means "everything larger". Sync reads use the `(user_id, seq)` indexes.
 
-Migration `0002_users.sql` creates the first user (id 1, the admin) and gives it all existing rows. The user is named `admin` by the migration and renamed from `BREADTRACKER_ADMIN_NAME` at start, once, only while it still has that placeholder name. User names are 1 to 40 letters, digits, spaces, `.`, `_` or `-`, unique ignoring case. The `settings` table is not migrated yet.
+Migration `0002_users.sql` creates the first user (id 1, the admin) and gives it all existing rows. The user is named `admin` by the migration and renamed from `BREADTRACKER_ADMIN_NAME` at start, once, only while it still has that placeholder name. User names are 1 to 40 letters, digits, spaces, `.`, `_` or `-`, unique ignoring case. The global `settings` table became per-user settings in migration 0003 (see Settings).
 
 ### Scoping
 
@@ -73,7 +81,7 @@ Management is command line only; the server exposes no admin routes over HTTP.
 
 - `pair [--user <name>]` prints a one-time code (15 minutes, single use) bound to that user; with no flag it is the admin's, as before. An unknown name is an error, never a fallback to the admin.
 - `devices [--user <name>]` lists devices with their owner. `revoke <id>` is unchanged.
-- `user list` and `user remove <name> --yes`. Removal needs the explicit flag, refuses admins, and deletes the user and everything they own in one transaction (devices, so their tokens stop working at once, items, completions, settings, reminder markers, pairing codes). It prints what was deleted. Invites keep their record with the user cleared. `users::remove` is the single deletion path; self-service account deletion should reuse it.
+- `user list` and `user remove <name> --yes`. Removal needs the explicit flag, refuses admins, and deletes the user and everything they own in one transaction (devices, so their tokens stop working at once, items, completions, settings, reminder markers, pairing codes). It prints what was deleted. Invites keep their record with the user cleared. `users::remove` is the single deletion path, also used by self-service account deletion.
 - `POST /pair-code` (authenticated) returns `{code, expires_in_secs}`: a 15 minute single-use code that adds another device to the caller's own account, redeemed with `POST /pair` like any other. It is bound to the user from the caller's token. A user keeps at most 3 unexpired codes; asking for another replaces the oldest.
 - The first-run pairing code printed at startup depends only on the admin having no device. Other users' devices do not suppress it, and no code is ever printed for another user.
 
@@ -119,4 +127,4 @@ A server that strangers can hold accounts on needs ceilings, all configurable wi
 - In the app, Settings has **Export my data** (copies the JSON to the clipboard; if it is too large for Android's clipboard limit the app says so) and **Delete my account** (type the account name to enable the button; the phone's token, cursor, recorded account and local items and ticks are removed only after the server confirms, so a refusal or an unreachable server changes nothing).
 - Deleting an account does not touch backups. The Litestream replica and any backup the owner took still hold the data until they rotate out (retention is 168 h by default in `packaging/litestream.yml`).
 
-**What the server owner can see.** The server stores users' items, completions, settings, device names and push tokens in plain SQLite, with no per-user encryption, and the owner administers the host and its backups. They can read every user's data and export it with `user export`. Users are not anonymous to them: names are chosen at signup. Tokens and invite codes are stored only as hashes. This should be said plainly to anyone who is invited; the join screen says it, and the onboarding documentation should repeat it.
+**What the server owner can see.** The server stores users' items, completions, settings, device names and push tokens in plain SQLite, with no per-user encryption, and the owner administers the host and its backups. They can read every user's data and export it with `user export`. Users are not anonymous to them: names are chosen at signup. Tokens and invite codes are stored only as hashes. This is said plainly to anyone invited: on the join screen and in `docs/ONBOARDING.md`.

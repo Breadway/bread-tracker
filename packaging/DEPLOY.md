@@ -50,26 +50,26 @@ docker run --rm -v /var/backups/bread-tracker:/b -v /tmp:/o litestream/litestrea
 sqlite3 /tmp/restored.db 'select count(*) from items;'
 ```
 
-## Upgrading an existing single-user deployment to the multi-user schema
+## Upgrading an existing single-user deployment to multi-user
 
-Migration `0002_users.sql` runs automatically at server start. It adds a `users` table, gives the
-existing data to the first user (id 1, the admin), and rebuilds `items`, `completions`, `devices`,
-`reminders_sent` and `pairing_codes` with a `user_id` and per-user keys. It is not reversible by
-starting an older image, so take a backup first.
+The multi-user release adds migrations that run automatically at server start: `0002_users.sql` adds a `users` table, gives all existing data to the first user (id 1, the admin) and rebuilds `items`, `completions`, `devices`, `reminders_sent` and `pairing_codes` with a `user_id` and per-user keys; `0003` moves the global settings to the admin; `0004` adds invites; `0005` and `0006` are small. They run in one transaction each, so a failure leaves the previous schema and the server refuses to start. They are not reversible by starting an older image, so back up first.
 
-1. Check that the Litestream replica is current and restorable:
-   `packaging/restore-test.sh` (it prints the item and device counts; note them).
-2. Take an explicit copy that you control, with the server running:
-   `docker exec bread-tracker sqlite3 /var/lib/bread-tracker/bread-tracker.db ".backup /var/lib/bread-tracker/pre-0002.db"`
-   (or stop the container and copy the volume). Keep it until you are happy with the result.
-3. Name the first user by setting `BREADTRACKER_ADMIN_NAME` in `.env` (for example `Riley`), then deploy.
-   The name is applied once: it renames the user only while it still has the placeholder name `admin`, so
-   changing the variable later does nothing. If you leave it unset the user is called `admin`.
-4. Check: the row counts match step 1 and `sqlite3 bread-tracker.db "select id,name,is_admin from users"`
-   shows one admin. Phones keep working without an app update, because the sync API did not change.
+1. **Check the Litestream replica** is current and restorable, and note the counts:
+   `packaging/restore-test.sh` (prints the item and device counts).
+2. **Take a copy you control.** The runtime image has no `sqlite3`, so copy the volume's files (database and WAL together) while the server is stopped, which is the simplest way to get a consistent copy:
 
-The migration runs in one transaction, so a failure leaves the old schema in place and the server
-refuses to start; restore from step 2 if anything else looks wrong.
+   ```sh
+   docker compose -f packaging/compose.yaml --project-directory . stop bread-tracker litestream
+   docker run --rm --user root -v bread-tracker_bread-tracker-data:/d:ro -v "$HOME/bread-tracker-pre-multiuser:/b" \
+     --entrypoint cp bread-tracker:local -a /d/. /b/
+   ```
+
+   Create `$HOME/bread-tracker-pre-multiuser` first and keep it until you are happy with the result. (The volume name is `<compose project>_bread-tracker-data`; check with `docker volume ls`.)
+3. **Name the first user.** Set `BREADTRACKER_ADMIN_NAME` in `.env` (for example `Riley`). It is applied once: it renames the user only while it still has the placeholder name `admin`, so changing it later does nothing. Unset, the user is called `admin`.
+4. **Deploy** as in the first section.
+5. **Check.** `docker exec bread-tracker bread-tracker-server user list` shows one admin with your devices; the item and device counts match step 1 (`devices` lists them). Existing phones keep working without an app update, because the sync API only gained fields. The timezone and quiet hours you had are now the admin's own settings.
+
+To roll back, stop the stack, restore the files from step 2 into the volume and start the previous image.
 
 ## Invites
 

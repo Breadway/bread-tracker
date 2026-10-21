@@ -35,7 +35,9 @@ impl Config {
                         .filter_map(|p| {
                             let parsed = TrustedProxy::parse(p);
                             if parsed.is_none() {
-                                eprintln!("ignoring invalid BREADTRACKER_TRUSTED_PROXIES entry: {p}");
+                                eprintln!(
+                                    "ignoring invalid BREADTRACKER_TRUSTED_PROXIES entry: {p}"
+                                );
                             }
                             parsed
                         })

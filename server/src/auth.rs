@@ -175,9 +175,10 @@ impl FailureLimiter {
                 !s.failures.is_empty()
             });
             if st.sources.len() >= MAX_SOURCES {
-                // Never evict a currently blocked source while an unblocked one exists:
-                // otherwise a flood of new addresses could reset an idle block. Within each
-                // class the least recently seen goes first.
+                // Preserve active blocks. When all entries are unblocked, a new address may
+                // evict an unblocked entry and reset its failures. This is bounded best-effort
+                // abuse control for the single-user pairing endpoint, not an account lockout
+                // guarantee; successful pairings do not count and codes still have high entropy.
                 let max = self.max;
                 let victim = st
                     .sources

@@ -19,7 +19,11 @@ async fn next_seq(conn: &mut SqliteConnection) -> Result<i64, sqlx::Error> {
 
 /// Apply client rows. A row only wins when its `updated_at` is newer than the stored one.
 /// Future timestamps are clamped to a day ahead so a bad phone clock cannot freeze a row.
-pub async fn apply_push(db: &Db, items: &[Item], completions: &[Completion]) -> Result<(), sqlx::Error> {
+pub async fn apply_push(
+    db: &Db,
+    items: &[Item],
+    completions: &[Completion],
+) -> Result<(), sqlx::Error> {
     let ceiling = now_ms() + DAY_MS;
     let mut tx = db.begin().await?;
 
@@ -115,7 +119,12 @@ pub async fn pull(db: &Db, since: i64) -> Result<SyncResponse, sqlx::Error> {
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(SyncResponse { cursor, items, completions, server_time: now_ms() })
+    Ok(SyncResponse {
+        cursor,
+        items,
+        completions,
+        server_time: now_ms(),
+    })
 }
 
 pub async fn all_items(db: &Db) -> Result<Vec<Item>, sqlx::Error> {

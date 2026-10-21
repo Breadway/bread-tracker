@@ -63,12 +63,18 @@ async fn main() -> anyhow::Result<()> {
             };
             match devices::revoke(&db, id).await? {
                 devices::Revoked::Removed(name) => println!("Revoked device \"{name}\"."),
-                devices::Revoked::NotFound => anyhow::bail!("no device matches {id:?} (use at least 4 characters of an id from `devices`)"),
-                devices::Revoked::Ambiguous(n) => anyhow::bail!("{id:?} matches {n} devices; use more of the id"),
+                devices::Revoked::NotFound => anyhow::bail!(
+                    "no device matches {id:?} (use at least 4 characters of an id from `devices`)"
+                ),
+                devices::Revoked::Ambiguous(n) => {
+                    anyhow::bail!("{id:?} matches {n} devices; use more of the id")
+                }
             }
             return Ok(());
         }
-        Some(other) => anyhow::bail!("unknown command {other:?} (expected pair, devices or revoke)"),
+        Some(other) => {
+            anyhow::bail!("unknown command {other:?} (expected pair, devices or revoke)")
+        }
         None => {}
     }
 

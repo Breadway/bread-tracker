@@ -485,8 +485,14 @@ async fn revoked_device_loses_access_immediately() {
     let (s, _) = call(&h.app, "GET", "/sync", Some(&phone), None).await;
     assert_eq!(s, StatusCode::OK);
     // Too short a prefix and unknown ids do nothing.
-    assert_eq!(devices::revoke(&h.state.db, "ab").await.unwrap(), Revoked::NotFound);
-    assert_eq!(devices::revoke(&h.state.db, "zzzzzzzz").await.unwrap(), Revoked::NotFound);
+    assert_eq!(
+        devices::revoke(&h.state.db, "ab").await.unwrap(),
+        Revoked::NotFound
+    );
+    assert_eq!(
+        devices::revoke(&h.state.db, "zzzzzzzz").await.unwrap(),
+        Revoked::NotFound
+    );
     assert_eq!(devices::list(&h.state.db).await.unwrap().len(), 2);
 
     // Revoke the first device by a unique prefix of its id.
@@ -505,14 +511,25 @@ async fn ambiguous_prefix_revokes_nothing() {
     let h = harness().await;
     paired(&h).await;
     paired(&h).await;
-    for (id, n) in [("aaaa1111-0000-4000-8000-000000000001", 1), ("aaaa1111-0000-4000-8000-000000000002", 2)] {
+    for (id, n) in [
+        ("aaaa1111-0000-4000-8000-000000000001", 1),
+        ("aaaa1111-0000-4000-8000-000000000002", 2),
+    ] {
         sqlx::query("INSERT INTO devices (id, name, token_hash, created_at, last_seen) VALUES (?, ?, ?, 0, 0)")
             .bind(id).bind(format!("d{n}")).bind(format!("hash{n}"))
             .execute(&h.state.db).await.unwrap();
     }
-    assert_eq!(devices::revoke(&h.state.db, "aaaa1111").await.unwrap(), Revoked::Ambiguous(2));
+    assert_eq!(
+        devices::revoke(&h.state.db, "aaaa1111").await.unwrap(),
+        Revoked::Ambiguous(2)
+    );
     assert_eq!(devices::list(&h.state.db).await.unwrap().len(), 4);
-    assert_eq!(devices::revoke(&h.state.db, "aaaa1111-0000-4000-8000-000000000002").await.unwrap(), Revoked::Removed("d2".into()));
+    assert_eq!(
+        devices::revoke(&h.state.db, "aaaa1111-0000-4000-8000-000000000002")
+            .await
+            .unwrap(),
+        Revoked::Removed("d2".into())
+    );
     assert_eq!(devices::list(&h.state.db).await.unwrap().len(), 3);
 }
 
@@ -521,7 +538,14 @@ async fn sign_out_revokes_only_the_calling_device() {
     let h = harness().await;
     let phone = paired(&h).await;
     let other = paired(&h).await;
-    call(&h.app, "PUT", "/device", Some(&phone), Some(json!({"fcm_token": "fcm-phone"}))).await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&phone),
+        Some(json!({"fcm_token": "fcm-phone"})),
+    )
+    .await;
     let (s, v) = call(&h.app, "DELETE", "/device", Some(&phone), None).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     let (s, _) = call(&h.app, "GET", "/sync", Some(&phone), None).await;
@@ -529,7 +553,10 @@ async fn sign_out_revokes_only_the_calling_device() {
     let (s, _) = call(&h.app, "GET", "/sync", Some(&other), None).await;
     assert_eq!(s, StatusCode::OK);
     // Its push token went with it, so it is not reminded any more.
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE fcm_token = 'fcm-phone'").fetch_one(&h.state.db).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE fcm_token = 'fcm-phone'")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
     assert_eq!(n, 0);
     let (s, _) = call(&h.app, "DELETE", "/device", None, None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "needs auth");

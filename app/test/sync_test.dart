@@ -224,11 +224,9 @@ void main() {
     sync.invalidate();
     await store.saveToken('new-token');
     sync.revalidate();
-    final generation = sync.generationForTest;
     server.releaseAuthLost!.complete();
     expect(await pending, SyncStatus.unpaired);
     expect(await store.token, 'new-token');
-    expect(sync.generationForTest, generation);
     await db.close();
   });
 

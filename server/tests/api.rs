@@ -990,3 +990,204 @@ async fn deleting_a_user_removes_their_settings() {
     let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_settings").fetch_one(&h.state.db).await.unwrap();
     assert_eq!(after, 1);
 }
+
+// ---- invites and signup ----
+
+use bread_tracker_server::invites;
+
+const DAY: i64 = 86_400_000;
+
+async fn invite(h: &Harness) -> String {
+    invites::create(&h.state.db, 1, 7 * DAY).await.unwrap().1
+}
+
+async fn signup(h: &Harness, code: &str, name: &str) -> (StatusCode, Value) {
+    call(&h.app, "POST", "/signup", None, Some(json!({"invite": code, "name": name, "device_name": "Pixel 9"}))).await
+}
+
+#[tokio::test]
+async fn signup_creates_the_user_settings_and_device_and_the_token_works() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let now = store::now_ms();
+    call(&h.app, "POST", "/sync", Some(&alice), Some(json!({"items": [item(C1, "chore", "Alice's", 127, None, now)]}))).await;
+
+    let code = invite(&h).await;
+    let (s, v) = call(&h.app, "POST", "/signup", None, Some(json!({"invite": code, "name": "  Sam  ", "device_name": "Sam's phone", "timezone": "Europe/Berlin"}))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["name"], "Sam");
+    let tok = v["token"].as_str().unwrap().to_string();
+    let uid = v["user_id"].as_i64().unwrap();
+    assert!(uid > 1);
+
+    let row: (String, bool) = sqlx::query_as("SELECT name, is_admin FROM users WHERE id = ?").bind(uid).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(row, ("Sam".to_string(), false), "never an admin");
+    let dev: (i64, String) = sqlx::query_as("SELECT user_id, name FROM devices WHERE id = ?").bind(v["device_id"].as_str().unwrap()).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(dev, (uid, "Sam's phone".to_string()));
+    let (_, st) = call(&h.app, "GET", "/settings", Some(&tok), None).await;
+    assert_eq!(st["timezone"], "Europe/Berlin");
+
+    // The new account is empty and isolated from Alice's data.
+    let (s, pulled) = call(&h.app, "GET", "/sync?since=0", Some(&tok), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(pulled["items"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn signup_without_a_timezone_or_with_a_bad_one_defaults_to_utc() {
+    let h = harness().await;
+    for (i, tz) in [None, Some("Mars/Olympus"), Some("")].into_iter().enumerate() {
+        let code = invite(&h).await;
+        let mut body = json!({"invite": code, "name": format!("User{i}")});
+        if let Some(tz) = tz {
+            body["timezone"] = json!(tz);
+        }
+        let (s, v) = call(&h.app, "POST", "/signup", None, Some(body)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let (_, st) = call(&h.app, "GET", "/settings", Some(v["token"].as_str().unwrap()), None).await;
+        assert_eq!(st["timezone"], "UTC");
+    }
+}
+
+#[tokio::test]
+async fn an_invite_is_single_use_and_a_used_one_looks_like_any_other_bad_code() {
+    let h = harness().await;
+    let code = invite(&h).await;
+    let (s, _) = signup(&h, &code.to_lowercase(), "First").await;
+    assert_eq!(s, StatusCode::OK, "case and dash insensitive");
+    let (s, v) = signup(&h, &code, "Second").await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s2, v2) = signup(&h, "AAAA-BBBB-CCCC", "Third").await;
+    assert_eq!((s, &v), (s2, &v2), "used and unknown codes are indistinguishable");
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(users, 2, "admin plus First");
+}
+
+#[tokio::test]
+async fn expired_and_revoked_invites_are_refused() {
+    let h = harness().await;
+    let (id, expired) = invites::create(&h.state.db, 1, DAY).await.unwrap();
+    sqlx::query("UPDATE invites SET expires_at = ? WHERE id = ?").bind(store::now_ms() - 1).bind(id).execute(&h.state.db).await.unwrap();
+    assert_eq!(signup(&h, &expired, "Late").await.0, StatusCode::UNAUTHORIZED);
+
+    let (id, revoked) = invites::create(&h.state.db, 1, DAY).await.unwrap();
+    assert_eq!(invites::revoke(&h.state.db, id).await.unwrap(), invites::Revoked::Revoked);
+    assert_eq!(signup(&h, &revoked, "Nope").await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(invites::revoke(&h.state.db, id).await.unwrap(), invites::Revoked::NotActive);
+    assert_eq!(invites::revoke(&h.state.db, 9999).await.unwrap(), invites::Revoked::NotFound);
+
+    let list = invites::list(&h.state.db).await.unwrap();
+    assert_eq!(list.iter().map(|i| i.status.clone()).collect::<Vec<_>>(), vec![invites::InviteStatus::Expired, invites::InviteStatus::Revoked]);
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(users, 1);
+}
+
+#[tokio::test]
+async fn names_are_validated_and_unique_ignoring_case_and_a_taken_name_keeps_the_invite() {
+    let h = harness().await;
+    let code = invite(&h).await;
+    for bad in ["", "   ", "has/slash", &"x".repeat(41), "tab\there"] {
+        let (s, _) = signup(&h, &code, bad).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad:?}");
+    }
+    // The placeholder admin name is taken, in any case.
+    let (s, v) = signup(&h, &code, "ADMIN").await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    // The failed attempts did not spend the invite.
+    let (s, _) = signup(&h, &code, "Sam").await;
+    assert_eq!(s, StatusCode::OK);
+    let code2 = invite(&h).await;
+    assert_eq!(signup(&h, &code2, "sam").await.0, StatusCode::CONFLICT);
+    let unused = invites::list(&h.state.db).await.unwrap().into_iter().filter(|i| i.status == invites::InviteStatus::Active).count();
+    assert_eq!(unused, 1, "the second invite is still usable with another name");
+    assert_eq!(signup(&h, &code2, "Sam2").await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn the_invite_code_is_stored_only_as_a_hash() {
+    let h = harness().await;
+    let code = invite(&h).await;
+    let raw = code.replace('-', "");
+    let stored: Vec<String> = sqlx::query_scalar("SELECT code_hash FROM invites").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert!(!stored[0].contains(&raw) && !stored[0].contains(&code));
+    assert_eq!(stored[0], auth::hash(&raw));
+    assert_eq!(code.len(), 14, "XXXX-XXXX-XXXX");
+}
+
+#[tokio::test]
+async fn signup_is_rate_limited_per_source_and_only_failures_count() {
+    let h = harness().await;
+    let bad = json!({"invite": "AAAA-BBBB-CCCC", "name": "Eve"});
+    for _ in 0..10 {
+        assert_eq!(call_from(&h.app, "203.0.113.9:5000", None, "/signup", bad.clone()).await, StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(call_from(&h.app, "203.0.113.9:5001", None, "/signup", bad.clone()).await, StatusCode::TOO_MANY_REQUESTS);
+    // Even a valid invite is refused from the blocked source for now...
+    let code = invite(&h).await;
+    let blocked = call_from(&h.app, "203.0.113.9:5002", None, "/signup", json!({"invite": code, "name": "Eve"})).await;
+    assert_eq!(blocked, StatusCode::TOO_MANY_REQUESTS);
+    // ...but another source is unaffected, and successful signups never count against anyone.
+    for i in 0..12 {
+        let c = invite(&h).await;
+        let s = call_from(&h.app, "198.51.100.7:4000", None, "/signup", json!({"invite": c, "name": format!("Ok{i}")})).await;
+        assert_eq!(s, StatusCode::OK, "signup {i}");
+    }
+    // /pair has its own counter: the signup block does not lock pairing.
+    let pc = auth::create_pairing_code(&h.state.db).await.unwrap();
+    assert_eq!(call_from(&h.app, "203.0.113.9:5003", None, "/pair", json!({"code": pc})).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn signup_is_public_but_the_other_routes_still_need_a_token() {
+    let h = harness().await;
+    let (s, _) = call(&h.app, "POST", "/signup", None, Some(json!({"invite": "x", "name": "y"}))).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "reaches the handler, refused for the invite, not for a missing token");
+    let (s, _) = call(&h.app, "GET", "/sync", None, None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn concurrent_double_redeem_creates_exactly_one_user() {
+    // A file database with several connections, so the two redemptions really race.
+    let dir = tempfile::tempdir().unwrap();
+    let pool = db::connect(&format!("sqlite://{}", dir.path().join("race.db").display())).await.unwrap();
+    for round in 0..5 {
+        let (_, code) = invites::create(&pool, 1, DAY).await.unwrap();
+        let mut tasks = Vec::new();
+        for i in 0..8 {
+            let (pool, code) = (pool.clone(), code.clone());
+            tasks.push(tokio::spawn(async move {
+                invites::signup(&pool, &code, &format!("R{round}U{i}"), "phone", None).await.unwrap()
+            }));
+        }
+        let mut ok = 0;
+        for t in tasks {
+            match t.await.unwrap() {
+                Ok(_) => ok += 1,
+                Err(e) => assert_eq!(e, invites::SignupError::BadInvite),
+            }
+        }
+        assert_eq!(ok, 1, "round {round}: exactly one redemption wins");
+    }
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users").fetch_one(&pool).await.unwrap();
+    assert_eq!(users, 1 + 5);
+    let devices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices").fetch_one(&pool).await.unwrap();
+    assert_eq!(devices, 5);
+    let settings: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_settings").fetch_one(&pool).await.unwrap();
+    assert_eq!(settings, 6);
+}
+
+#[tokio::test]
+async fn signup_is_atomic_when_a_step_fails_after_the_claim() {
+    let h = harness().await;
+    let code = invite(&h).await;
+    // Make the device insert fail (token hash collision is impossible, so break the table instead).
+    sqlx::query("CREATE TRIGGER no_devices BEFORE INSERT ON devices BEGIN SELECT RAISE(ABORT, 'no devices today'); END").execute(&h.state.db).await.unwrap();
+    let (s, _) = signup(&h, &code, "Sam").await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+    sqlx::query("DROP TRIGGER no_devices").execute(&h.state.db).await.unwrap();
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(users, 1, "no half-created user");
+    assert_eq!(signup(&h, &code, "Sam").await.0, StatusCode::OK, "the invite was not spent by the failed attempt");
+}

@@ -19,7 +19,7 @@ use crate::error::ApiError;
 use crate::store::now_ms;
 use crate::AppState;
 
-const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+pub(crate) const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const CODE_TTL_MS: i64 = 15 * 60 * 1000;
 const LAST_SEEN_INTERVAL_MS: i64 = 60 * 1000;
 
@@ -41,7 +41,7 @@ pub fn random_token() -> String {
     hex::encode(b)
 }
 
-fn normalize_code(code: &str) -> String {
+pub fn normalize_code(code: &str) -> String {
     code.chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect::<String>()
@@ -83,6 +83,16 @@ pub async fn redeem(db: &Db, code: &str, device_name: &str) -> Result<Option<(St
     let Some(user_id) = used else {
         return Ok(None);
     };
+    let mut conn = db.acquire().await?;
+    Ok(Some(insert_device(&mut conn, user_id, device_name).await?))
+}
+
+/// Create a device for `user_id` and return `(device_id, token)`. Only the token's hash is stored.
+pub async fn insert_device(
+    conn: &mut sqlx::SqliteConnection,
+    user_id: i64,
+    device_name: &str,
+) -> Result<(String, String), sqlx::Error> {
     let id = uuid::Uuid::new_v4().to_string();
     let token = random_token();
     let now = now_ms();
@@ -93,9 +103,9 @@ pub async fn redeem(db: &Db, code: &str, device_name: &str) -> Result<Option<(St
         .bind(hash(&token))
         .bind(now)
         .bind(now)
-        .execute(db)
+        .execute(conn)
         .await?;
-    Ok(Some((id, token)))
+    Ok((id, token))
 }
 
 pub async fn device_count(db: &Db) -> Result<i64, sqlx::Error> {

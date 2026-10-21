@@ -21,6 +21,8 @@ pub struct Config {
     pub push_mode: PushMode,
     /// Name for the first (admin) user, who owns all data that existed before multi-user.
     pub admin_name: Option<String>,
+    /// How long a new invite code stays valid, in days (`invite create --ttl` overrides it).
+    pub invite_ttl_days: i64,
 }
 
 impl Config {
@@ -62,6 +64,10 @@ impl Config {
                 })
                 .unwrap_or_default(),
             admin_name: get("BREADTRACKER_ADMIN_NAME"),
+            invite_ttl_days: get("BREADTRACKER_INVITE_TTL_DAYS")
+                .and_then(|v| v.parse().ok())
+                .filter(|d| (1..=365).contains(d))
+                .unwrap_or(7),
         }
     }
 

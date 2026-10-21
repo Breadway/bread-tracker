@@ -18,6 +18,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::model::{SyncRequest, SyncResponse};
 use crate::push::{Message, SendOutcome};
 use crate::store::{UserDb, UserSettings};
+use crate::{invites, users};
 use crate::{xp, AppState};
 
 const MAX_BATCH: usize = 5000;
@@ -34,6 +35,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/pair", post(pair))
+        .route("/signup", post(signup))
         .merge(authed)
         .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
@@ -70,6 +72,60 @@ async fn pair(
             st.pair_limiter.record_failure(src);
             Err(ApiError::Unauthorized)
         }
+    }
+}
+
+#[derive(Deserialize)]
+struct SignupReq {
+    invite: String,
+    name: String,
+    #[serde(default)]
+    device_name: String,
+    /// The phone's IANA timezone (for example `Europe/Berlin`). Optional; an unknown name is
+    /// ignored and the account keeps the UTC default, so signup never fails over a timezone.
+    #[serde(default)]
+    timezone: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SignupResp {
+    user_id: i64,
+    name: String,
+    device_id: String,
+    token: String,
+}
+
+/// Public. Create an account from an invite code: user, default settings and first device in
+/// one transaction. Never creates an admin. Failed attempts (bad invite) are limited per
+/// client address with the same limiter type as `/pair`.
+async fn signup(
+    State(st): State<AppState>,
+    ClientIp(src): ClientIp,
+    Json(req): Json<SignupReq>,
+) -> ApiResult<Json<SignupResp>> {
+    if st.signup_limiter.is_blocked(src) {
+        return Err(ApiError::TooManyRequests);
+    }
+    let name = req.name.trim();
+    if !invites::name_ok(name) {
+        return Err(ApiError::BadRequest(format!(
+            "name must be 1 to {} letters, digits, spaces, '.', '_' or '-'",
+            users::MAX_NAME_LEN
+        )));
+    }
+    let device_name = if req.device_name.trim().is_empty() { "Android" } else { req.device_name.trim() };
+    let device_name: String = device_name.chars().take(80).collect();
+    let timezone = req.timezone.as_deref().map(str::trim).filter(|t| !t.is_empty() && Tz::from_str(t).is_ok());
+    match invites::signup(&st.db, &req.invite, name, &device_name, timezone).await? {
+        Ok(s) => {
+            tracing::info!(user = s.user_id, "signed up");
+            Ok(Json(SignupResp { user_id: s.user_id, name: name.to_string(), device_id: s.device_id, token: s.token }))
+        }
+        Err(invites::SignupError::BadInvite) => {
+            st.signup_limiter.record_failure(src);
+            Err(ApiError::Unauthorized)
+        }
+        Err(invites::SignupError::NameTaken) => Err(ApiError::Conflict("that name is already taken".into())),
     }
 }
 

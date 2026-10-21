@@ -6,6 +6,7 @@ pub mod config;
 pub mod db;
 pub mod devices;
 pub mod error;
+pub mod invites;
 pub mod model;
 pub mod push;
 pub mod store;
@@ -25,6 +26,9 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub push: Arc<dyn PushSender>,
     pub pair_limiter: Arc<auth::FailureLimiter>,
+    /// Failed signup attempts (unknown, used, expired or revoked invite), counted per client
+    /// address with the same limiter type as `/pair`.
+    pub signup_limiter: Arc<auth::FailureLimiter>,
 }
 
 impl AppState {
@@ -34,6 +38,7 @@ impl AppState {
             config: Arc::new(config),
             push,
             pair_limiter: Arc::new(auth::FailureLimiter::new(5, Duration::from_secs(600))),
+            signup_limiter: Arc::new(auth::FailureLimiter::new(10, Duration::from_secs(600))),
         }
     }
 }

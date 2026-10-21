@@ -70,3 +70,15 @@ starting an older image, so take a backup first.
 
 The migration runs in one transaction, so a failure leaves the old schema in place and the server
 refuses to start; restore from step 2 if anything else looks wrong.
+
+## Invites
+
+Create a code for a new user (valid 7 days by default, single use) and send it to them:
+
+```sh
+docker exec bread-tracker bread-tracker-server invite create            # or --ttl 48h
+docker exec bread-tracker bread-tracker-server invite list
+docker exec bread-tracker bread-tracker-server invite revoke <id>
+```
+
+The code is shown once. Signup is a public endpoint (`POST /signup`) behind the same reverse proxy as the rest: set `BREADTRACKER_TRUSTED_PROXIES` to your proxy's address range so the per-address rate limit sees the real client rather than the proxy. `BREADTRACKER_INVITE_TTL_DAYS` changes the default lifetime.

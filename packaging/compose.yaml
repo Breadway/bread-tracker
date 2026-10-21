@@ -24,6 +24,7 @@ services:
       BREADTRACKER_TRUSTED_PROXIES: ${BREADTRACKER_TRUSTED_PROXIES:-}
       BREADTRACKER_PUSH_MODE: ${BREADTRACKER_PUSH_MODE:-notification}
       BREADTRACKER_ADMIN_NAME: ${BREADTRACKER_ADMIN_NAME:-}
+      BREADTRACKER_INVITE_TTL_DAYS: ${BREADTRACKER_INVITE_TTL_DAYS:-7}
     volumes:
       - bread-tracker-data:/var/lib/bread-tracker
       # FCM service account, mounted read-only when BREADTRACKER_FCM_KEY_FILE is set.

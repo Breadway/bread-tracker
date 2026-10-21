@@ -4,12 +4,15 @@
 //!   bread-tracker-server pair     print a one-time pairing code (valid 15 minutes)
 //!   bread-tracker-server devices  list paired devices
 //!   bread-tracker-server revoke <id>   remove a device (id or unique prefix, from `devices`)
+//!   bread-tracker-server invite create [--ttl 7d]   print a single-use signup code
+//!   bread-tracker-server invite list                list invites and their state
+//!   bread-tracker-server invite revoke <id>         cancel an unused invite
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
-use bread_tracker_server::{api, auth, config::Config, db, devices, push, AppState};
+use bread_tracker_server::{api, auth, config::Config, db, devices, invites, push, users, AppState};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::main]
@@ -59,7 +62,48 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        Some(other) => anyhow::bail!("unknown command {other:?} (expected pair, devices or revoke)"),
+        Some("invite") => {
+            match args.get(1).map(String::as_str) {
+                Some("create") => {
+                    let ttl_ms = match args.iter().position(|a| a == "--ttl") {
+                        Some(i) => {
+                            let v = args.get(i + 1).context("--ttl needs a value such as 7d, 48h or 90m")?;
+                            invites::parse_ttl(v).with_context(|| format!("invalid --ttl {v:?} (use e.g. 7d, 48h, 90m; 1 minute to 365 days)"))?
+                        }
+                        None => config.invite_ttl_days * 86_400_000,
+                    };
+                    let (id, code) = invites::create(&db, users::ADMIN_ID, ttl_ms).await?;
+                    println!("{code}");
+                    eprintln!("Invite {id}, valid until {}. It can be used once; it cannot be shown again.", fmt_ms(bread_tracker_server::store::now_ms() + ttl_ms));
+                }
+                Some("list") => {
+                    let list = invites::list(&db).await?;
+                    if list.is_empty() {
+                        println!("No invites.");
+                    }
+                    for i in list {
+                        let state = match i.status {
+                            invites::InviteStatus::Active => "active".to_string(),
+                            invites::InviteStatus::Used(by) => format!("used by {by}"),
+                            invites::InviteStatus::Expired => "expired".to_string(),
+                            invites::InviteStatus::Revoked => "revoked".to_string(),
+                        };
+                        println!("{:<4}  created {}  expires {}  {}", i.id, fmt_ms(i.created_at), fmt_ms(i.expires_at), state);
+                    }
+                }
+                Some("revoke") => {
+                    let id: i64 = args.get(2).and_then(|v| v.parse().ok()).context("usage: bread-tracker-server invite revoke <id from `invite list`>")?;
+                    match invites::revoke(&db, id).await? {
+                        invites::Revoked::Revoked => println!("Invite {id} revoked."),
+                        invites::Revoked::NotFound => anyhow::bail!("no invite {id}"),
+                        invites::Revoked::NotActive => anyhow::bail!("invite {id} is already used, expired or revoked"),
+                    }
+                }
+                _ => anyhow::bail!("usage: bread-tracker-server invite create [--ttl 7d] | list | revoke <id>"),
+            }
+            return Ok(());
+        }
+        Some(other) => anyhow::bail!("unknown command {other:?} (expected pair, devices, revoke or invite)"),
         None => {}
     }
 

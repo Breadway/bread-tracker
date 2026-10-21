@@ -68,9 +68,11 @@ class Api {
   Future<Map<String, dynamic>> sync(
     int since,
     List<Map<String, dynamic>> items,
-    List<Map<String, dynamic>> completions,
-  ) => _send('POST', '/sync', {
+    List<Map<String, dynamic>> completions, {
+    String? epoch,
+  }) => _send('POST', '/sync', {
     'since': since,
+    'epoch': ?epoch,
     'items': items,
     'completions': completions,
   });

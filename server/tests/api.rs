@@ -24,16 +24,29 @@ async fn harness() -> Harness {
     let db = db::connect_memory().await.unwrap();
     let mock = Arc::new(MockSender::default());
     let state = AppState::new(db, Config::from_env(), mock.clone());
-    Harness { app: api::router(state.clone()), state, mock }
+    Harness {
+        app: api::router(state.clone()),
+        state,
+        mock,
+    }
 }
 
-async fn call(app: &Router, method: &str, uri: &str, token: Option<&str>, body: Option<Value>) -> (StatusCode, Value) {
+async fn call(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
     let mut req = Request::builder().method(method).uri(uri);
     if let Some(t) = token {
         req = req.header("authorization", format!("Bearer {t}"));
     }
     let req = match body {
-        Some(b) => req.header("content-type", "application/json").body(Body::from(b.to_string())).unwrap(),
+        Some(b) => req
+            .header("content-type", "application/json")
+            .body(Body::from(b.to_string()))
+            .unwrap(),
         None => req.body(Body::empty()).unwrap(),
     };
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -45,7 +58,14 @@ async fn call(app: &Router, method: &str, uri: &str, token: Option<&str>, body: 
 
 async fn paired(h: &Harness) -> String {
     let code = auth::create_pairing_code(&h.state.db).await.unwrap();
-    let (s, v) = call(&h.app, "POST", "/pair", None, Some(json!({"code": code, "device_name": "Pixel"}))).await;
+    let (s, v) = call(
+        &h.app,
+        "POST",
+        "/pair",
+        None,
+        Some(json!({"code": code, "device_name": "Pixel"})),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "{v}");
     v["token"].as_str().unwrap().to_string()
 }
@@ -62,7 +82,13 @@ fn comp(item_id: &str, date: &str, updated: i64, deleted: Option<i64>) -> Value 
 #[tokio::test]
 async fn unauthenticated_requests_are_rejected() {
     let h = harness().await;
-    for (m, p) in [("GET", "/sync"), ("POST", "/sync"), ("GET", "/stats"), ("GET", "/settings"), ("PUT", "/device")] {
+    for (m, p) in [
+        ("GET", "/sync"),
+        ("POST", "/sync"),
+        ("GET", "/stats"),
+        ("GET", "/settings"),
+        ("PUT", "/device"),
+    ] {
         let (s, _) = call(&h.app, m, p, None, Some(json!({}))).await;
         assert_eq!(s, StatusCode::UNAUTHORIZED, "{m} {p}");
     }
@@ -76,7 +102,14 @@ async fn unauthenticated_requests_are_rejected() {
 async fn pairing_code_is_single_use_and_rate_limited() {
     let h = harness().await;
     let code = auth::create_pairing_code(&h.state.db).await.unwrap();
-    let (s, _) = call(&h.app, "POST", "/pair", None, Some(json!({"code": code.to_lowercase()}))).await;
+    let (s, _) = call(
+        &h.app,
+        "POST",
+        "/pair",
+        None,
+        Some(json!({"code": code.to_lowercase()})),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "code is case and dash insensitive");
     let (s, _) = call(&h.app, "POST", "/pair", None, Some(json!({"code": code}))).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "second use fails");
@@ -84,7 +117,15 @@ async fn pairing_code_is_single_use_and_rate_limited() {
     let h2 = harness().await;
     let mut last = StatusCode::OK;
     for _ in 0..7 {
-        last = call(&h2.app, "POST", "/pair", None, Some(json!({"code": "AAAA-BBBB"}))).await.0;
+        last = call(
+            &h2.app,
+            "POST",
+            "/pair",
+            None,
+            Some(json!({"code": "AAAA-BBBB"})),
+        )
+        .await
+        .0;
     }
     assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
 }
@@ -106,22 +147,69 @@ async fn sync_round_trip_last_write_wins_and_tombstones() {
     assert!(cursor >= 3);
 
     // Older rename loses, newer rename wins.
-    call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"items": [item(C1, "chore", "Stale", 127, None, now - 1000)]}))).await;
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [item(C1, "chore", "Stale", 127, None, now - 1000)]})),
+    )
+    .await;
     let (_, v) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"since": cursor, "items": [item(C1, "chore", "Dishes and dinner", 127, None, now + 1000)]}))).await;
-    assert_eq!(v["items"].as_array().unwrap().len(), 1, "only the changed row comes back");
+    assert_eq!(
+        v["items"].as_array().unwrap().len(),
+        1,
+        "only the changed row comes back"
+    );
     assert_eq!(v["items"][0]["name"], "Dishes and dinner");
 
     // Un-tick is a tombstone that syncs; an older re-tick does not resurrect it.
-    let (_, v) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"completions": [comp(C1, "2026-10-19", now + 5000, Some(now + 5000))]}))).await;
-    let c = v["completions"].as_array().unwrap().iter().find(|c| c["date"] == "2026-10-19").cloned().unwrap();
+    let (_, v) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"completions": [comp(C1, "2026-10-19", now + 5000, Some(now + 5000))]})),
+    )
+    .await;
+    let c = v["completions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["date"] == "2026-10-19")
+        .cloned()
+        .unwrap();
     assert!(!c["deleted_at"].is_null());
-    let (_, v) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"completions": [comp(C1, "2026-10-19", now + 2000, None)]}))).await;
-    let c = v["completions"].as_array().unwrap().iter().find(|c| c["date"] == "2026-10-19").cloned().unwrap();
+    let (_, v) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"completions": [comp(C1, "2026-10-19", now + 2000, None)]})),
+    )
+    .await;
+    let c = v["completions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["date"] == "2026-10-19")
+        .cloned()
+        .unwrap();
     assert!(!c["deleted_at"].is_null(), "stale re-tick must lose");
 
     // Pull-only returns nothing new at the head.
-    let (_, v) = call(&h.app, "GET", &format!("/sync?since={}", v["cursor"]), Some(&tok), None).await;
-    assert!(v["items"].as_array().unwrap().is_empty() && v["completions"].as_array().unwrap().is_empty());
+    let (_, v) = call(
+        &h.app,
+        "GET",
+        &format!("/sync?since={}", v["cursor"]),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert!(
+        v["items"].as_array().unwrap().is_empty()
+            && v["completions"].as_array().unwrap().is_empty()
+    );
 }
 
 #[tokio::test]
@@ -136,7 +224,14 @@ async fn sync_validates_rows() {
         item(C1, "chore", "x", 128, None, now),
         item(C1, "chore", "x", 127, Some("25:99"), now),
     ] {
-        let (s, _) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"items": [bad]}))).await;
+        let (s, _) = call(
+            &h.app,
+            "POST",
+            "/sync",
+            Some(&tok),
+            Some(json!({"items": [bad]})),
+        )
+        .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
     }
 }
@@ -163,11 +258,25 @@ async fn settings_round_trip_and_validation() {
     let tok = paired(&h).await;
     let (_, v) = call(&h.app, "GET", "/settings", Some(&tok), None).await;
     assert_eq!(v["timezone"], "Australia/Perth");
-    let (s, v) = call(&h.app, "PUT", "/settings", Some(&tok), Some(json!({"quiet_start": "22:00", "quiet_end": "07:00", "reminders_enabled": false}))).await;
+    let (s, v) = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"quiet_start": "22:00", "quiet_end": "07:00", "reminders_enabled": false})),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["quiet_start"], "22:00");
     assert_eq!(v["reminders_enabled"], false);
-    let (s, _) = call(&h.app, "PUT", "/settings", Some(&tok), Some(json!({"timezone": "Mars/Olympus"}))).await;
+    let (s, _) = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"timezone": "Mars/Olympus"})),
+    )
+    .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 }
 
@@ -178,11 +287,25 @@ fn perth(h: u32, m: u32) -> chrono::DateTime<Utc> {
 
 async fn seed_reminder_world(h: &Harness, tok: &str) {
     let now = store::now_ms();
-    call(&h.app, "POST", "/sync", Some(tok), Some(json!({"items": [
-        item(C1, "chore", "Recycling", 1, Some("17:15"), now),          // Mondays only
-        item(H1, "habit", "Read", 127, Some("20:00"), now),
-    ]}))).await;
-    call(&h.app, "PUT", "/device", Some(tok), Some(json!({"fcm_token": "fcm-token-1"}))).await;
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(tok),
+        Some(json!({"items": [
+            item(C1, "chore", "Recycling", 1, Some("17:15"), now),          // Mondays only
+            item(H1, "habit", "Read", 127, Some("20:00"), now),
+        ]})),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(tok),
+        Some(json!({"fcm_token": "fcm-token-1"})),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -191,7 +314,11 @@ async fn scheduler_sends_once_skips_done_and_not_yet_due() {
     let tok = paired(&h).await;
     seed_reminder_world(&h, &tok).await;
 
-    assert_eq!(push::tick(&h.state, perth(17, 0)).await.unwrap(), 0, "before the time");
+    assert_eq!(
+        push::tick(&h.state, perth(17, 0)).await.unwrap(),
+        0,
+        "before the time"
+    );
     assert_eq!(push::tick(&h.state, perth(17, 16)).await.unwrap(), 1);
     {
         let sent = h.mock.sent.lock().unwrap();
@@ -201,12 +328,27 @@ async fn scheduler_sends_once_skips_done_and_not_yet_due() {
         assert_eq!(sent[0].data["item_id"], C1);
         assert_eq!(sent[0].data["date"], "2026-10-19");
     }
-    assert_eq!(push::tick(&h.state, perth(17, 20)).await.unwrap(), 0, "deduped");
+    assert_eq!(
+        push::tick(&h.state, perth(17, 20)).await.unwrap(),
+        0,
+        "deduped"
+    );
 
     // The habit is done before its time, so it never fires.
     let now = store::now_ms();
-    call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"completions": [comp(H1, "2026-10-19", now, None)]}))).await;
-    assert_eq!(push::tick(&h.state, perth(20, 1)).await.unwrap(), 0, "already completed");
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"completions": [comp(H1, "2026-10-19", now, None)]})),
+    )
+    .await;
+    assert_eq!(
+        push::tick(&h.state, perth(20, 1)).await.unwrap(),
+        0,
+        "already completed"
+    );
     assert_eq!(h.mock.sent.lock().unwrap().len(), 1);
 }
 
@@ -222,16 +364,44 @@ async fn scheduler_honours_weekday_grace_quiet_hours_and_disable() {
 
     // Server was down for hours: the 17:15 chore is stale and dropped, not sent late.
     // (The 20:00 habit is still inside its grace window, so only it goes out.)
-    assert_eq!(push::tick(&h.state, perth(17, 15) + Duration::minutes(361)).await.unwrap(), 1);
-    assert_eq!(h.mock.sent.lock().unwrap().iter().map(|m| m.title.clone()).collect::<Vec<_>>(), vec!["Read"]);
+    assert_eq!(
+        push::tick(&h.state, perth(17, 15) + Duration::minutes(361))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        h.mock
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| m.title.clone())
+            .collect::<Vec<_>>(),
+        vec!["Read"]
+    );
 
     // Quiet hours suppress, and the reminder is still sendable once they end (within grace).
-    call(&h.app, "PUT", "/settings", Some(&tok), Some(json!({"quiet_start": "17:00", "quiet_end": "18:00"}))).await;
+    call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"quiet_start": "17:00", "quiet_end": "18:00"})),
+    )
+    .await;
     assert_eq!(push::tick(&h.state, perth(17, 30)).await.unwrap(), 0);
     assert_eq!(push::tick(&h.state, perth(18, 5)).await.unwrap(), 1);
 
     // Master switch.
-    call(&h.app, "PUT", "/settings", Some(&tok), Some(json!({"reminders_enabled": false}))).await;
+    call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"reminders_enabled": false})),
+    )
+    .await;
     assert_eq!(push::tick(&h.state, perth(20, 1)).await.unwrap(), 0);
 }
 
@@ -240,19 +410,47 @@ async fn dead_tokens_are_pruned_and_unsent_reminders_wait_for_a_device() {
     let h = harness().await;
     let tok = paired(&h).await;
     let now = store::now_ms();
-    call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"items": [item(C1, "chore", "Recycling", 1, Some("17:15"), now)]}))).await;
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [item(C1, "chore", "Recycling", 1, Some("17:15"), now)]})),
+    )
+    .await;
 
     // No device token yet: nothing is sent and nothing is marked sent.
     assert_eq!(push::tick(&h.state, perth(17, 16)).await.unwrap(), 0);
 
-    call(&h.app, "PUT", "/device", Some(&tok), Some(json!({"fcm_token": "dead-token"}))).await;
-    h.mock.dead_tokens.lock().unwrap().insert("dead-token".into());
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&tok),
+        Some(json!({"fcm_token": "dead-token"})),
+    )
+    .await;
+    h.mock
+        .dead_tokens
+        .lock()
+        .unwrap()
+        .insert("dead-token".into());
     assert_eq!(push::tick(&h.state, perth(17, 17)).await.unwrap(), 0);
-    let stored: Option<String> = sqlx::query_scalar("SELECT fcm_token FROM devices").fetch_one(&h.state.db).await.unwrap();
+    let stored: Option<String> = sqlx::query_scalar("SELECT fcm_token FROM devices")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
     assert!(stored.is_none(), "dead token cleared");
 
     // A fresh token registered inside the grace window still gets the reminder.
-    call(&h.app, "PUT", "/device", Some(&tok), Some(json!({"fcm_token": "good-token"}))).await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&tok),
+        Some(json!({"fcm_token": "good-token"})),
+    )
+    .await;
     assert_eq!(push::tick(&h.state, perth(17, 40)).await.unwrap(), 1);
 }
 
@@ -262,7 +460,14 @@ async fn push_test_route_needs_a_registered_token() {
     let tok = paired(&h).await;
     let (s, _) = call(&h.app, "POST", "/push/test", Some(&tok), None).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
-    call(&h.app, "PUT", "/device", Some(&tok), Some(json!({"fcm_token": "t1"}))).await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&tok),
+        Some(json!({"fcm_token": "t1"})),
+    )
+    .await;
     let (s, v) = call(&h.app, "POST", "/push/test", Some(&tok), None).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(h.mock.sent.lock().unwrap().len(), 1);
@@ -276,13 +481,30 @@ async fn sync_reports_a_stable_epoch_that_differs_between_databases() {
     let epoch = a["epoch"].as_str().unwrap().to_string();
     assert!(!epoch.is_empty() && epoch != "0");
     let now = store::now_ms();
-    let (_, b) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"items": [item(C1, "chore", "x", 127, None, now)]}))).await;
+    let (_, b) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [item(C1, "chore", "x", 127, None, now)]})),
+    )
+    .await;
     assert_eq!(b["epoch"], epoch, "writes do not change it");
 
-    // Opening the same database again keeps it; a different database gets its own.
-    bread_tracker_server::db::ensure_epoch(&h.state.db).await.unwrap();
+    // A normal database open preserves its identity. Explicit rotation changes it.
+    bread_tracker_server::db::ensure_epoch(&h.state.db)
+        .await
+        .unwrap();
+    let (_, same) = call(&h.app, "GET", "/sync", Some(&tok), None).await;
+    assert_eq!(same["epoch"], epoch);
+    bread_tracker_server::db::set_epoch(&h.state.db, "rotated-generation")
+        .await
+        .unwrap();
     let (_, c) = call(&h.app, "GET", "/sync", Some(&tok), None).await;
-    assert_eq!(c["epoch"], epoch);
+    assert_ne!(
+        c["epoch"], epoch,
+        "restored/restarted generation must change before writes"
+    );
     let other = harness().await;
     let tok2 = paired(&other).await;
     let (_, d) = call(&other.app, "GET", "/sync", Some(&tok2), None).await;
@@ -290,14 +512,95 @@ async fn sync_reports_a_stable_epoch_that_differs_between_databases() {
 }
 
 #[tokio::test]
+async fn generation_preflight_rejects_dirty_writes_then_returns_full_snapshot() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [item(C1, "chore", "restored", 127, None, now)]})),
+    )
+    .await;
+    let old_epoch: String = sqlx::query_scalar("SELECT value FROM settings WHERE key='sync_epoch'")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    bread_tracker_server::db::set_epoch(&h.state.db, "rotated-generation")
+        .await
+        .unwrap();
+    let current: i64 = sqlx::query_scalar("SELECT val FROM meta WHERE key='seq'")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert!(current >= 1);
+    let (status, _) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"since": 999, "epoch": old_epoch, "items": [item("22222222-2222-4222-8222-222222222222", "chore", "dirty", 127, None, now + 1000)]}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, preflight) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"since": 999, "epoch": old_epoch})),
+    )
+    .await;
+    assert_ne!(preflight["epoch"], old_epoch);
+    assert_eq!(preflight["items"].as_array().unwrap().len(), 1);
+    let (status, accepted) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"since": preflight["cursor"], "epoch": preflight["epoch"], "items": [item("22222222-2222-4222-8222-222222222222", "chore", "dirty", 127, None, now + 1000)]}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(accepted["items"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn legacy_client_without_generation_still_syncs() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    let (status, response) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [item(C1, "chore", "legacy", 127, None, now)]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["items"][0]["name"], "legacy");
+}
+
+#[tokio::test]
 async fn a_cursor_ahead_of_the_database_gets_everything() {
     let h = harness().await;
     let tok = paired(&h).await;
     let now = store::now_ms();
-    call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"items": [item(C1, "chore", "x", 127, None, now)]}))).await;
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [item(C1, "chore", "x", 127, None, now)]})),
+    )
+    .await;
     // A phone that synced against a later state of a database that was then restored from an older copy.
-    let (s, v) = call(&h.app, "GET", "/sync?since=999999", Some(&tok), None).await;
+    let (_, epoch_response) = call(&h.app, "GET", "/sync", Some(&tok), None).await;
+    let (s, v) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"since": 999999, "epoch": epoch_response["epoch"]})),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(v["items"].as_array().unwrap().len(), 1, "full pull instead of an empty one");
-    assert!(v["cursor"].as_i64().unwrap() < 999999, "cursor tells the client the database went backwards");
+    assert_eq!(
+        v["items"].as_array().unwrap().len(),
+        1,
+        "full pull instead of an empty one"
+    );
+    assert!(
+        v["cursor"].as_i64().unwrap() < 999999,
+        "cursor tells the client the database went backwards"
+    );
 }

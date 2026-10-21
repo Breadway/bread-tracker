@@ -2,6 +2,7 @@
 //!
 //!   bread-tracker-server          run the server
 //!   bread-tracker-server pair     print a one-time pairing code (valid 15 minutes)
+//!   bread-tracker-server mark-restored  rotate generation after restoring a DB
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,15 +14,32 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "bread_tracker_server=info,tower_http=info".into()))
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "bread_tracker_server=info,tower_http=info".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
     let config = Config::from_env();
-    if let Some(parent) = config.database_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+    if let Some(parent) = config
+        .database_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent).ok();
     }
-    let db = db::connect(&config.database_url()).await.context("opening database")?;
+    if std::env::args().nth(1).as_deref() == Some("mark-restored") {
+        db::rotate_sidecar_generation(&config.database_path)?;
+        println!("Sync generation rotated. Start the server to resume sync.");
+        return Ok(());
+    }
+
+    let db = db::connect(&config.database_url())
+        .await
+        .context("opening database")?;
+    let generation = db::read_or_create_generation(&config.database_path)?;
+    db::set_epoch(&db, &generation).await?;
 
     if std::env::args().nth(1).as_deref() == Some("pair") {
         println!("{}", auth::create_pairing_code(&db).await?);
@@ -46,7 +64,9 @@ async fn main() -> anyhow::Result<()> {
     push::spawn_scheduler(state.clone());
 
     let addr: SocketAddr = listen.parse().context("parsing BREADTRACKER_LISTEN")?;
-    let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("binding {addr}"))?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding {addr}"))?;
     tracing::info!(%addr, "listening");
     axum::serve(listener, api::router(state))
         .with_graceful_shutdown(async {

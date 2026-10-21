@@ -43,6 +43,68 @@ class SyncEngine {
     if (token == null) return SyncStatus.unpaired;
     final api = _apiFactory(store.serverUrl, token);
 
+    final requestEpoch = store.epoch;
+    Map<String, dynamic> preflight;
+    try {
+      preflight = await api.sync(
+        store.cursor,
+        const [],
+        const [],
+        epoch: requestEpoch,
+      );
+    } on AuthLost {
+      return SyncStatus.unpaired;
+    } on ApiException {
+      return SyncStatus.offline;
+    }
+    final serverEpoch = preflight['epoch'] as String?;
+    if (serverEpoch != null &&
+        requestEpoch != null &&
+        serverEpoch != requestEpoch &&
+        !afterReset) {
+      await db.transaction(() async {
+        for (final j
+            in (preflight['items'] as List).cast<Map<String, dynamic>>()) {
+          final local = await (db.select(
+            db.items,
+          )..where((t) => t.id.equals(j['id']))).getSingleOrNull();
+          if (local != null &&
+              local.dirty &&
+              local.updatedAt > (j['updated_at'] as int)) {
+            continue;
+          }
+          await db.upsertItem(_itemCompanion(j));
+        }
+        for (final j
+            in (preflight['completions'] as List)
+                .cast<Map<String, dynamic>>()) {
+          final local =
+              await (db.select(db.completions)..where(
+                    (t) =>
+                        t.itemId.equals(j['item_id']) &
+                        t.date.equals(j['date']),
+                  ))
+                  .getSingleOrNull();
+          if (local != null &&
+              local.dirty &&
+              local.updatedAt > (j['updated_at'] as int)) {
+            continue;
+          }
+          await db
+              .into(db.completions)
+              .insertOnConflictUpdate(_compCompanion(j));
+        }
+      });
+      await db.markAllDirty();
+      await store.resetSync();
+      await store.setEpoch(serverEpoch);
+      await store.setCursor(preflight['cursor'] as int);
+      return _once(afterReset: true);
+    }
+    if (serverEpoch != null && requestEpoch == null) {
+      await store.setEpoch(serverEpoch);
+    }
+
     final dirtyItems = await (db.select(
       db.items,
     )..where((t) => t.dirty.equals(true))).get();
@@ -56,6 +118,7 @@ class SyncEngine {
         store.cursor,
         [for (final i in dirtyItems) _itemJson(i)],
         [for (final c in dirtyComps) _compJson(c)],
+        epoch: requestEpoch,
       );
     } on AuthLost {
       return SyncStatus.unpaired;
@@ -63,22 +126,17 @@ class SyncEngine {
       return SyncStatus.offline;
     }
 
-    // The cursor only means something against the database it came from. If the server is a
-    // different database (new epoch), or went backwards (restored from an older copy), the
-    // phone's cursor is meaningless and the server may be missing rows the phone has. Start
-    // over: cursor 0 and push everything (last write wins makes that safe).
     final epoch = res['epoch'] as String?;
-    final serverCursor = res['cursor'] as int;
-    final known = store.epoch;
-    final changed = (epoch != null && known != null && epoch != known) || serverCursor < store.cursor;
-    if (changed && !afterReset) {
+    if (epoch != null &&
+        requestEpoch != null &&
+        epoch != requestEpoch &&
+        !afterReset) {
       await store.resetSync();
       await db.markAllDirty();
-      if (epoch != null) await store.setEpoch(epoch);
+      await store.setEpoch(epoch);
       return _once(afterReset: true);
     }
-    if (epoch != null && known == null) await store.setEpoch(epoch);
-
+    if (epoch != null && requestEpoch == null) await store.setEpoch(epoch);
     await db.transaction(() async {
       // Rows unchanged since we pushed them are now clean.
       for (final i in dirtyItems) {

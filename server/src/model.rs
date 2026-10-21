@@ -54,7 +54,8 @@ impl Item {
             NaiveTime::parse_from_str(t, "%H:%M").map_err(|_| bad("remind_time must be HH:MM"))?;
         }
         if let Some(d) = &self.due_date {
-            NaiveDate::parse_from_str(d, "%Y-%m-%d").map_err(|_| bad("due_date must be YYYY-MM-DD"))?;
+            NaiveDate::parse_from_str(d, "%Y-%m-%d")
+                .map_err(|_| bad("due_date must be YYYY-MM-DD"))?;
         }
         if !(0..=1000).contains(&self.points) {
             return Err(bad("points must be 0 to 1000"));
@@ -65,14 +66,18 @@ impl Item {
 
 impl Completion {
     pub fn validate(&self) -> Result<(), String> {
-        uuid::Uuid::parse_str(&self.item_id).map_err(|_| bad("completion item_id must be a uuid"))?;
-        NaiveDate::parse_from_str(&self.date, "%Y-%m-%d").map_err(|_| bad("date must be YYYY-MM-DD"))?;
+        uuid::Uuid::parse_str(&self.item_id)
+            .map_err(|_| bad("completion item_id must be a uuid"))?;
+        NaiveDate::parse_from_str(&self.date, "%Y-%m-%d")
+            .map_err(|_| bad("date must be YYYY-MM-DD"))?;
         Ok(())
     }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SyncRequest {
+    #[serde(default)]
+    pub epoch: Option<String>,
     #[serde(default)]
     pub since: i64,
     #[serde(default)]
@@ -84,8 +89,8 @@ pub struct SyncRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SyncResponse {
     /// Identity of this database; see `db::ensure_epoch`. Clients reset when it changes.
-    #[serde(default)]
-    pub epoch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<String>,
     pub cursor: i64,
     pub items: Vec<Item>,
     pub completions: Vec<Completion>,

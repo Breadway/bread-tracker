@@ -650,6 +650,14 @@ async fn user_with_device(h: &Harness, name: &str) -> (i64, String) {
     (uid, v["token"].as_str().unwrap().to_string())
 }
 
+/// Like `user_with_device`, but in the Perth timezone the reminder tests use for their clock.
+async fn perth_user_with_device(h: &Harness, name: &str) -> (i64, String) {
+    let (uid, tok) = user_with_device(h, name).await;
+    let (s, _) = call(&h.app, "PUT", "/settings", Some(&tok), Some(json!({"timezone": "Australia/Perth"}))).await;
+    assert_eq!(s, StatusCode::OK);
+    (uid, tok)
+}
+
 #[tokio::test]
 async fn pairing_code_binds_the_device_to_the_code_owner() {
     let h = harness().await;
@@ -793,7 +801,7 @@ async fn push_test_goes_to_the_callers_device_only() {
 async fn reminders_go_only_to_the_owners_devices_and_are_tracked_per_user() {
     let h = harness().await;
     let alice = paired(&h).await;
-    let (_, bob) = user_with_device(&h, "Bob").await;
+    let (_, bob) = perth_user_with_device(&h, "Bob").await;
     let now = store::now_ms();
     // Both users have a chore due at 17:15 on the same day, with the same item id.
     for tok in [&alice, &bob] {
@@ -816,7 +824,7 @@ async fn reminders_go_only_to_the_owners_devices_and_are_tracked_per_user() {
 async fn a_user_without_devices_does_not_block_or_consume_anothers_reminder() {
     let h = harness().await;
     let alice = paired(&h).await;
-    let (bob_id, bob) = user_with_device(&h, "Bob").await;
+    let (bob_id, bob) = perth_user_with_device(&h, "Bob").await;
     let now = store::now_ms();
     for tok in [&alice, &bob] {
         call(&h.app, "POST", "/sync", Some(tok), Some(json!({"items": [item(C1, "chore", "Dishes", 127, Some("17:15"), now)]}))).await;
@@ -834,7 +842,7 @@ async fn a_user_without_devices_does_not_block_or_consume_anothers_reminder() {
 async fn one_users_completion_does_not_suppress_anothers_reminder() {
     let h = harness().await;
     let alice = paired(&h).await;
-    let (_, bob) = user_with_device(&h, "Bob").await;
+    let (_, bob) = perth_user_with_device(&h, "Bob").await;
     let now = store::now_ms();
     for tok in [&alice, &bob] {
         call(&h.app, "POST", "/sync", Some(tok), Some(json!({"items": [item(C1, "chore", "Dishes", 127, Some("17:15"), now)]}))).await;
@@ -847,4 +855,138 @@ async fn one_users_completion_does_not_suppress_anothers_reminder() {
     assert_eq!(push::tick(&h.state, perth(17, 16)).await.unwrap(), 1);
     let sent: Vec<String> = h.mock.sent.lock().unwrap().iter().map(|m| m.token.clone()).collect();
     assert_eq!(sent, vec!["fcm-bob".to_string()], "Alice is skipped because she is done; Bob is still reminded");
+}
+
+// ---- per-user settings ----
+
+#[tokio::test]
+async fn new_users_start_with_utc_and_defaults_and_do_not_inherit_the_admins_settings() {
+    let h = harness().await;
+    let admin = paired(&h).await;
+    call(&h.app, "PUT", "/settings", Some(&admin), Some(json!({"timezone": "Asia/Kolkata", "quiet_start": "22:00", "quiet_end": "07:00", "reminders_enabled": false}))).await;
+    let (_, bob) = user_with_device(&h, "Bob").await;
+
+    let (s, v) = call(&h.app, "GET", "/settings", Some(&bob), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!((v["timezone"].as_str(), v["quiet_start"].as_str(), v["quiet_end"].as_str(), v["reminders_enabled"].as_bool()),
+               (Some("UTC"), Some(""), Some(""), Some(true)));
+    assert_eq!(v["utc_offset_minutes"], 0);
+    let (_, a) = call(&h.app, "GET", "/settings", Some(&admin), None).await;
+    assert_eq!((a["timezone"].as_str(), a["quiet_start"].as_str(), a["reminders_enabled"].as_bool()), (Some("Asia/Kolkata"), Some("22:00"), Some(false)));
+    assert_eq!(a["utc_offset_minutes"], 330);
+}
+
+#[tokio::test]
+async fn put_settings_changes_only_the_callers_row_and_validates_as_a_whole() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (_, bob) = user_with_device(&h, "Bob").await;
+    call(&h.app, "PUT", "/settings", Some(&bob), Some(json!({"timezone": "Europe/Berlin", "quiet_start": "21:00", "quiet_end": "06:00"}))).await;
+
+    let (s, v) = call(&h.app, "PUT", "/settings", Some(&alice), Some(json!({"timezone": "Asia/Tokyo"}))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["timezone"], "Asia/Tokyo");
+    let (_, b) = call(&h.app, "GET", "/settings", Some(&bob), None).await;
+    assert_eq!((b["timezone"].as_str(), b["quiet_start"].as_str(), b["quiet_end"].as_str()), (Some("Europe/Berlin"), Some("21:00"), Some("06:00")));
+
+    // A rejected request changes nothing, even the fields in it that were valid.
+    let (s, _) = call(&h.app, "PUT", "/settings", Some(&bob), Some(json!({"timezone": "Asia/Tokyo", "quiet_start": "nope"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = call(&h.app, "PUT", "/settings", Some(&bob), Some(json!({"timezone": "Asia/Tokyo", "quiet_end": ""}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "half-set quiet window");
+    let (_, b) = call(&h.app, "GET", "/settings", Some(&bob), None).await;
+    assert_eq!((b["timezone"].as_str(), b["quiet_start"].as_str(), b["quiet_end"].as_str()), (Some("Europe/Berlin"), Some("21:00"), Some("06:00")));
+}
+
+#[tokio::test]
+async fn stats_uses_the_callers_timezone_for_today() {
+    const H2: &str = "44444444-4444-4444-8444-444444444444";
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (_, bob) = user_with_device(&h, "Bob").await;
+    call(&h.app, "PUT", "/settings", Some(&alice), Some(json!({"timezone": "Pacific/Kiritimati"}))).await; // UTC+14
+    call(&h.app, "PUT", "/settings", Some(&bob), Some(json!({"timezone": "Pacific/Pago_Pago"}))).await; // UTC-11
+
+    // A streak is the run of days ending today, or yesterday when today is not done. H1 is done
+    // only on the user's local today, H2 only on their local yesterday, so both have a streak of
+    // 1 exactly when "today" is computed in the user's own zone. At any instant at least one of
+    // these two zones has a calendar date different from UTC's, and with UTC as "today" that
+    // user would lose a streak (a future completion counts for nothing, a two day old one is
+    // past the one day allowance), so a handler that ignored the zone cannot pass at any hour.
+    let local = |tz: chrono_tz::Tz, back: i64| (Utc::now().with_timezone(&tz).date_naive() - Duration::days(back)).format("%Y-%m-%d").to_string();
+    let now = store::now_ms();
+    for (tok, tz) in [(&alice, chrono_tz::Pacific::Kiritimati), (&bob, chrono_tz::Pacific::Pago_Pago)] {
+        call(&h.app, "POST", "/sync", Some(tok), Some(json!({
+            "items": [item(H1, "habit", "today only", 127, None, now), item(H2, "habit", "yesterday only", 127, None, now)],
+            "completions": [comp(H1, &local(tz, 0), now, None), comp(H2, &local(tz, 1), now, None)]
+        }))).await;
+    }
+    for tok in [&alice, &bob] {
+        let (s, v) = call(&h.app, "GET", "/stats", Some(tok), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!((v["streaks"][H1].as_i64(), v["streaks"][H2].as_i64()), (Some(1), Some(1)), "{v}");
+    }
+}
+
+#[tokio::test]
+async fn each_users_timezone_quiet_hours_and_switch_drive_their_own_reminders() {
+    let h = harness().await;
+    let alice = paired(&h).await; // Perth for the clock below
+    call(&h.app, "PUT", "/settings", Some(&alice), Some(json!({"timezone": "Australia/Perth"}))).await;
+    let (_, bob) = user_with_device(&h, "Bob").await; // stays UTC
+    let (_, cy) = perth_user_with_device(&h, "Cy").await;
+    let (_, di) = perth_user_with_device(&h, "Di").await;
+    let now = store::now_ms();
+    for tok in [&alice, &bob, &cy, &di] {
+        call(&h.app, "POST", "/sync", Some(tok), Some(json!({"items": [item(C1, "chore", "Dishes", 127, Some("17:15"), now)]}))).await;
+    }
+    for (tok, name) in [(&alice, "alice"), (&bob, "bob"), (&cy, "cy"), (&di, "di")] {
+        call(&h.app, "PUT", "/device", Some(tok), Some(json!({"fcm_token": format!("fcm-{name}")}))).await;
+    }
+    // Cy is in quiet hours at 17:16 Perth; Di switched reminders off; Bob is on UTC, where it is 09:16.
+    call(&h.app, "PUT", "/settings", Some(&cy), Some(json!({"quiet_start": "17:00", "quiet_end": "18:00"}))).await;
+    call(&h.app, "PUT", "/settings", Some(&di), Some(json!({"reminders_enabled": false}))).await;
+
+    assert_eq!(push::tick(&h.state, perth(17, 16)).await.unwrap(), 1);
+    let sent: Vec<String> = h.mock.sent.lock().unwrap().iter().map(|m| m.token.clone()).collect();
+    assert_eq!(sent, vec!["fcm-alice".to_string()], "only Alice is due, awake and enabled");
+
+    // Later, Bob's own local time passes 17:15 (17:16 UTC = 01:16 Perth next day), so he is reminded
+    // on his own schedule; Cy is out of quiet hours and gets hers.
+    h.mock.sent.lock().unwrap().clear();
+    let utc_evening = Utc.with_ymd_and_hms(2026, 10, 19, 17, 16, 0).unwrap();
+    assert_eq!(push::tick(&h.state, utc_evening).await.unwrap(), 1, "Bob only");
+    let sent: Vec<String> = h.mock.sent.lock().unwrap().iter().map(|m| m.token.clone()).collect();
+    assert_eq!(sent, vec!["fcm-bob".to_string()]);
+}
+
+#[tokio::test]
+async fn a_failing_user_does_not_stop_the_others() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    call(&h.app, "PUT", "/settings", Some(&alice), Some(json!({"timezone": "Australia/Perth"}))).await;
+    let (bob_id, bob) = perth_user_with_device(&h, "Bob").await;
+    let now = store::now_ms();
+    for tok in [&alice, &bob] {
+        call(&h.app, "POST", "/sync", Some(tok), Some(json!({"items": [item(C1, "chore", "Dishes", 127, Some("17:15"), now)]}))).await;
+    }
+    call(&h.app, "PUT", "/device", Some(&alice), Some(json!({"fcm_token": "fcm-alice"}))).await;
+    call(&h.app, "PUT", "/device", Some(&bob), Some(json!({"fcm_token": "fcm-bob"}))).await;
+    // Break Alice's settings row (the first user processed): her pass errors, Bob's must still run.
+    sqlx::query("DELETE FROM user_settings WHERE user_id = 1").execute(&h.state.db).await.unwrap();
+    assert_eq!(push::tick(&h.state, perth(17, 16)).await.unwrap(), 1);
+    let sent: Vec<String> = h.mock.sent.lock().unwrap().iter().map(|m| m.token.clone()).collect();
+    assert_eq!(sent, vec!["fcm-bob".to_string()]);
+    let _ = bob_id;
+}
+
+#[tokio::test]
+async fn deleting_a_user_removes_their_settings() {
+    let h = harness().await;
+    let (bob_id, _) = user_with_device(&h, "Bob").await;
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_settings").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(before, 2, "admin and Bob");
+    sqlx::query("DELETE FROM users WHERE id = ?").bind(bob_id).execute(&h.state.db).await.unwrap();
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_settings").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(after, 1);
 }

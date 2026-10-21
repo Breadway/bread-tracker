@@ -105,8 +105,12 @@ async fn existing_database_migrates_and_the_admin_owns_everything() {
         sqlx::query_as("SELECT name, fcm_token, created_at, last_seen FROM devices WHERE id = 'dev-1'").fetch_one(&pool).await.unwrap();
     assert_eq!(dev, ("Pixel".into(), Some("fcm-1".into()), 777, 888));
     assert_eq!(count(&pool, "SELECT val FROM meta WHERE key = 'seq'").await, 5);
-    let tz: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'timezone'").fetch_one(&pool).await.unwrap();
-    assert_eq!(tz, "Europe/Berlin", "global settings are kept for the next migration");
+    // The global settings moved to the admin's own row, and the old table is gone.
+    let st: (String, String, String, bool) =
+        sqlx::query_as("SELECT timezone, quiet_start, quiet_end, reminders_enabled FROM user_settings WHERE user_id = 1").fetch_one(&pool).await.unwrap();
+    assert_eq!(st, ("Europe/Berlin".into(), "22:00".into(), "".into(), true));
+    assert_eq!(count(&pool, "SELECT COUNT(*) FROM user_settings").await, 1);
+    assert_eq!(count(&pool, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'settings'").await, 0);
 
     // No dangling references anywhere.
     let violations: Vec<(String, i64, String, i64)> = sqlx::query_as("PRAGMA foreign_key_check").fetch_all(&pool).await.unwrap();
@@ -116,6 +120,8 @@ async fn existing_database_migrates_and_the_admin_owns_everything() {
 
     // Composite keys: a second user can hold the same item id and completion without touching user 1's rows.
     sqlx::query("INSERT INTO users (id, name, is_admin, created_at) VALUES (2, 'Sam', 0, 1)").execute(&pool).await.unwrap();
+    let sam: (String, bool) = sqlx::query_as("SELECT timezone, reminders_enabled FROM user_settings WHERE user_id = 2").fetch_one(&pool).await.unwrap();
+    assert_eq!(sam, ("UTC".into(), true), "a new user gets defaults, not the admin's settings");
     sqlx::query("INSERT INTO items (user_id, id, kind, name, points, updated_at, seq) VALUES (2, ?, 'chore', 'Sam dishes', 10, 1, 6)")
         .bind(I1).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO completions (user_id, item_id, date, completed_at, updated_at, seq) VALUES (2, ?, '2026-10-19', 1, 1, 7)")
@@ -129,6 +135,7 @@ async fn existing_database_migrates_and_the_admin_owns_everything() {
     assert!(sqlx::query("INSERT INTO users (name, is_admin, created_at) VALUES ('sam', 0, 1)").execute(&pool).await.is_err());
     // Removing a user removes everything they own, and nothing of anyone else's.
     sqlx::query("DELETE FROM users WHERE id = 2").execute(&pool).await.unwrap();
+    assert_eq!(count(&pool, "SELECT COUNT(*) FROM user_settings").await, 1);
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM items").await, 2);
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM completions").await, 3);
 

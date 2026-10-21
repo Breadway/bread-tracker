@@ -202,6 +202,31 @@ impl UserDb {
         .collect())
     }
 
+    /// This user's reminder settings. Every user has a row (created with the user).
+    pub async fn settings(&self) -> Result<UserSettings, sqlx::Error> {
+        sqlx::query_as::<_, UserSettings>(
+            "SELECT timezone, quiet_start, quiet_end, reminders_enabled FROM user_settings WHERE user_id = ?",
+        )
+        .bind(self.user_id)
+        .fetch_one(&self.db)
+        .await
+    }
+
+    /// Replace this user's settings in one statement.
+    pub async fn save_settings(&self, s: &UserSettings) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE user_settings SET timezone = ?, quiet_start = ?, quiet_end = ?, reminders_enabled = ? WHERE user_id = ?",
+        )
+        .bind(&s.timezone)
+        .bind(&s.quiet_start)
+        .bind(&s.quiet_end)
+        .bind(s.reminders_enabled)
+        .bind(self.user_id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
     pub async fn mark_reminder_sent(&self, item_id: &str, date: &str) -> Result<(), sqlx::Error> {
         sqlx::query("INSERT OR IGNORE INTO reminders_sent (user_id, item_id, date, sent_at) VALUES (?, ?, ?, ?)")
             .bind(self.user_id)
@@ -211,6 +236,22 @@ impl UserDb {
             .execute(&self.db)
             .await?;
         Ok(())
+    }
+}
+
+/// One user's reminder settings. A new user starts with UTC, no quiet hours and reminders on.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct UserSettings {
+    pub timezone: String,
+    pub quiet_start: String,
+    pub quiet_end: String,
+    pub reminders_enabled: bool,
+}
+
+impl UserSettings {
+    /// The user's timezone; an unknown name (it is validated on write) falls back to UTC.
+    pub fn tz(&self) -> chrono_tz::Tz {
+        std::str::FromStr::from_str(&self.timezone).unwrap_or(chrono_tz::UTC)
     }
 }
 
@@ -261,21 +302,4 @@ pub async fn prune(db: &Db, now: i64, tombstone_days: i64) -> Result<Pruned, sql
         .await?
         .rows_affected();
     Ok(p)
-}
-
-pub async fn get_setting(db: &Db, key: &str) -> Result<String, sqlx::Error> {
-    sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ?")
-        .bind(key)
-        .fetch_optional(db)
-        .await
-        .map(|v| v.unwrap_or_default())
-}
-
-pub async fn set_setting(db: &Db, key: &str, value: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-        .bind(key)
-        .bind(value)
-        .execute(db)
-        .await?;
-    Ok(())
 }

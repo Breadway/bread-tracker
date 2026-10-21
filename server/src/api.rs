@@ -17,8 +17,8 @@ use crate::auth::{self, ClientIp, DeviceId, UserId};
 use crate::error::{ApiError, ApiResult};
 use crate::model::{SyncRequest, SyncResponse};
 use crate::push::{Message, SendOutcome};
-use crate::store::UserDb;
-use crate::{store, xp, AppState};
+use crate::store::{UserDb, UserSettings};
+use crate::{xp, AppState};
 
 const MAX_BATCH: usize = 5000;
 
@@ -161,10 +161,6 @@ struct StatsQuery {
     date: Option<String>,
 }
 
-async fn timezone(st: &AppState) -> ApiResult<Tz> {
-    Ok(Tz::from_str(&store::get_setting(&st.db, "timezone").await?).unwrap_or(chrono_tz::Australia::Perth))
-}
-
 async fn stats(
     State(st): State<AppState>,
     Extension(UserId(uid)): Extension<UserId>,
@@ -172,7 +168,7 @@ async fn stats(
 ) -> ApiResult<Json<xp::Stats>> {
     let today = match q.date {
         Some(d) => NaiveDate::parse_from_str(&d, "%Y-%m-%d").map_err(|_| ApiError::BadRequest("date must be YYYY-MM-DD".into()))?,
-        None => Utc::now().with_timezone(&timezone(&st).await?).date_naive(),
+        None => Utc::now().with_timezone(&UserDb::new(&st.db, uid).settings().await?.tz()).date_naive(),
     };
     let user = UserDb::new(&st.db, uid);
     let items = user.all_items().await?;
@@ -192,21 +188,19 @@ struct Settings {
     utc_offset_minutes: i64,
 }
 
-async fn load_settings(st: &AppState) -> ApiResult<Settings> {
-    let timezone = store::get_setting(&st.db, "timezone").await?;
-    let tz = Tz::from_str(&timezone).unwrap_or(chrono_tz::Australia::Perth);
-    let utc_offset_minutes = Utc::now().with_timezone(&tz).offset().fix().local_minus_utc() as i64 / 60;
-    Ok(Settings {
+fn settings_response(s: &UserSettings) -> Settings {
+    let utc_offset_minutes = Utc::now().with_timezone(&s.tz()).offset().fix().local_minus_utc() as i64 / 60;
+    Settings {
         utc_offset_minutes,
-        timezone,
-        quiet_start: store::get_setting(&st.db, "quiet_start").await?,
-        quiet_end: store::get_setting(&st.db, "quiet_end").await?,
-        reminders_enabled: store::get_setting(&st.db, "reminders_enabled").await? == "1",
-    })
+        timezone: s.timezone.clone(),
+        quiet_start: s.quiet_start.clone(),
+        quiet_end: s.quiet_end.clone(),
+        reminders_enabled: s.reminders_enabled,
+    }
 }
 
-async fn get_settings(State(st): State<AppState>) -> ApiResult<Json<Settings>> {
-    Ok(Json(load_settings(&st).await?))
+async fn get_settings(State(st): State<AppState>, Extension(UserId(uid)): Extension<UserId>) -> ApiResult<Json<Settings>> {
+    Ok(Json(settings_response(&UserDb::new(&st.db, uid).settings().await?)))
 }
 
 #[derive(Deserialize)]
@@ -221,30 +215,38 @@ fn valid_time_or_empty(t: &str) -> bool {
     t.is_empty() || NaiveTime::parse_from_str(t, "%H:%M").is_ok()
 }
 
-async fn put_settings(State(st): State<AppState>, Json(p): Json<SettingsPatch>) -> ApiResult<Json<Settings>> {
-    // Quiet hours need both ends or neither; a half-set window used to disable them silently.
-    let cur = load_settings(&st).await?;
-    let start = p.quiet_start.clone().unwrap_or(cur.quiet_start);
-    let end = p.quiet_end.clone().unwrap_or(cur.quiet_end);
-    if start.is_empty() != end.is_empty() {
-        return Err(ApiError::BadRequest("quiet_start and quiet_end must both be set or both be empty".into()));
+async fn put_settings(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+    Json(p): Json<SettingsPatch>,
+) -> ApiResult<Json<Settings>> {
+    let user = UserDb::new(&st.db, uid);
+    let mut s = user.settings().await?;
+    if let Some(tz) = p.timezone {
+        Tz::from_str(&tz).map_err(|_| ApiError::BadRequest("unknown timezone".into()))?;
+        s.timezone = tz;
     }
-    if let Some(tz) = &p.timezone {
-        Tz::from_str(tz).map_err(|_| ApiError::BadRequest("unknown timezone".into()))?;
-        store::set_setting(&st.db, "timezone", tz).await?;
-    }
-    for (key, val) in [("quiet_start", &p.quiet_start), ("quiet_end", &p.quiet_end)] {
+    for (key, val, field) in [
+        ("quiet_start", p.quiet_start, &mut s.quiet_start),
+        ("quiet_end", p.quiet_end, &mut s.quiet_end),
+    ] {
         if let Some(v) = val {
-            if !valid_time_or_empty(v) {
+            if !valid_time_or_empty(&v) {
                 return Err(ApiError::BadRequest(format!("{key} must be HH:MM or empty")));
             }
-            store::set_setting(&st.db, key, v).await?;
+            *field = v;
         }
     }
-    if let Some(on) = p.reminders_enabled {
-        store::set_setting(&st.db, "reminders_enabled", if on { "1" } else { "0" }).await?;
+    // Quiet hours need both ends or neither; a half-set window used to disable them silently.
+    if s.quiet_start.is_empty() != s.quiet_end.is_empty() {
+        return Err(ApiError::BadRequest("quiet_start and quiet_end must both be set or both be empty".into()));
     }
-    Ok(Json(load_settings(&st).await?))
+    if let Some(on) = p.reminders_enabled {
+        s.reminders_enabled = on;
+    }
+    // Validated as a whole, then written in one statement: a rejected request changes nothing.
+    user.save_settings(&s).await?;
+    Ok(Json(settings_response(&s)))
 }
 
 /// Send a test notification to the calling device.

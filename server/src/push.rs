@@ -2,7 +2,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -342,25 +341,17 @@ fn parse_quiet(start: &str, end: &str) -> Option<(NaiveTime, NaiveTime)> {
 
 /// One scheduler pass over every user. Returns the number of reminders sent.
 ///
-/// Settings (timezone, quiet hours, on/off) are still the single global set here; making them
-/// per user is a separate change. Everything else is per user: a user's reminders are built
-/// from their own items and completions and sent only to their own devices, and a failure for
+/// Everything is per user: their own timezone, quiet hours and on/off switch, their items,
+/// completions and sent markers, and only their own devices receive the result. An error for
 /// one user is logged and does not stop the others.
 pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize> {
-    if !st.push.enabled() || store::get_setting(&st.db, "reminders_enabled").await? != "1" {
+    if !st.push.enabled() {
         return Ok(0);
     }
-    let tz = Tz::from_str(&store::get_setting(&st.db, "timezone").await?).unwrap_or(chrono_tz::Australia::Perth);
-    let quiet = parse_quiet(
-        &store::get_setting(&st.db, "quiet_start").await?,
-        &store::get_setting(&st.db, "quiet_end").await?,
-    );
-    let now = tz.from_utc_datetime(&now_utc.naive_utc());
-
     let users: Vec<i64> = sqlx::query_scalar("SELECT id FROM users ORDER BY id").fetch_all(&st.db).await?;
     let mut count = 0;
     for uid in users {
-        match tick_user(st, UserDb::new(&st.db, uid), now, quiet).await {
+        match tick_user(st, UserDb::new(&st.db, uid), now_utc).await {
             Ok(n) => count += n,
             Err(e) => tracing::error!(user = uid, error = ?e, "reminder tick failed for user"),
         }
@@ -368,12 +359,13 @@ pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize
     Ok(count)
 }
 
-async fn tick_user(
-    st: &AppState,
-    user: UserDb,
-    now: DateTime<Tz>,
-    quiet: Option<(NaiveTime, NaiveTime)>,
-) -> anyhow::Result<usize> {
+async fn tick_user(st: &AppState, user: UserDb, now_utc: DateTime<Utc>) -> anyhow::Result<usize> {
+    let settings = user.settings().await?;
+    if !settings.reminders_enabled {
+        return Ok(0);
+    }
+    let quiet = parse_quiet(&settings.quiet_start, &settings.quiet_end);
+    let now = settings.tz().from_utc_datetime(&now_utc.naive_utc());
     let date = now.format("%Y-%m-%d").to_string();
     let yesterday = (now.date_naive() - ChronoDuration::days(1)).format("%Y-%m-%d").to_string();
 

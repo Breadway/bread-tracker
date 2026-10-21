@@ -13,10 +13,11 @@ use serde::{Deserialize, Serialize};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::auth::{self, ClientIp, DeviceId};
+use crate::auth::{self, ClientIp, DeviceId, UserId};
 use crate::error::{ApiError, ApiResult};
 use crate::model::{SyncRequest, SyncResponse};
 use crate::push::{Message, SendOutcome};
+use crate::store::UserDb;
 use crate::{store, xp, AppState};
 
 const MAX_BATCH: usize = 5000;
@@ -78,12 +79,20 @@ struct PullQuery {
     since: i64,
 }
 
-async fn pull(State(st): State<AppState>, Query(q): Query<PullQuery>) -> ApiResult<Json<SyncResponse>> {
-    Ok(Json(store::pull(&st.db, q.since).await?))
+async fn pull(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+    Query(q): Query<PullQuery>,
+) -> ApiResult<Json<SyncResponse>> {
+    Ok(Json(UserDb::new(&st.db, uid).pull(q.since).await?))
 }
 
 /// Push local changes, then return everything changed since `since` (one round trip).
-async fn sync(State(st): State<AppState>, Json(req): Json<SyncRequest>) -> ApiResult<Json<SyncResponse>> {
+async fn sync(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+    Json(req): Json<SyncRequest>,
+) -> ApiResult<Json<SyncResponse>> {
     if req.items.len() + req.completions.len() > MAX_BATCH {
         return Err(ApiError::BadRequest(format!("batch too large (max {MAX_BATCH} rows)")));
     }
@@ -94,8 +103,9 @@ async fn sync(State(st): State<AppState>, Json(req): Json<SyncRequest>) -> ApiRe
     for c in &req.completions {
         c.validate(today).map_err(ApiError::BadRequest)?;
     }
-    store::apply_push(&st.db, &req.items, &req.completions).await?;
-    Ok(Json(store::pull(&st.db, req.since).await?))
+    let user = UserDb::new(&st.db, uid);
+    user.apply_push(&req.items, &req.completions).await?;
+    Ok(Json(user.pull(req.since).await?))
 }
 
 #[derive(Deserialize)]
@@ -106,6 +116,7 @@ struct DeviceReq {
 async fn set_device(
     State(st): State<AppState>,
     Extension(DeviceId(id)): Extension<DeviceId>,
+    Extension(UserId(uid)): Extension<UserId>,
     Json(req): Json<DeviceReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let token = req.fcm_token.filter(|t| !t.is_empty());
@@ -113,16 +124,23 @@ async fn set_device(
         if t.len() > 4096 {
             return Err(ApiError::BadRequest("fcm_token too long".into()));
         }
-        // A token belongs to one device; a reinstall re-pairs and takes it over.
-        sqlx::query("UPDATE devices SET fcm_token = NULL WHERE fcm_token = ? AND id != ?")
+        // A token identifies one app install, so it belongs to exactly one device across all
+        // users: a reinstall, or the same phone signing in as someone else, takes it over.
+        // Only the token column of the previous holder is cleared, never the device itself.
+        let taken = sqlx::query("UPDATE devices SET fcm_token = NULL WHERE fcm_token = ? AND id != ?")
             .bind(t)
             .bind(&id)
             .execute(&st.db)
-            .await?;
+            .await?
+            .rows_affected();
+        if taken > 0 {
+            tracing::info!(user = uid, device = %id, taken, "fcm token moved to this device");
+        }
     }
-    sqlx::query("UPDATE devices SET fcm_token = ? WHERE id = ?")
+    sqlx::query("UPDATE devices SET fcm_token = ? WHERE id = ? AND user_id = ?")
         .bind(&token)
         .bind(&id)
+        .bind(uid)
         .execute(&st.db)
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -132,8 +150,9 @@ async fn set_device(
 async fn sign_out(
     State(st): State<AppState>,
     Extension(DeviceId(id)): Extension<DeviceId>,
+    Extension(UserId(uid)): Extension<UserId>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    crate::devices::revoke_self(&st.db, &id).await?;
+    crate::devices::revoke_self(&st.db, uid, &id).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -146,13 +165,18 @@ async fn timezone(st: &AppState) -> ApiResult<Tz> {
     Ok(Tz::from_str(&store::get_setting(&st.db, "timezone").await?).unwrap_or(chrono_tz::Australia::Perth))
 }
 
-async fn stats(State(st): State<AppState>, Query(q): Query<StatsQuery>) -> ApiResult<Json<xp::Stats>> {
+async fn stats(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+    Query(q): Query<StatsQuery>,
+) -> ApiResult<Json<xp::Stats>> {
     let today = match q.date {
         Some(d) => NaiveDate::parse_from_str(&d, "%Y-%m-%d").map_err(|_| ApiError::BadRequest("date must be YYYY-MM-DD".into()))?,
         None => Utc::now().with_timezone(&timezone(&st).await?).date_naive(),
     };
-    let items = store::all_items(&st.db).await?;
-    let completions = store::all_completions(&st.db).await?;
+    let user = UserDb::new(&st.db, uid);
+    let items = user.all_items().await?;
+    let completions = user.all_completions().await?;
     Ok(Json(xp::compute(&items, &completions, today)))
 }
 
@@ -227,12 +251,14 @@ async fn put_settings(State(st): State<AppState>, Json(p): Json<SettingsPatch>) 
 async fn push_test(
     State(st): State<AppState>,
     Extension(DeviceId(id)): Extension<DeviceId>,
+    Extension(UserId(uid)): Extension<UserId>,
 ) -> ApiResult<Json<serde_json::Value>> {
     if !st.push.enabled() {
         return Err(ApiError::BadRequest("push is not configured on the server".into()));
     }
-    let token: Option<String> = sqlx::query_scalar("SELECT fcm_token FROM devices WHERE id = ?")
+    let token: Option<String> = sqlx::query_scalar("SELECT fcm_token FROM devices WHERE id = ? AND user_id = ?")
         .bind(&id)
+        .bind(uid)
         .fetch_one(&st.db)
         .await?;
     let Some(token) = token.filter(|t| !t.is_empty()) else {
@@ -247,7 +273,11 @@ async fn push_test(
     match st.push.send(&msg).await? {
         SendOutcome::Sent => Ok(Json(serde_json::json!({ "sent": true }))),
         SendOutcome::Unregistered => {
-            sqlx::query("UPDATE devices SET fcm_token = NULL WHERE id = ?").bind(&id).execute(&st.db).await?;
+            sqlx::query("UPDATE devices SET fcm_token = NULL WHERE id = ? AND user_id = ?")
+                .bind(&id)
+                .bind(uid)
+                .execute(&st.db)
+                .await?;
             Err(ApiError::BadRequest("fcm token is no longer valid; re-register".into()))
         }
     }

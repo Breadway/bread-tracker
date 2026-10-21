@@ -14,7 +14,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{Completion, Item};
-use crate::store::{self, now_ms};
+use crate::store::{self, now_ms, UserDb};
 use crate::AppState;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -340,7 +340,12 @@ fn parse_quiet(start: &str, end: &str) -> Option<(NaiveTime, NaiveTime)> {
     Some((s, e))
 }
 
-/// One scheduler pass. Returns the number of reminders sent.
+/// One scheduler pass over every user. Returns the number of reminders sent.
+///
+/// Settings (timezone, quiet hours, on/off) are still the single global set here; making them
+/// per user is a separate change. Everything else is per user: a user's reminders are built
+/// from their own items and completions and sent only to their own devices, and a failure for
+/// one user is logged and does not stop the others.
 pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize> {
     if !st.push.enabled() || store::get_setting(&st.db, "reminders_enabled").await? != "1" {
         return Ok(0);
@@ -351,29 +356,42 @@ pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize
         &store::get_setting(&st.db, "quiet_end").await?,
     );
     let now = tz.from_utc_datetime(&now_utc.naive_utc());
+
+    let users: Vec<i64> = sqlx::query_scalar("SELECT id FROM users ORDER BY id").fetch_all(&st.db).await?;
+    let mut count = 0;
+    for uid in users {
+        match tick_user(st, UserDb::new(&st.db, uid), now, quiet).await {
+            Ok(n) => count += n,
+            Err(e) => tracing::error!(user = uid, error = ?e, "reminder tick failed for user"),
+        }
+    }
+    Ok(count)
+}
+
+async fn tick_user(
+    st: &AppState,
+    user: UserDb,
+    now: DateTime<Tz>,
+    quiet: Option<(NaiveTime, NaiveTime)>,
+) -> anyhow::Result<usize> {
     let date = now.format("%Y-%m-%d").to_string();
     let yesterday = (now.date_naive() - ChronoDuration::days(1)).format("%Y-%m-%d").to_string();
 
-    let items = store::reminder_items(&st.db).await?;
-    let mut completions = store::reminder_completions(&st.db, &date).await?;
-    completions.extend(store::reminder_completions(&st.db, &yesterday).await?);
-    let sent: HashSet<(String, String)> =
-        sqlx::query_as::<_, (String, String)>("SELECT item_id, date FROM reminders_sent WHERE date IN (?, ?)")
-            .bind(&date)
-            .bind(&yesterday)
-            .fetch_all(&st.db)
-            .await?
-            .into_iter()
-            .collect();
+    let items = user.reminder_items().await?;
+    let mut completions = user.reminder_completions(&date).await?;
+    completions.extend(user.reminder_completions(&yesterday).await?);
+    let sent = user.sent_reminders(&date, &yesterday).await?;
 
     let due = due_reminders(now, &items, &completions, &sent, st.config.reminder_grace_mins, quiet);
     if due.is_empty() {
         return Ok(0);
     }
-    let devices: Vec<(String, String)> =
-        sqlx::query_as("SELECT id, fcm_token FROM devices WHERE fcm_token IS NOT NULL AND fcm_token != ''")
-            .fetch_all(&st.db)
-            .await?;
+    let devices: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, fcm_token FROM devices WHERE user_id = ? AND fcm_token IS NOT NULL AND fcm_token != ''",
+    )
+    .bind(user.user_id())
+    .fetch_all(&st.db)
+    .await?;
     if devices.is_empty() {
         return Ok(0); // not marked sent, so it can still go out after a device registers
     }
@@ -395,23 +413,18 @@ pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize
             match st.push.send(&msg).await {
                 Ok(SendOutcome::Sent) => delivered = true,
                 Ok(SendOutcome::Unregistered) => {
-                    tracing::info!(device = %device_id, "fcm token unregistered, clearing");
-                    sqlx::query("UPDATE devices SET fcm_token = NULL WHERE id = ?")
+                    tracing::info!(user = user.user_id(), device = %device_id, "fcm token unregistered, clearing");
+                    sqlx::query("UPDATE devices SET fcm_token = NULL WHERE id = ? AND user_id = ?")
                         .bind(device_id)
+                        .bind(user.user_id())
                         .execute(&st.db)
                         .await?;
                 }
-                Err(e) => tracing::warn!(error = ?e, item = %d.item_id, "reminder send failed"),
+                Err(e) => tracing::warn!(user = user.user_id(), error = ?e, item = %d.item_id, "reminder send failed"),
             }
         }
         if delivered {
-            sqlx::query("INSERT OR IGNORE INTO reminders_sent (user_id, item_id, date, sent_at) VALUES (?, ?, ?, ?)")
-                .bind(crate::users::ADMIN_ID)
-                .bind(&d.item_id)
-                .bind(&d.date)
-                .bind(now_ms())
-                .execute(&st.db)
-                .await?;
+            user.mark_reminder_sent(&d.item_id, &d.date).await?;
             count += 1;
         }
     }

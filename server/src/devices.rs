@@ -52,7 +52,13 @@ pub async fn revoke(db: &Db, id_or_prefix: &str) -> Result<Revoked, sqlx::Error>
     Ok(Revoked::Removed(name))
 }
 
-/// Revoke exactly this device (sign out). Returns whether a row was removed.
-pub async fn revoke_self(db: &Db, id: &str) -> Result<bool, sqlx::Error> {
-    Ok(sqlx::query("DELETE FROM devices WHERE id = ?").bind(id).execute(db).await?.rows_affected() > 0)
+/// Revoke exactly this device of this user (sign out). Returns whether a row was removed.
+pub async fn revoke_self(db: &Db, user_id: i64, id: &str) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query("DELETE FROM devices WHERE id = ? AND user_id = ?")
+        .bind(id)
+        .bind(user_id)
+        .execute(db)
+        .await?
+        .rows_affected()
+        > 0)
 }

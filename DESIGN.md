@@ -47,4 +47,10 @@ Every owned row belongs to a user: `items`, `completions`, `devices`, `reminders
 
 Migration `0002_users.sql` creates the first user (id 1, the admin) and gives it all existing rows. The user is named `admin` by the migration and renamed from `BREADTRACKER_ADMIN_NAME` at start, once, only while it still has that placeholder name. User names are 1 to 40 letters, digits, spaces, `.`, `_` or `-`, unique ignoring case. The `settings` table is not migrated yet.
 
-At this stage the server code still attributes every request to the first user, so behaviour is unchanged for a single-user deployment; scoping requests to the calling user comes with the auth change.
+### Scoping
+
+`require_auth` looks the bearer token up in `devices` and puts both a `DeviceId` and a `UserId` into the request extensions. The user id always comes from that row, never from the request body or query. All queries on `items`, `completions` and `reminders_sent` live on `store::UserDb`, which holds the user id privately and binds it in every statement, so a handler cannot read or write those tables without naming whose data it is. `/sync` (both verbs), `/stats`, `/device` (set token and sign out) and `/push/test` act only on the caller. The sync cursor is the global counter, so it advances when other users write; their rows are never returned and the gaps are harmless.
+
+An FCM token identifies one app install, so it still belongs to exactly one device across all users: registering a token that another device holds clears the token on the old device (only that column) and records it in the log. This is what lets a phone sign in as a different account.
+
+The scheduler loops over users. Each user's reminders are built from their own items, completions and sent markers and go only to their own devices; a failure for one user is logged and does not stop the others, and a user with no registered device does not use up anyone else's reminder. Timezone, quiet hours and the on/off switch are still the one global set; per-user settings are a separate change. `GET/PUT /settings` are still global for the same reason.

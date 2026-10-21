@@ -26,6 +26,11 @@ const LAST_SEEN_INTERVAL_MS: i64 = 60 * 1000;
 #[derive(Clone, Debug)]
 pub struct DeviceId(pub String);
 
+/// The user who owns the authenticated device. Set by [`require_auth`] from the database,
+/// never from anything the client sends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserId(pub i64);
+
 pub fn hash(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
 }
@@ -231,20 +236,23 @@ pub async fn require_auth(State(st): State<AppState>, mut req: Request, next: Ne
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(ApiError::Unauthorized)?
         .to_string();
-    let row: Option<(String, i64)> = sqlx::query_as("SELECT id, last_seen FROM devices WHERE token_hash = ?")
-        .bind(hash(&token))
-        .fetch_optional(&st.db)
-        .await?;
-    let (id, last_seen) = row.ok_or(ApiError::Unauthorized)?;
+    let row: Option<(String, i64, i64)> =
+        sqlx::query_as("SELECT id, last_seen, user_id FROM devices WHERE token_hash = ?")
+            .bind(hash(&token))
+            .fetch_optional(&st.db)
+            .await?;
+    let (id, last_seen, user_id) = row.ok_or(ApiError::Unauthorized)?;
     // last_seen is informational, so write it at most once per interval, not per request.
     let now = now_ms();
     if now - last_seen >= LAST_SEEN_INTERVAL_MS {
-        sqlx::query("UPDATE devices SET last_seen = ? WHERE id = ?")
+        sqlx::query("UPDATE devices SET last_seen = ? WHERE id = ? AND user_id = ?")
             .bind(now)
             .bind(&id)
+            .bind(user_id)
             .execute(&st.db)
             .await?;
     }
     req.extensions_mut().insert(DeviceId(id));
+    req.extensions_mut().insert(UserId(user_id));
     Ok(next.run(req).await)
 }

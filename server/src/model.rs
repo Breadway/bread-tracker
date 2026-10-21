@@ -54,7 +54,8 @@ impl Item {
             NaiveTime::parse_from_str(t, "%H:%M").map_err(|_| bad("remind_time must be HH:MM"))?;
         }
         if let Some(d) = &self.due_date {
-            NaiveDate::parse_from_str(d, "%Y-%m-%d").map_err(|_| bad("due_date must be YYYY-MM-DD"))?;
+            NaiveDate::parse_from_str(d, "%Y-%m-%d")
+                .map_err(|_| bad("due_date must be YYYY-MM-DD"))?;
         }
         if !(0..=1000).contains(&self.points) {
             return Err(bad("points must be 0 to 1000"));
@@ -72,10 +73,14 @@ pub const EARLIEST_COMPLETION_DATE: (i32, u32, u32) = (2020, 1, 1);
 impl Completion {
     /// `today` is the server's current UTC date.
     pub fn validate(&self, today: NaiveDate) -> Result<(), String> {
-        uuid::Uuid::parse_str(&self.item_id).map_err(|_| bad("completion item_id must be a uuid"))?;
-        let date = NaiveDate::parse_from_str(&self.date, "%Y-%m-%d").map_err(|_| bad("date must be YYYY-MM-DD"))?;
+        uuid::Uuid::parse_str(&self.item_id)
+            .map_err(|_| bad("completion item_id must be a uuid"))?;
+        let date = NaiveDate::parse_from_str(&self.date, "%Y-%m-%d")
+            .map_err(|_| bad("date must be YYYY-MM-DD"))?;
         let (y, m, d) = EARLIEST_COMPLETION_DATE;
-        if date > today + chrono::Duration::days(MAX_COMPLETION_DAYS_AHEAD) || date < NaiveDate::from_ymd_opt(y, m, d).unwrap() {
+        if date > today + chrono::Duration::days(MAX_COMPLETION_DAYS_AHEAD)
+            || date < NaiveDate::from_ymd_opt(y, m, d).unwrap()
+        {
             return Err(bad("completion date is out of range"));
         }
         Ok(())

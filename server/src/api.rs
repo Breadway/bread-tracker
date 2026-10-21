@@ -28,7 +28,10 @@ pub fn router(state: AppState) -> Router {
         .route("/stats", get(stats))
         .route("/settings", get(get_settings).put(put_settings))
         .route("/push/test", post(push_test))
-        .layer(middleware::from_fn_with_state(state.clone(), auth::require_auth));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
 
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -56,7 +59,11 @@ async fn pair(State(st): State<AppState>, Json(req): Json<PairReq>) -> ApiResult
     if !st.pair_limiter.check() {
         return Err(ApiError::TooManyRequests);
     }
-    let name = if req.device_name.trim().is_empty() { "Android" } else { req.device_name.trim() };
+    let name = if req.device_name.trim().is_empty() {
+        "Android"
+    } else {
+        req.device_name.trim()
+    };
     let name: String = name.chars().take(80).collect();
     match auth::redeem(&st.db, &req.code, &name).await? {
         Some((device_id, token)) => Ok(Json(PairResp { device_id, token })),
@@ -70,14 +77,22 @@ struct PullQuery {
     since: i64,
 }
 
-async fn pull(State(st): State<AppState>, Query(q): Query<PullQuery>) -> ApiResult<Json<SyncResponse>> {
+async fn pull(
+    State(st): State<AppState>,
+    Query(q): Query<PullQuery>,
+) -> ApiResult<Json<SyncResponse>> {
     Ok(Json(store::pull(&st.db, q.since).await?))
 }
 
 /// Push local changes, then return everything changed since `since` (one round trip).
-async fn sync(State(st): State<AppState>, Json(req): Json<SyncRequest>) -> ApiResult<Json<SyncResponse>> {
+async fn sync(
+    State(st): State<AppState>,
+    Json(req): Json<SyncRequest>,
+) -> ApiResult<Json<SyncResponse>> {
     if req.items.len() + req.completions.len() > MAX_BATCH {
-        return Err(ApiError::BadRequest(format!("batch too large (max {MAX_BATCH} rows)")));
+        return Err(ApiError::BadRequest(format!(
+            "batch too large (max {MAX_BATCH} rows)"
+        )));
     }
     for it in &req.items {
         it.validate().map_err(ApiError::BadRequest)?;
@@ -85,6 +100,24 @@ async fn sync(State(st): State<AppState>, Json(req): Json<SyncRequest>) -> ApiRe
     let today = Utc::now().date_naive();
     for c in &req.completions {
         c.validate(today).map_err(ApiError::BadRequest)?;
+    }
+    let incoming: std::collections::HashSet<&str> = req
+        .items
+        .iter()
+        .filter(|i| i.deleted_at.is_none())
+        .map(|i| i.id.as_str())
+        .collect();
+    let mut referenced: Vec<String> = req.completions.iter().map(|c| c.item_id.clone()).collect();
+    referenced.extend(req.items.iter().map(|i| i.id.clone()));
+    let existing = store::item_ids(&st.db, &referenced).await?;
+    // A batch may carry a new item and its completion together. Validate references against
+    // the union before any write, so malformed rows cannot partially apply.
+    for c in &req.completions {
+        if !existing.contains(&c.item_id) && !incoming.contains(c.item_id.as_str()) {
+            return Err(ApiError::BadRequest(
+                "completion references an unknown item".into(),
+            ));
+        }
     }
     store::apply_push(&st.db, &req.items, &req.completions).await?;
     Ok(Json(store::pull(&st.db, req.since).await?))
@@ -126,12 +159,17 @@ struct StatsQuery {
 }
 
 async fn timezone(st: &AppState) -> ApiResult<Tz> {
-    Ok(Tz::from_str(&store::get_setting(&st.db, "timezone").await?).unwrap_or(chrono_tz::Australia::Perth))
+    Ok(Tz::from_str(&store::get_setting(&st.db, "timezone").await?)
+        .unwrap_or(chrono_tz::Australia::Perth))
 }
 
-async fn stats(State(st): State<AppState>, Query(q): Query<StatsQuery>) -> ApiResult<Json<xp::Stats>> {
+async fn stats(
+    State(st): State<AppState>,
+    Query(q): Query<StatsQuery>,
+) -> ApiResult<Json<xp::Stats>> {
     let today = match q.date {
-        Some(d) => NaiveDate::parse_from_str(&d, "%Y-%m-%d").map_err(|_| ApiError::BadRequest("date must be YYYY-MM-DD".into()))?,
+        Some(d) => NaiveDate::parse_from_str(&d, "%Y-%m-%d")
+            .map_err(|_| ApiError::BadRequest("date must be YYYY-MM-DD".into()))?,
         None => Utc::now().with_timezone(&timezone(&st).await?).date_naive(),
     };
     let items = store::all_items(&st.db).await?;
@@ -172,13 +210,18 @@ fn valid_time_or_empty(t: &str) -> bool {
     t.is_empty() || NaiveTime::parse_from_str(t, "%H:%M").is_ok()
 }
 
-async fn put_settings(State(st): State<AppState>, Json(p): Json<SettingsPatch>) -> ApiResult<Json<Settings>> {
+async fn put_settings(
+    State(st): State<AppState>,
+    Json(p): Json<SettingsPatch>,
+) -> ApiResult<Json<Settings>> {
     // Quiet hours need both ends or neither; a half-set window used to disable them silently.
     let cur = load_settings(&st).await?;
     let start = p.quiet_start.clone().unwrap_or(cur.quiet_start);
     let end = p.quiet_end.clone().unwrap_or(cur.quiet_end);
     if start.is_empty() != end.is_empty() {
-        return Err(ApiError::BadRequest("quiet_start and quiet_end must both be set or both be empty".into()));
+        return Err(ApiError::BadRequest(
+            "quiet_start and quiet_end must both be set or both be empty".into(),
+        ));
     }
     if let Some(tz) = &p.timezone {
         Tz::from_str(tz).map_err(|_| ApiError::BadRequest("unknown timezone".into()))?;
@@ -187,7 +230,9 @@ async fn put_settings(State(st): State<AppState>, Json(p): Json<SettingsPatch>) 
     for (key, val) in [("quiet_start", &p.quiet_start), ("quiet_end", &p.quiet_end)] {
         if let Some(v) = val {
             if !valid_time_or_empty(v) {
-                return Err(ApiError::BadRequest(format!("{key} must be HH:MM or empty")));
+                return Err(ApiError::BadRequest(format!(
+                    "{key} must be HH:MM or empty"
+                )));
             }
             store::set_setting(&st.db, key, v).await?;
         }
@@ -204,14 +249,18 @@ async fn push_test(
     Extension(DeviceId(id)): Extension<DeviceId>,
 ) -> ApiResult<Json<serde_json::Value>> {
     if !st.push.enabled() {
-        return Err(ApiError::BadRequest("push is not configured on the server".into()));
+        return Err(ApiError::BadRequest(
+            "push is not configured on the server".into(),
+        ));
     }
     let token: Option<String> = sqlx::query_scalar("SELECT fcm_token FROM devices WHERE id = ?")
         .bind(&id)
         .fetch_one(&st.db)
         .await?;
     let Some(token) = token.filter(|t| !t.is_empty()) else {
-        return Err(ApiError::BadRequest("this device has no fcm token registered".into()));
+        return Err(ApiError::BadRequest(
+            "this device has no fcm token registered".into(),
+        ));
     };
     let msg = Message {
         token,
@@ -222,8 +271,13 @@ async fn push_test(
     match st.push.send(&msg).await? {
         SendOutcome::Sent => Ok(Json(serde_json::json!({ "sent": true }))),
         SendOutcome::Unregistered => {
-            sqlx::query("UPDATE devices SET fcm_token = NULL WHERE id = ?").bind(&id).execute(&st.db).await?;
-            Err(ApiError::BadRequest("fcm token is no longer valid; re-register".into()))
+            sqlx::query("UPDATE devices SET fcm_token = NULL WHERE id = ?")
+                .bind(&id)
+                .execute(&st.db)
+                .await?;
+            Err(ApiError::BadRequest(
+                "fcm token is no longer valid; re-register".into(),
+            ))
         }
     }
 }

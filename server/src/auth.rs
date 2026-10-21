@@ -44,7 +44,9 @@ fn normalize_code(code: &str) -> String {
 /// Create a pairing code valid for 15 minutes. Returned in `XXXX-XXXX` form.
 pub async fn create_pairing_code(db: &Db) -> Result<String, sqlx::Error> {
     let mut rng = rand::thread_rng();
-    let raw: String = (0..8).map(|_| CODE_ALPHABET[rng.gen_range(0..CODE_ALPHABET.len())] as char).collect();
+    let raw: String = (0..8)
+        .map(|_| CODE_ALPHABET[rng.gen_range(0..CODE_ALPHABET.len())] as char)
+        .collect();
     sqlx::query("DELETE FROM pairing_codes WHERE expires_at < ?")
         .bind(now_ms())
         .execute(db)
@@ -58,7 +60,11 @@ pub async fn create_pairing_code(db: &Db) -> Result<String, sqlx::Error> {
 }
 
 /// Redeem a code (single use). Returns `(device_id, token)` on success.
-pub async fn redeem(db: &Db, code: &str, device_name: &str) -> Result<Option<(String, String)>, sqlx::Error> {
+pub async fn redeem(
+    db: &Db,
+    code: &str,
+    device_name: &str,
+) -> Result<Option<(String, String)>, sqlx::Error> {
     let used: Option<String> = sqlx::query_scalar(
         "DELETE FROM pairing_codes WHERE code_hash = ? AND expires_at > ? RETURNING code_hash",
     )
@@ -72,19 +78,23 @@ pub async fn redeem(db: &Db, code: &str, device_name: &str) -> Result<Option<(St
     let id = uuid::Uuid::new_v4().to_string();
     let token = random_token();
     let now = now_ms();
-    sqlx::query("INSERT INTO devices (id, name, token_hash, created_at, last_seen) VALUES (?, ?, ?, ?, ?)")
-        .bind(&id)
-        .bind(device_name)
-        .bind(hash(&token))
-        .bind(now)
-        .bind(now)
-        .execute(db)
-        .await?;
+    sqlx::query(
+        "INSERT INTO devices (id, name, token_hash, created_at, last_seen) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(device_name)
+    .bind(hash(&token))
+    .bind(now)
+    .bind(now)
+    .execute(db)
+    .await?;
     Ok(Some((id, token)))
 }
 
 pub async fn device_count(db: &Db) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar("SELECT COUNT(*) FROM devices").fetch_one(db).await
+    sqlx::query_scalar("SELECT COUNT(*) FROM devices")
+        .fetch_one(db)
+        .await
 }
 
 /// Allows a small number of pairing attempts per window, globally (single-user server).
@@ -96,13 +106,20 @@ pub struct PairLimiter {
 
 impl PairLimiter {
     pub fn new(max: usize, window: Duration) -> Self {
-        Self { max, window, hits: Mutex::new(VecDeque::new()) }
+        Self {
+            max,
+            window,
+            hits: Mutex::new(VecDeque::new()),
+        }
     }
 
     pub fn check(&self) -> bool {
         let mut hits = self.hits.lock().unwrap();
         let now = Instant::now();
-        while hits.front().is_some_and(|t| now.duration_since(*t) > self.window) {
+        while hits
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > self.window)
+        {
             hits.pop_front();
         }
         if hits.len() >= self.max {
@@ -114,7 +131,11 @@ impl PairLimiter {
 }
 
 /// Middleware: require `Authorization: Bearer <token>` matching a paired device.
-pub async fn require_auth(State(st): State<AppState>, mut req: Request, next: Next) -> Result<Response, ApiError> {
+pub async fn require_auth(
+    State(st): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
     let token = req
         .headers()
         .get(AUTHORIZATION)
@@ -122,17 +143,19 @@ pub async fn require_auth(State(st): State<AppState>, mut req: Request, next: Ne
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(ApiError::Unauthorized)?
         .to_string();
-    let row: Option<(String, i64)> = sqlx::query_as("SELECT id, last_seen FROM devices WHERE token_hash = ?")
-        .bind(hash(&token))
-        .fetch_optional(&st.db)
-        .await?;
+    let row: Option<(String, i64)> =
+        sqlx::query_as("SELECT id, last_seen FROM devices WHERE token_hash = ?")
+            .bind(hash(&token))
+            .fetch_optional(&st.db)
+            .await?;
     let (id, last_seen) = row.ok_or(ApiError::Unauthorized)?;
     // last_seen is informational, so write it at most once per interval, not per request.
     let now = now_ms();
     if now - last_seen >= LAST_SEEN_INTERVAL_MS {
-        sqlx::query("UPDATE devices SET last_seen = ? WHERE id = ?")
+        sqlx::query("UPDATE devices SET last_seen = ? WHERE id = ? AND last_seen < ?")
             .bind(now)
             .bind(&id)
+            .bind(now - LAST_SEEN_INTERVAL_MS)
             .execute(&st.db)
             .await?;
     }

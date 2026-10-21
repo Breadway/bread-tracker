@@ -12,7 +12,7 @@ Run compose as the `breadway` user, not root.
 
 ## Edge
 
-Hestia's own Caddy (LAN) and Aegis (public) both reverse-proxy `tracker.breadway.dev` to port 7290; the blocks live in the infra repo (`hestia/Caddyfile`, `aegis/Caddyfile`). Aegis reaches Hestia over Tailscale, so the container must bind an address Tailscale can reach: set `BREADTRACKER_BIND=0.0.0.0:7290` in `.env` (as breadboard does with 7280) or the Tailscale IP.
+Hestia's own Caddy (LAN) and Aegis (public) both reverse-proxy `tracker.breadway.dev` to port 7290; the blocks live in the infra repo (`hestia/Caddyfile`, `aegis/Caddyfile`). Aegis reaches Hestia over Tailscale, so bind only the Tailscale interface address, for example `BREADTRACKER_BIND=<Hestia-Tailscale-IP>:7290` in `.env`. Do not use `0.0.0.0`: that also exposes the plain HTTP listener on every LAN interface. Confirm the selected address with the operator's Tailscale configuration before deployment.
 
 ## Push (FCM)
 

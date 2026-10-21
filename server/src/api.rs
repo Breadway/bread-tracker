@@ -214,8 +214,22 @@ async fn put_settings(
     State(st): State<AppState>,
     Json(p): Json<SettingsPatch>,
 ) -> ApiResult<Json<Settings>> {
-    // Quiet hours need both ends or neither; a half-set window used to disable them silently.
-    let cur = load_settings(&st).await?;
+    // Validate the complete resulting object before mutating any settings.
+    let mut tx = st.db.begin_with("BEGIN IMMEDIATE").await?;
+    let current: HashMap<String, String> = sqlx::query_as("SELECT key, value FROM settings")
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .collect();
+    let cur = Settings {
+        timezone: current
+            .get("timezone")
+            .cloned()
+            .unwrap_or_else(|| "Australia/Perth".into()),
+        quiet_start: current.get("quiet_start").cloned().unwrap_or_default(),
+        quiet_end: current.get("quiet_end").cloned().unwrap_or_default(),
+        reminders_enabled: current.get("reminders_enabled").is_none_or(|v| v == "1"),
+    };
     let start = p.quiet_start.clone().unwrap_or(cur.quiet_start);
     let end = p.quiet_end.clone().unwrap_or(cur.quiet_end);
     if start.is_empty() != end.is_empty() {
@@ -223,23 +237,31 @@ async fn put_settings(
             "quiet_start and quiet_end must both be set or both be empty".into(),
         ));
     }
+    if !valid_time_or_empty(&start) || !valid_time_or_empty(&end) {
+        return Err(ApiError::BadRequest(
+            "quiet hours must be HH:MM or empty".into(),
+        ));
+    }
     if let Some(tz) = &p.timezone {
         Tz::from_str(tz).map_err(|_| ApiError::BadRequest("unknown timezone".into()))?;
-        store::set_setting(&st.db, "timezone", tz).await?;
     }
-    for (key, val) in [("quiet_start", &p.quiet_start), ("quiet_end", &p.quiet_end)] {
-        if let Some(v) = val {
-            if !valid_time_or_empty(v) {
-                return Err(ApiError::BadRequest(format!(
-                    "{key} must be HH:MM or empty"
-                )));
-            }
-            store::set_setting(&st.db, key, v).await?;
-        }
+    if let Some(tz) = &p.timezone {
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('timezone', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+            .bind(tz).execute(&mut *tx).await?;
+    }
+    if p.quiet_start.is_some() {
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('quiet_start', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+            .bind(&start).execute(&mut *tx).await?;
+    }
+    if p.quiet_end.is_some() {
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('quiet_end', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+            .bind(&end).execute(&mut *tx).await?;
     }
     if let Some(on) = p.reminders_enabled {
-        store::set_setting(&st.db, "reminders_enabled", if on { "1" } else { "0" }).await?;
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('reminders_enabled', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+            .bind(if on { "1" } else { "0" }).execute(&mut *tx).await?;
     }
+    tx.commit().await?;
     Ok(Json(load_settings(&st).await?))
 }
 

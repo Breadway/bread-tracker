@@ -353,6 +353,78 @@ async fn settings_round_trip_and_validation() {
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"quiet_start": "22:00", "quiet_end": "not-a-time"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (_, after) = call(&h.app, "GET", "/settings", Some(&tok), None).await;
+    assert_eq!(
+        after["quiet_start"], "22:00",
+        "invalid patch must not partially mutate settings"
+    );
+    assert_eq!(after["quiet_end"], "07:00");
+    let concurrent = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"timezone":"Australia/Sydney","reminders_enabled":false})),
+    );
+    let concurrent2 = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"quiet_start":"21:00","quiet_end":"06:00"})),
+    );
+    let (a, b) = tokio::join!(concurrent, concurrent2);
+    assert_eq!(a.0, StatusCode::OK);
+    assert_eq!(b.0, StatusCode::OK);
+    let (_, final_settings) = call(&h.app, "GET", "/settings", Some(&tok), None).await;
+    assert_eq!(final_settings["timezone"], "Australia/Sydney");
+    assert_eq!(final_settings["quiet_start"], "21:00");
+    assert_eq!(final_settings["quiet_end"], "06:00");
+    assert_eq!(final_settings["reminders_enabled"], false);
+}
+
+#[tokio::test]
+async fn concurrent_settings_patches_preserve_both_fields() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let app = h.app.clone();
+    let token = tok.clone();
+    let first = tokio::spawn(async move {
+        call(
+            &app,
+            "PUT",
+            "/settings",
+            Some(&token),
+            Some(json!({"timezone": "Australia/Sydney"})),
+        )
+        .await
+    });
+    let app = h.app.clone();
+    let token = tok.clone();
+    let second = tokio::spawn(async move {
+        call(
+            &app,
+            "PUT",
+            "/settings",
+            Some(&token),
+            Some(json!({"reminders_enabled": false})),
+        )
+        .await
+    });
+    assert_eq!(first.await.unwrap().0, StatusCode::OK);
+    assert_eq!(second.await.unwrap().0, StatusCode::OK);
+    let (_, settings) = call(&h.app, "GET", "/settings", Some(&tok), None).await;
+    assert_eq!(settings["timezone"], "Australia/Sydney");
+    assert_eq!(settings["reminders_enabled"], false);
 }
 
 // Monday 2026-10-19, 17:15 Perth = 09:15 UTC.

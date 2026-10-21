@@ -1,9 +1,11 @@
 //! bread-tracker-server entry point.
 //!
 //!   bread-tracker-server          run the server
-//!   bread-tracker-server pair     print a one-time pairing code (valid 15 minutes)
-//!   bread-tracker-server devices  list paired devices
+//!   bread-tracker-server pair [--user <name>]   print a one-time pairing code (valid 15 minutes)
+//!   bread-tracker-server devices [--user <name>]   list paired devices
 //!   bread-tracker-server revoke <id>   remove a device (id or unique prefix, from `devices`)
+//!   bread-tracker-server user list             list users
+//!   bread-tracker-server user remove <name> --yes   delete a user and all their data
 //!   bread-tracker-server invite create [--ttl 7d]   print a single-use signup code
 //!   bread-tracker-server invite list                list invites and their state
 //!   bread-tracker-server invite revoke <id>         cancel an unused invite
@@ -31,23 +33,54 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("pair") => {
-            println!("{}", auth::create_pairing_code(&db).await?);
+            let user = resolve_user_flag(&db, &args[1..]).await?;
+            println!("{}", auth::create_pairing_code_for(&db, user.id).await?);
+            eprintln!("Pairing code for {} (valid 15 minutes, single use).", user.name);
             return Ok(());
         }
         Some("devices") => {
-            let list = devices::list(&db).await?;
+            let filter = if args.iter().any(|a| a == "--user") { Some(resolve_user_flag(&db, &args[1..]).await?.id) } else { None };
+            let list = devices::list(&db, filter).await?;
             if list.is_empty() {
                 println!("No devices are paired.");
             }
             for d in list {
                 println!(
-                    "{}  {:<20}  paired {}  last seen {}  push {}",
+                    "{}  {:<16}  {:<20}  paired {}  last seen {}  push {}",
                     d.id,
+                    d.user,
                     d.name,
                     fmt_ms(d.created_at),
                     fmt_ms(d.last_seen),
                     if d.has_push { "yes" } else { "no" }
                 );
+            }
+            return Ok(());
+        }
+        Some("user") => {
+            match args.get(1).map(String::as_str) {
+                Some("list") => {
+                    for u in users::list(&db).await? {
+                        let devices = devices::list(&db, Some(u.id)).await?.len();
+                        println!("{:<4}  {:<20}  {}  {} device(s)  since {}", u.id, u.name, if u.is_admin { "admin" } else { "user " }, devices, fmt_ms(u.created_at));
+                    }
+                }
+                Some("remove") => {
+                    let name = args.get(2).filter(|a| !a.starts_with("--")).context("usage: bread-tracker-server user remove <name> --yes")?;
+                    let Some(user) = users::find(&db, name).await? else { anyhow::bail!("no user named {name:?}") };
+                    if !args.iter().any(|a| a == "--yes") {
+                        anyhow::bail!(
+                            "this deletes {} and all of their devices, items, completions and settings, and cannot be undone. Run again with --yes to confirm.",
+                            user.name
+                        );
+                    }
+                    match users::remove(&db, user.id).await? {
+                        Ok(r) => println!("Removed {}: {} device(s), {} item(s), {} completion(s).", r.name, r.devices, r.items, r.completions),
+                        Err(users::RemoveError::IsAdmin) => anyhow::bail!("{} is an admin and cannot be removed", user.name),
+                        Err(users::RemoveError::NotFound) => anyhow::bail!("no user named {name:?}"),
+                    }
+                }
+                _ => anyhow::bail!("usage: bread-tracker-server user list | user remove <name> --yes"),
             }
             return Ok(());
         }
@@ -103,7 +136,7 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        Some(other) => anyhow::bail!("unknown command {other:?} (expected pair, devices, revoke or invite)"),
+        Some(other) => anyhow::bail!("unknown command {other:?} (expected pair, devices, revoke, user or invite)"),
         None => {}
     }
 
@@ -118,7 +151,9 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    if auth::device_count(&db).await? == 0 {
+    // First run only: the owner (admin) has no device yet. Other users' devices do not count,
+    // and no codes are ever printed for other users.
+    if auth::admin_device_count(&db).await? == 0 {
         let code = auth::create_pairing_code(&db).await?;
         println!("No device is paired yet. Pairing code (valid 15 minutes): {code}");
     }
@@ -134,6 +169,19 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("server error")
+}
+
+/// `--user <name>` selects a user; without the flag the admin is meant. A name that does not
+/// exist is an error, never a silent fallback to the admin.
+async fn resolve_user_flag(db: &bread_tracker_server::db::Db, args: &[String]) -> anyhow::Result<users::User> {
+    let name = match args.iter().position(|a| a == "--user") {
+        Some(i) => Some(args.get(i + 1).filter(|v| !v.starts_with("--")).context("--user needs a user name")?),
+        None => None,
+    };
+    match name {
+        Some(n) => users::find(db, n).await?.with_context(|| format!("no user named {n:?} (see `user list`)")),
+        None => users::find_by_id(db, users::ADMIN_ID).await?.context("the admin user is missing"),
+    }
 }
 
 /// Resolves on SIGINT (Ctrl-C) or SIGTERM (what `docker stop` and systemd send).

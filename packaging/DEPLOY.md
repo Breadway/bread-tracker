@@ -82,3 +82,15 @@ docker exec bread-tracker bread-tracker-server invite revoke <id>
 ```
 
 The code is shown once. Signup is a public endpoint (`POST /signup`) behind the same reverse proxy as the rest: set `BREADTRACKER_TRUSTED_PROXIES` to your proxy's address range so the per-address rate limit sees the real client rather than the proxy. `BREADTRACKER_INVITE_TTL_DAYS` changes the default lifetime.
+
+## Users and devices
+
+```sh
+docker exec bread-tracker bread-tracker-server user list
+docker exec bread-tracker bread-tracker-server devices [--user NAME]
+docker exec bread-tracker bread-tracker-server pair [--user NAME]    # a code for that user's new device
+docker exec bread-tracker bread-tracker-server revoke <device id>
+docker exec bread-tracker bread-tracker-server user remove NAME --yes # deletes the user and all their data
+```
+
+Without `--user`, `pair` makes a code for the admin. Users add their own second device from the app (Settings), which calls `POST /pair-code`; you do not need to be involved. `user remove` cannot be undone, so take a backup first if in doubt; it refuses to remove an admin.

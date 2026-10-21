@@ -56,8 +56,12 @@ pub async fn create_pairing_code(db: &Db) -> Result<String, sqlx::Error> {
 
 /// Create a pairing code that adds a device to `user_id`'s account.
 pub async fn create_pairing_code_for(db: &Db, user_id: i64) -> Result<String, sqlx::Error> {
-    let mut rng = rand::thread_rng();
-    let raw: String = (0..8).map(|_| CODE_ALPHABET[rng.gen_range(0..CODE_ALPHABET.len())] as char).collect();
+    // The RNG is not Send, so it must be gone before the first await (handlers run on a
+    // multi-threaded runtime).
+    let raw: String = {
+        let mut rng = rand::thread_rng();
+        (0..8).map(|_| CODE_ALPHABET[rng.gen_range(0..CODE_ALPHABET.len())] as char).collect()
+    };
     sqlx::query("DELETE FROM pairing_codes WHERE expires_at < ?")
         .bind(now_ms())
         .execute(db)
@@ -108,8 +112,38 @@ pub async fn insert_device(
     Ok((id, token))
 }
 
-pub async fn device_count(db: &Db) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar("SELECT COUNT(*) FROM devices").fetch_one(db).await
+/// Number of devices the first-run check looks at: only the admin's. Other users' devices say
+/// nothing about whether the owner still needs a pairing code.
+pub async fn admin_device_count(db: &Db) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE user_id = ?")
+        .bind(crate::users::ADMIN_ID)
+        .fetch_one(db)
+        .await
+}
+
+/// Pairing codes a user may have outstanding at once. Creating one more replaces the oldest,
+/// so a stuck client cannot pile them up.
+const MAX_OPEN_CODES_PER_USER: i64 = 3;
+
+/// A fresh short-lived pairing code for `user_id`, keeping at most
+/// [`MAX_OPEN_CODES_PER_USER`] unexpired codes for that user.
+pub async fn create_pairing_code_limited(db: &Db, user_id: i64) -> Result<String, sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM pairing_codes WHERE user_id = ?1 AND code_hash NOT IN
+           (SELECT code_hash FROM pairing_codes WHERE user_id = ?1 AND expires_at > ?2
+            ORDER BY expires_at DESC LIMIT ?3)",
+    )
+    .bind(user_id)
+    .bind(now_ms())
+    .bind(MAX_OPEN_CODES_PER_USER - 1)
+    .execute(db)
+    .await?;
+    create_pairing_code_for(db, user_id).await
+}
+
+/// Expiry of a pairing code, for the response of `POST /pair-code`.
+pub fn pairing_code_ttl_secs() -> i64 {
+    CODE_TTL_MS / 1000
 }
 
 /// Counts failed attempts per source and refuses further attempts from a source that has

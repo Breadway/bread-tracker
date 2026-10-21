@@ -7,17 +7,22 @@ use crate::db::Db;
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DeviceInfo {
     pub id: String,
+    pub user: String,
     pub name: String,
     pub created_at: i64,
     pub last_seen: i64,
     pub has_push: bool,
 }
 
-pub async fn list(db: &Db) -> Result<Vec<DeviceInfo>, sqlx::Error> {
+/// All devices, or only those of the user with this id.
+pub async fn list(db: &Db, user_id: Option<i64>) -> Result<Vec<DeviceInfo>, sqlx::Error> {
     sqlx::query_as::<_, DeviceInfo>(
-        "SELECT id, name, created_at, last_seen, (fcm_token IS NOT NULL AND fcm_token != '') AS has_push
-         FROM devices ORDER BY created_at, id",
+        "SELECT d.id, u.name AS user, d.name, d.created_at, d.last_seen,
+                (d.fcm_token IS NOT NULL AND d.fcm_token != '') AS has_push
+         FROM devices d JOIN users u ON u.id = d.user_id
+         WHERE (?1 IS NULL OR d.user_id = ?1) ORDER BY d.created_at, d.id",
     )
+    .bind(user_id)
     .fetch_all(db)
     .await
 }

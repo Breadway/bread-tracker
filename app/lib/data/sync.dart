@@ -82,8 +82,11 @@ class SyncEngine {
     }
 
     if (generation != _generation || _invalidated) return SyncStatus.unpaired;
-
+    final cursor = res['cursor'] as int;
     await db.transaction(() async {
+      // Re-check inside the same database write transaction used for applying the
+      // response. Sign-out performs its local wipe in a database transaction too.
+      if (generation != _generation || _invalidated) return;
       // Rows unchanged since we pushed them are now clean.
       for (final i in dirtyItems) {
         await (db.update(db.items)..where(
@@ -127,7 +130,8 @@ class SyncEngine {
         await db.into(db.completions).insertOnConflictUpdate(_compCompanion(j));
       }
     });
-    await store.setCursor(res['cursor'] as int);
+    if (generation != _generation || _invalidated) return SyncStatus.unpaired;
+    await store.setCursor(cursor);
     return SyncStatus.idle;
   }
 

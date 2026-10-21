@@ -223,7 +223,7 @@ class _ZoneDialogState extends State<_ZoneDialog> {
       controller: _c,
       autofocus: true,
       decoration: const InputDecoration(
-        hintText: 'For example Australia/Perth',
+        hintText: 'For example Europe/Berlin',
         helperText: 'Reminder times and "today" follow this zone.',
       ),
     ),

@@ -211,8 +211,8 @@ class _PairScreenState extends ConsumerState<PairScreen> {
             Text(
               join
                   ? 'Invite codes come from whoever runs the server. Each works once.'
-                  : 'Make a code on Hestia with: docker exec bread-tracker bread-tracker-server pair, '
-                        'or in Settings on a phone that is already signed in.',
+                  : 'Get a code from Settings on a phone that is already signed in to the '
+                        'account (Add another device), or ask whoever runs the server.',
               style: TextStyle(color: p.dim, fontSize: 12),
             ),
             if (_error != null)

@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically verify Bread Tracker backup restore
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

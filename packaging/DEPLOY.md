@@ -35,17 +35,23 @@ docker run --rm -v /var/backups/bread-tracker:/b -v /tmp:/o litestream/litestrea
 sqlite3 /tmp/restored.db 'select count(*) from items;'
 ```
 
+Install `restore-test.service.example` and `restore-test.timer.example` as systemd user or
+system units after setting the correct project directory and confirming Docker/sqlite3 availability.
+The schedule is daily and persistent; it verifies the local replica without modifying live data.
+
 Run `packaging/restore-test.sh` to do this for the newest replica: it restores into a temporary
 directory, runs `pragma integrity_check`, prints the item and device counts and exits non-zero on
-failure. Schedule it (cron or a systemd timer) so a broken backup is noticed.
+failure. `restore-test.service.example` and `restore-test.timer.example` provide a daily,
+persistent systemd schedule. Install only after confirming the replica path and dependencies.
 
 ### Offsite copy
 
 The Litestream replica above lives on the same host as the live database. It protects against a
-corrupt database, not against losing the host or its disk. Copy `BREADTRACKER_BACKUP_DIR` to another
-machine on a schedule, for example with `rsync -a --delete /var/backups/bread-tracker/ other-host:backups/bread-tracker/`
-from a timer, or point a second Litestream replica at S3 compatible storage. No offsite target is
-configured by this repository; choose one and run `restore-test.sh` against the copy too.
+corrupt database, not against losing the host or its disk. Use `packaging/offsite-backup.sh` with
+`BREADTRACKER_OFFSITE_SOURCE` and `BREADTRACKER_OFFSITE_DEST` configured in an operator-managed
+environment file. It uses rsync and refuses to run until both are explicitly supplied. Example
+hourly service/timer files are provided. Choose and secure the SSH/S3 destination and credentials
+outside this repository; no destination is invented here. Run `restore-test.sh` against the copy too.
 
 ## Container user, healthcheck and base images
 

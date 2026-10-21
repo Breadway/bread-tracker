@@ -8,6 +8,8 @@
 #                                               these to the file's owner (see DEPLOY.md).
 #   BREADTRACKER_BIND=127.0.0.1:7290            host bind (Aegis reaches it over Tailscale, see DEPLOY.md)
 #   BREADTRACKER_BACKUP_DIR=/var/backups/bread-tracker
+#   BREADTRACKER_OFFSITE_SOURCE=/var/backups/bread-tracker/litestream
+#   BREADTRACKER_OFFSITE_DEST=operator-configured-user@host:/safe/path/litestream
 #   BREADTRACKER_FCM_KEY_FILE=/home/breadway/secrets/bread-tracker-fcm.json   Firebase service account
 #
 # Pair a phone:  docker exec bread-tracker bread-tracker-server pair

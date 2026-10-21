@@ -103,9 +103,9 @@ pub async fn device_count(db: &Db) -> Result<i64, sqlx::Error> {
 /// source being blocked never affects another. Shared by `/pair` (and later `/signup`).
 ///
 /// Memory is bounded: at most `MAX_SOURCES` sources are tracked and each keeps at most
-/// `max` timestamps (the block threshold, so a source is never tracked past the point it
-/// is already blocked). When a new source arrives at capacity, the least recently seen
-/// tracked source is evicted. Eviction cost is a single scan of `MAX_SOURCES` entries.
+/// `max` timestamps. At capacity, new sources are admitted without a budget rather than
+/// evicting a live budget or globally rejecting valid pairings. Existing active blocks
+/// therefore cannot be reset by source churn.
 pub struct FailureLimiter {
     max: usize,
     window: Duration,
@@ -175,19 +175,9 @@ impl FailureLimiter {
                 !s.failures.is_empty()
             });
             if st.sources.len() >= MAX_SOURCES {
-                // Preserve active blocks. When all entries are unblocked, a new address may
-                // evict an unblocked entry and reset its failures. This is bounded best-effort
-                // abuse control for the single-user pairing endpoint, not an account lockout
-                // guarantee; successful pairings do not count and codes still have high entropy.
-                let max = self.max;
-                let victim = st
-                    .sources
-                    .iter()
-                    .min_by_key(|(_, s)| (s.failures.len() >= max, s.last_seen))
-                    .map(|(ip, _)| *ip);
-                if let Some(victim) = victim {
-                    st.sources.remove(&victim);
-                }
+                // Fail closed for accounting, not for pairing: do not evict another
+                // source's live budget, and do not refuse the request globally.
+                return;
             }
         }
         let entry = st.sources.entry(src).or_insert_with(|| Source {
@@ -270,6 +260,34 @@ mod limiter_tests {
             l.record_failure(ip(n));
         }
         assert!(l.is_blocked(ip(1)));
+    }
+
+    #[test]
+    fn source_churn_cannot_reset_partial_failure_budget_at_capacity() {
+        let l = FailureLimiter::new(5, Duration::from_secs(600));
+        for _ in 0..4 {
+            l.record_failure(ip(1));
+        }
+        for n in 2..=(MAX_SOURCES as u32 + 100) {
+            l.record_failure(ip(n));
+        }
+        l.record_failure(ip(1));
+        assert!(l.is_blocked(ip(1)));
+        assert_eq!(l.tracked_sources(), MAX_SOURCES);
+    }
+
+    #[test]
+    fn all_blocked_budgets_survive_new_source_at_capacity() {
+        let l = FailureLimiter::new(5, Duration::from_secs(600));
+        for n in 1..=MAX_SOURCES as u32 {
+            for _ in 0..5 {
+                l.record_failure(ip(n));
+            }
+        }
+        l.record_failure(ip(MAX_SOURCES as u32 + 1));
+        assert!(l.is_blocked(ip(1)));
+        assert!(l.is_blocked(ip(MAX_SOURCES as u32)));
+        assert!(!l.is_blocked(ip(MAX_SOURCES as u32 + 1)));
     }
 
     #[test]

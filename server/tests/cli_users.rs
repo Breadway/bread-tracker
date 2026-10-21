@@ -150,3 +150,30 @@ fn bad_usage_fails_without_changing_anything() {
     }
     assert_eq!(query(&db, "SELECT COUNT(*) FROM users"), "1");
 }
+
+#[test]
+fn disable_and_enable_keep_all_data_and_protect_the_admin() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.db");
+    run(&db, &["user", "list"]);
+    add_user(&db, "Bob");
+
+    let o = run(&db, &["user", "disable", "bob"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(query(&db, "SELECT COUNT(*) FROM users WHERE disabled_at IS NOT NULL"), "1");
+    assert_eq!(query(&db, "SELECT COUNT(*) FROM devices"), "1", "data is untouched");
+    assert_eq!(query(&db, "SELECT COUNT(*) FROM items"), "1");
+    let list = out(&run(&db, &["user", "list"]));
+    assert!(list.lines().any(|l| l.contains("Bob") && l.contains("DISABLED")), "{list}");
+
+    let o = run(&db, &["user", "enable", "Bob"]);
+    assert!(o.status.success());
+    assert_eq!(query(&db, "SELECT COUNT(*) FROM users WHERE disabled_at IS NOT NULL"), "0");
+    assert!(!out(&run(&db, &["user", "list"])).contains("DISABLED"));
+
+    let o = run(&db, &["user", "disable", "admin"]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("admin"), "{}", err(&o));
+    assert!(!run(&db, &["user", "disable", "ghost"]).status.success());
+    assert!(!run(&db, &["user", "disable"]).status.success());
+}

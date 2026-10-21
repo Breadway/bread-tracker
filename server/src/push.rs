@@ -348,7 +348,7 @@ pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize
     if !st.push.enabled() {
         return Ok(0);
     }
-    let users: Vec<i64> = sqlx::query_scalar("SELECT id FROM users ORDER BY id").fetch_all(&st.db).await?;
+    let users: Vec<i64> = sqlx::query_scalar("SELECT id FROM users WHERE disabled_at IS NULL ORDER BY id").fetch_all(&st.db).await?;
     let mut count = 0;
     for uid in users {
         match tick_user(st, UserDb::new(&st.db, uid), now_utc).await {

@@ -17,6 +17,14 @@ async fn next_seq(conn: &mut SqliteConnection) -> Result<i64, sqlx::Error> {
         .await
 }
 
+/// Result of [`UserDb::apply_push`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum PushOutcome {
+    Applied { skipped_completions: usize },
+    /// A per-user row ceiling was reached; nothing from the batch was stored.
+    LimitReached(String),
+}
+
 /// Storage for one user. Every query on a user-owned table (items, completions,
 /// reminders_sent) lives here and binds `user_id`, and the id is private, so a handler cannot
 /// run such a query without naming whose data it is. Build one per request from the
@@ -39,9 +47,31 @@ impl UserDb {
     /// Apply client rows. A row only wins when its `updated_at` is newer than the stored one.
     /// Future timestamps are clamped to a day ahead so a bad phone clock cannot freeze a row.
     /// An id that another user also holds is a different row: keys are (user_id, id).
-    pub async fn apply_push(&self, items: &[Item], completions: &[Completion]) -> Result<(), sqlx::Error> {
+    ///
+    /// `limits` caps how many rows (tombstones included) the user may hold. The counts are read
+    /// and enforced inside the write transaction, so concurrent requests cannot both slip under
+    /// the ceiling. Hitting a ceiling rolls the whole batch back and reports which one.
+    ///
+    /// A completion whose item the user does not have (neither stored nor in this batch) is not
+    /// stored. It is skipped rather than rejected so a phone with such a row cannot be stuck
+    /// retrying a batch that never succeeds; the number skipped is returned.
+    pub async fn apply_push(
+        &self,
+        items: &[Item],
+        completions: &[Completion],
+        limits: &crate::config::Limits,
+    ) -> Result<PushOutcome, sqlx::Error> {
         let ceiling = now_ms() + DAY_MS;
         let mut tx = self.db.begin().await?;
+        let mut item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE user_id = ?")
+            .bind(self.user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let mut completion_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM completions WHERE user_id = ?")
+            .bind(self.user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let mut orphans = 0;
 
         for it in items {
             let updated = it.updated_at.min(ceiling);
@@ -52,6 +82,15 @@ impl UserDb {
                 .await?;
             if existing.is_some_and(|e| e >= updated) {
                 continue;
+            }
+            if existing.is_none() {
+                if item_count >= limits.max_items {
+                    return Ok(PushOutcome::LimitReached(format!(
+                        "item limit reached ({} per account); delete items you no longer need",
+                        limits.max_items
+                    )));
+                }
+                item_count += 1;
             }
             let seq = next_seq(&mut tx).await?;
             sqlx::query(
@@ -92,6 +131,24 @@ impl UserDb {
             if existing.is_some_and(|e| e >= updated) {
                 continue;
             }
+            let owned: Option<i64> = sqlx::query_scalar("SELECT 1 FROM items WHERE user_id = ? AND id = ?")
+                .bind(self.user_id)
+                .bind(&c.item_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            if owned.is_none() {
+                orphans += 1;
+                continue;
+            }
+            if existing.is_none() {
+                if completion_count >= limits.max_completions {
+                    return Ok(PushOutcome::LimitReached(format!(
+                        "history limit reached ({} entries per account)",
+                        limits.max_completions
+                    )));
+                }
+                completion_count += 1;
+            }
             let seq = next_seq(&mut tx).await?;
             sqlx::query(
                 "INSERT INTO completions (user_id, item_id, date, completed_at, updated_at, deleted_at, seq)
@@ -111,7 +168,8 @@ impl UserDb {
             .await?;
         }
 
-        tx.commit().await
+        tx.commit().await?;
+        Ok(PushOutcome::Applied { skipped_completions: orphans })
     }
 
     /// This user's rows changed after `since`, read from one snapshot together with the new

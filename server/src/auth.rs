@@ -77,18 +77,47 @@ pub async fn create_pairing_code_for(db: &Db, user_id: i64) -> Result<String, sq
 
 /// Redeem a code (single use). Returns `(device_id, token)` on success.
 pub async fn redeem(db: &Db, code: &str, device_name: &str) -> Result<Option<(String, String)>, sqlx::Error> {
+    Ok(redeem_limited(db, code, device_name, i64::MAX).await?.ok())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RedeemError {
+    BadCode,
+    /// The user already has the maximum number of devices. The code is not spent.
+    DeviceLimit,
+}
+
+/// [`redeem`] with a ceiling on the user's devices. The code is only consumed when the device
+/// is created: the delete and the insert are one transaction.
+pub async fn redeem_limited(
+    db: &Db,
+    code: &str,
+    device_name: &str,
+    max_devices: i64,
+) -> Result<Result<(String, String), RedeemError>, sqlx::Error> {
+    use sqlx::Connection;
+    let mut conn = db.acquire().await?;
+    let mut tx = conn.begin().await?;
     let used: Option<i64> = sqlx::query_scalar(
         "DELETE FROM pairing_codes WHERE code_hash = ? AND expires_at > ? RETURNING user_id",
     )
     .bind(hash(&normalize_code(code)))
     .bind(now_ms())
-    .fetch_optional(db)
+    .fetch_optional(&mut *tx)
     .await?;
     let Some(user_id) = used else {
-        return Ok(None);
+        return Ok(Err(RedeemError::BadCode));
     };
-    let mut conn = db.acquire().await?;
-    Ok(Some(insert_device(&mut conn, user_id, device_name).await?))
+    let have: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if have >= max_devices {
+        return Ok(Err(RedeemError::DeviceLimit)); // dropped transaction: the code is not spent
+    }
+    let device = insert_device(&mut tx, user_id, device_name).await?;
+    tx.commit().await?;
+    Ok(Ok(device))
 }
 
 /// Create a device for `user_id` and return `(device_id, token)`. Only the token's hash is stored.
@@ -198,6 +227,36 @@ impl FailureLimiter {
     }
 }
 
+/// Fixed-window request counter per key (a device id), in memory. Unlike [`FailureLimiter`] it
+/// counts every request, so one noisy or malicious token cannot use the server for everyone.
+pub struct RateLimiter {
+    max: i64,
+    window: Duration,
+    hits: Mutex<HashMap<String, (Instant, i64)>>,
+}
+
+impl RateLimiter {
+    pub fn new(max: i64, window: Duration) -> Self {
+        Self { max, window, hits: Mutex::new(HashMap::new()) }
+    }
+
+    /// Count one request for `key`; false when it is over the limit for the current window.
+    pub fn allow(&self, key: &str) -> bool {
+        let mut hits = self.hits.lock().unwrap();
+        let now = Instant::now();
+        if hits.len() >= SWEEP_AT {
+            let window = self.window;
+            hits.retain(|_, (start, _)| now.duration_since(*start) <= window);
+        }
+        let e = hits.entry(key.to_string()).or_insert((now, 0));
+        if now.duration_since(e.0) > self.window {
+            *e = (now, 0);
+        }
+        e.1 += 1;
+        e.1 <= self.max
+    }
+}
+
 /// An IP or CIDR range allowed to set `X-Forwarded-For` (our reverse proxy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrustedProxy {
@@ -280,12 +339,22 @@ pub async fn require_auth(State(st): State<AppState>, mut req: Request, next: Ne
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(ApiError::Unauthorized)?
         .to_string();
-    let row: Option<(String, i64, i64)> =
-        sqlx::query_as("SELECT id, last_seen, user_id FROM devices WHERE token_hash = ?")
-            .bind(hash(&token))
-            .fetch_optional(&st.db)
-            .await?;
-    let (id, last_seen, user_id) = row.ok_or(ApiError::Unauthorized)?;
+    let row: Option<(String, i64, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT d.id, d.last_seen, d.user_id, u.disabled_at
+         FROM devices d JOIN users u ON u.id = d.user_id WHERE d.token_hash = ?",
+    )
+    .bind(hash(&token))
+    .fetch_optional(&st.db)
+    .await?;
+    let (id, last_seen, user_id, disabled_at) = row.ok_or(ApiError::Unauthorized)?;
+    if disabled_at.is_some() {
+        return Err(ApiError::Disabled);
+    }
+    // Per token, so one noisy device cannot use up the server for everyone else.
+    if !st.rate_limiter.allow(&id) {
+        tracing::warn!(user = user_id, device = %id, "request rate limit hit");
+        return Err(ApiError::TooManyRequests);
+    }
     // last_seen is informational, so write it at most once per interval, not per request.
     let now = now_ms();
     if now - last_seen >= LAST_SEEN_INTERVAL_MS {
@@ -296,7 +365,12 @@ pub async fn require_auth(State(st): State<AppState>, mut req: Request, next: Ne
             .execute(&st.db)
             .await?;
     }
+    // The user id goes in the log so abuse can be traced to an account. Never the token, and
+    // only the path (no query string).
+    let (method, path) = (req.method().clone(), req.uri().path().to_string());
     req.extensions_mut().insert(DeviceId(id));
     req.extensions_mut().insert(UserId(user_id));
-    Ok(next.run(req).await)
+    let resp = next.run(req).await;
+    tracing::info!(user = user_id, %method, %path, status = resp.status().as_u16(), "request");
+    Ok(resp)
 }

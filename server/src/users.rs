@@ -43,22 +43,35 @@ pub struct User {
     pub name: String,
     pub is_admin: bool,
     pub created_at: i64,
+    pub disabled_at: Option<i64>,
 }
 
 pub async fn list(db: &Db) -> Result<Vec<User>, sqlx::Error> {
-    sqlx::query_as("SELECT id, name, is_admin, created_at FROM users ORDER BY id").fetch_all(db).await
+    sqlx::query_as("SELECT id, name, is_admin, created_at, disabled_at FROM users ORDER BY id").fetch_all(db).await
+}
+
+/// Disable or enable a user without touching their data. A disabled user's devices are refused
+/// (403) and they get no reminders. Admins cannot be disabled. Returns false when there is no
+/// such (non-admin) user.
+pub async fn set_disabled(db: &Db, id: i64, disabled: bool) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query("UPDATE users SET disabled_at = ? WHERE id = ? AND is_admin = 0")
+        .bind(if disabled { Some(crate::store::now_ms()) } else { None })
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(res.rows_affected() > 0)
 }
 
 /// Find a user by name (case-insensitive, as names are unique that way).
 pub async fn find(db: &Db, name: &str) -> Result<Option<User>, sqlx::Error> {
-    sqlx::query_as("SELECT id, name, is_admin, created_at FROM users WHERE name = ?")
+    sqlx::query_as("SELECT id, name, is_admin, created_at, disabled_at FROM users WHERE name = ?")
         .bind(name.trim())
         .fetch_optional(db)
         .await
 }
 
 pub async fn find_by_id(db: &Db, id: i64) -> Result<Option<User>, sqlx::Error> {
-    sqlx::query_as("SELECT id, name, is_admin, created_at FROM users WHERE id = ?").bind(id).fetch_optional(db).await
+    sqlx::query_as("SELECT id, name, is_admin, created_at, disabled_at FROM users WHERE id = ?").bind(id).fetch_optional(db).await
 }
 
 /// What [`remove`] deleted, counted inside the same transaction.

@@ -18,7 +18,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::model::{SyncRequest, SyncResponse};
 use crate::push::{Message, SendOutcome};
 use crate::store::{UserDb, UserSettings};
-use crate::{invites, users};
+use crate::{invites, store, users};
 use crate::{xp, AppState};
 
 const MAX_BATCH: usize = 5000;
@@ -72,8 +72,16 @@ async fn pair(
     }
     let name = if req.device_name.trim().is_empty() { "Android" } else { req.device_name.trim() };
     let name: String = name.chars().take(80).collect();
-    match auth::redeem(&st.db, &req.code, &name).await? {
-        Some((device_id, token)) => {
+    match auth::redeem_limited(&st.db, &req.code, &name, st.config.limits.max_devices).await? {
+        Err(auth::RedeemError::DeviceLimit) => Err(ApiError::LimitReached(format!(
+            "this account already has the maximum of {} devices; sign out of one first",
+            st.config.limits.max_devices
+        ))),
+        Err(auth::RedeemError::BadCode) => {
+            st.pair_limiter.record_failure(src);
+            Err(ApiError::Unauthorized)
+        }
+        Ok((device_id, token)) => {
             let (user_id, name): (i64, String) = sqlx::query_as(
                 "SELECT u.id, u.name FROM devices d JOIN users u ON u.id = d.user_id WHERE d.id = ?",
             )
@@ -81,10 +89,6 @@ async fn pair(
             .fetch_one(&st.db)
             .await?;
             Ok(Json(PairResp { device_id, token, user_id, name }))
-        }
-        None => {
-            st.pair_limiter.record_failure(src);
-            Err(ApiError::Unauthorized)
         }
     }
 }
@@ -114,6 +118,13 @@ async fn new_pair_code(
     State(st): State<AppState>,
     Extension(UserId(uid)): Extension<UserId>,
 ) -> ApiResult<Json<PairCodeResp>> {
+    let devices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE user_id = ?").bind(uid).fetch_one(&st.db).await?;
+    if devices >= st.config.limits.max_devices {
+        return Err(ApiError::LimitReached(format!(
+            "this account already has the maximum of {} devices; sign out of one first",
+            st.config.limits.max_devices
+        )));
+    }
     let code = auth::create_pairing_code_limited(&st.db, uid).await?;
     tracing::info!(user = uid, "pairing code issued");
     Ok(Json(PairCodeResp { code, expires_in_secs: auth::pairing_code_ttl_secs() }))
@@ -160,7 +171,7 @@ async fn signup(
     let device_name = if req.device_name.trim().is_empty() { "Android" } else { req.device_name.trim() };
     let device_name: String = device_name.chars().take(80).collect();
     let timezone = req.timezone.as_deref().map(str::trim).filter(|t| !t.is_empty() && Tz::from_str(t).is_ok());
-    match invites::signup(&st.db, &req.invite, name, &device_name, timezone).await? {
+    match invites::signup(&st.db, &req.invite, name, &device_name, timezone, st.config.limits.max_users).await? {
         Ok(s) => {
             tracing::info!(user = s.user_id, "signed up");
             Ok(Json(SignupResp { user_id: s.user_id, name: name.to_string(), device_id: s.device_id, token: s.token }))
@@ -170,6 +181,9 @@ async fn signup(
             Err(ApiError::Unauthorized)
         }
         Err(invites::SignupError::NameTaken) => Err(ApiError::Conflict("that name is already taken".into())),
+        Err(invites::SignupError::ServerFull) => {
+            Err(ApiError::LimitReached("this server is not accepting new accounts right now".into()))
+        }
     }
 }
 
@@ -204,7 +218,17 @@ async fn sync(
         c.validate(today).map_err(ApiError::BadRequest)?;
     }
     let user = UserDb::new(&st.db, uid);
-    user.apply_push(&req.items, &req.completions).await?;
+    match user.apply_push(&req.items, &req.completions, &st.config.limits).await? {
+        store::PushOutcome::Applied { skipped_completions } => {
+            if skipped_completions > 0 {
+                tracing::warn!(user = uid, skipped_completions, "completions for unknown items were not stored");
+            }
+        }
+        store::PushOutcome::LimitReached(msg) => {
+            tracing::warn!(user = uid, "{msg}");
+            return Err(ApiError::LimitReached(msg));
+        }
+    }
     Ok(Json(user.pull(req.since).await?))
 }
 

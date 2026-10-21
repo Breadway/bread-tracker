@@ -206,4 +206,61 @@ void main() {
     expect(await sync, SyncStatus.unpaired);
     expect((await db.select(db.items).getSingle()).name, 'keep');
   });
+
+  test(
+    're-pair invalidates an old response without clearing the new credential',
+    () async {
+      final entered = Completer<void>();
+      final release = Completer<void>();
+      SharedPreferences.setMockInitialValues({});
+      final prefs = await SharedPreferences.getInstance();
+      final store = MemStore(prefs);
+      final db = AppDb(NativeDatabase.memory());
+      await db.upsertItem(
+        ItemsCompanion.insert(
+          id: id1,
+          kind: 'chore',
+          name: 'private',
+          points: 10,
+          updatedAt: 1,
+          dirty: const Value(true),
+        ),
+      );
+      final container = ProviderContainer(
+        overrides: [
+          prefsProvider.overrideWithValue(prefs),
+          storeProvider.overrideWithValue(store),
+          dbProvider.overrideWithValue(db),
+          apiFactoryProvider.overrideWithValue(
+            (base, token) => Api(
+              base,
+              token: token,
+              client: MockClient((r) async {
+                if (r.method == 'POST' && !entered.isCompleted) {
+                  entered.complete();
+                  await release.future;
+                }
+                return http.Response(
+                  '{"cursor":17,"items":[],"completions":[]}',
+                  200,
+                );
+              }),
+            ),
+          ),
+        ],
+      );
+      addTearDown(container.dispose);
+      final syncing = container.read(syncEngineProvider).sync();
+      await entered.future;
+      final ctl = container.read(controllerProvider);
+      await ctl.signOut();
+      await store.saveToken('new-token');
+      ctl.pairedAgain();
+      release.complete();
+      expect(await syncing, SyncStatus.unpaired);
+      expect(await store.token, 'new-token');
+      expect(store.cursor, 0);
+      expect((await db.select(db.items).getSingle()).dirty, isTrue);
+    },
+  );
 }

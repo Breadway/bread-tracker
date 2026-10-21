@@ -31,7 +31,9 @@ impl Config {
             push_mode: get("BREADTRACKER_PUSH_MODE")
                 .map(|v| {
                     PushMode::parse(&v).unwrap_or_else(|| {
-                        eprintln!("ignoring invalid BREADTRACKER_PUSH_MODE {v:?}, using notification");
+                        eprintln!(
+                            "ignoring invalid BREADTRACKER_PUSH_MODE {v:?}, using notification"
+                        );
                         PushMode::Notification
                     })
                 })

@@ -159,11 +159,17 @@ pub struct Fcm {
 
 impl Fcm {
     pub fn from_file(path: &Path, mode: PushMode) -> anyhow::Result<Self> {
-        let raw = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let sa: ServiceAccount = serde_json::from_str(&raw).context("parsing service account json")?;
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let sa: ServiceAccount =
+            serde_json::from_str(&raw).context("parsing service account json")?;
         Ok(Self {
-            client: reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?,
-            key: EncodingKey::from_rsa_pem(sa.private_key.as_bytes()).context("service account private key")?,
+            mode,
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(20))
+                .build()?,
+            key: EncodingKey::from_rsa_pem(sa.private_key.as_bytes())
+                .context("service account private key")?,
             project_id: sa.project_id,
             client_email: sa.client_email,
             token_uri: sa.token_uri,
@@ -221,8 +227,17 @@ impl PushSender for Fcm {
     async fn send(&self, msg: &Message) -> anyhow::Result<SendOutcome> {
         let access = self.access_token().await?;
         let payload = fcm_payload(msg, self.mode);
-        let url = format!("https://fcm.googleapis.com/v1/projects/{}/messages:send", self.project_id);
-        let resp = self.client.post(url).bearer_auth(access).json(&payload).send().await?;
+        let url = format!(
+            "https://fcm.googleapis.com/v1/projects/{}/messages:send",
+            self.project_id
+        );
+        let resp = self
+            .client
+            .post(url)
+            .bearer_auth(access)
+            .json(&payload)
+            .send()
+            .await?;
         let status = resp.status();
         if status.is_success() {
             return Ok(SendOutcome::Sent);
@@ -450,24 +465,49 @@ mod tests {
         assert_eq!(v["message"]["notification"]["body"], "Chore due now");
         assert_eq!(v["message"]["data"]["item_id"], "i1");
         assert_eq!(v["message"]["android"]["priority"], "HIGH");
-        assert_eq!(v["message"]["android"]["notification"]["channel_id"], "reminders");
+        assert_eq!(
+            v["message"]["android"]["notification"]["channel_id"],
+            "reminders"
+        );
     }
 
     #[test]
     fn data_mode_has_no_notification_block_and_carries_the_text_as_data() {
         let v = fcm_payload(&msg(), PushMode::Data);
-        assert!(v["message"].get("notification").is_none(), "a notification block would make Android show it itself");
+        assert!(
+            v["message"].get("notification").is_none(),
+            "a notification block would make Android show it itself"
+        );
         let d = &v["message"]["data"];
-        assert_eq!((d["title"].as_str(), d["body"].as_str()), (Some("Recycling"), Some("Chore due now")));
-        assert_eq!((d["item_id"].as_str(), d["date"].as_str(), d["kind"].as_str()), (Some("i1"), Some("2026-10-19"), Some("chore")));
-        assert_eq!(v["message"]["android"]["priority"], "HIGH", "high priority so it wakes the app");
-        assert!(d.as_object().unwrap().values().all(|x| x.is_string()), "FCM data values must be strings");
+        assert_eq!(
+            (d["title"].as_str(), d["body"].as_str()),
+            (Some("Recycling"), Some("Chore due now"))
+        );
+        assert_eq!(
+            (
+                d["item_id"].as_str(),
+                d["date"].as_str(),
+                d["kind"].as_str()
+            ),
+            (Some("i1"), Some("2026-10-19"), Some("chore"))
+        );
+        assert_eq!(
+            v["message"]["android"]["priority"], "HIGH",
+            "high priority so it wakes the app"
+        );
+        assert!(
+            d.as_object().unwrap().values().all(|x| x.is_string()),
+            "FCM data values must be strings"
+        );
     }
 
     #[test]
     fn push_mode_parsing() {
         assert_eq!(PushMode::parse("DATA"), Some(PushMode::Data));
-        assert_eq!(PushMode::parse(" notification "), Some(PushMode::Notification));
+        assert_eq!(
+            PushMode::parse(" notification "),
+            Some(PushMode::Notification)
+        );
         assert_eq!(PushMode::parse("both"), None);
         assert_eq!(PushMode::default(), PushMode::Notification);
     }

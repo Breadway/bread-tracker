@@ -238,9 +238,18 @@ pub fn due_reminders(
     if in_quiet_hours(local.time(), quiet) {
         return Vec::new();
     }
+    // Chores and habits are done per day. A to-do is done once, on whichever day it was
+    // ticked (the app records the tick date, which can be before the due date).
+    let todo_ids: HashSet<&str> = items
+        .iter()
+        .filter(|i| i.kind == "todo")
+        .map(|i| i.id.as_str())
+        .collect();
     let done: HashSet<&str> = completions
         .iter()
-        .filter(|c| c.date == date && c.deleted_at.is_none())
+        .filter(|c| {
+            c.deleted_at.is_none() && (c.date == date || todo_ids.contains(c.item_id.as_str()))
+        })
         .map(|c| c.item_id.as_str())
         .collect();
 
@@ -308,11 +317,7 @@ pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize
     let date = now.format("%Y-%m-%d").to_string();
 
     let items = store::all_items(&st.db).await?;
-    let completions: Vec<Completion> = store::all_completions(&st.db)
-        .await?
-        .into_iter()
-        .filter(|c| c.date == date)
-        .collect();
+    let completions = store::reminder_completions(&st.db, &date).await?;
     let sent: HashSet<(String, String)> = sqlx::query_as::<_, (String, String)>(
         "SELECT item_id, date FROM reminders_sent WHERE date = ?",
     )

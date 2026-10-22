@@ -472,3 +472,78 @@ async fn push_test_route_needs_a_registered_token() {
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(h.mock.sent.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn todo_ticked_on_an_earlier_day_gets_no_reminder() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    let mut todo = item(C1, "todo", "Pay rent", 127, Some("17:15"), now);
+    todo["due_date"] = json!("2026-10-19");
+    let mut other = item(H1, "todo", "Book dentist", 127, Some("17:15"), now);
+    other["due_date"] = json!("2026-10-19");
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({
+            "items": [todo, other],
+            // C1 was ticked yesterday, ahead of its due date.
+            "completions": [comp(C1, "2026-10-18", now, None)]
+        })),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&tok),
+        Some(json!({"fcm_token": "fcm-token-1"})),
+    )
+    .await;
+
+    assert_eq!(push::tick(&h.state, perth(17, 16)).await.unwrap(), 1);
+    let titles: Vec<String> = h
+        .mock
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| m.title.clone())
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["Book dentist"],
+        "only the untouched to-do is reminded"
+    );
+}
+
+#[tokio::test]
+async fn un_ticked_todo_completion_does_not_suppress_the_reminder() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    let mut todo = item(C1, "todo", "Pay rent", 127, Some("17:15"), now);
+    todo["due_date"] = json!("2026-10-19");
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({
+            "items": [todo],
+            "completions": [comp(C1, "2026-10-18", now, Some(now))]
+        })),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&tok),
+        Some(json!({"fcm_token": "fcm-token-1"})),
+    )
+    .await;
+    assert_eq!(push::tick(&h.state, perth(17, 16)).await.unwrap(), 1);
+}

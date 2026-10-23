@@ -88,7 +88,7 @@ pub struct SyncRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SyncResponse {
-    /// Identity of this database; see `db::ensure_epoch`. Clients reset when it changes.
+    /// Database generation. Missing remains compatible with older servers and clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch: Option<String>,
     pub cursor: i64,

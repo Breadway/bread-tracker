@@ -20,15 +20,17 @@ use push::PushSender;
 #[derive(Clone)]
 pub struct AppState {
     pub db: Db,
+    pub generation: Arc<std::sync::RwLock<String>>,
     pub config: Arc<Config>,
     pub push: Arc<dyn PushSender>,
     pub pair_limiter: Arc<auth::PairLimiter>,
 }
 
 impl AppState {
-    pub fn new(db: Db, config: Config, push: Arc<dyn PushSender>) -> Self {
+    pub fn new(db: Db, generation: String, config: Config, push: Arc<dyn PushSender>) -> Self {
         Self {
             db,
+            generation: Arc::new(std::sync::RwLock::new(generation)),
             config: Arc::new(config),
             push,
             pair_limiter: Arc::new(auth::PairLimiter::new(5, Duration::from_secs(600))),

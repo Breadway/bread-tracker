@@ -22,29 +22,58 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env();
+    let command = std::env::args().nth(1);
     if let Some(parent) = config
         .database_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
     {
-        std::fs::create_dir_all(parent).ok();
+        std::fs::create_dir_all(parent)?;
     }
-    if std::env::args().nth(1).as_deref() == Some("mark-restored") {
-        db::rotate_sidecar_generation(&config.database_path)?;
+    if command.as_deref() == Some("mark-restored") {
+        let _generation_lock = db::GenerationLock::try_acquire_exclusive(&config.database_path)
+            .context("server is running; stop it before marking a restored database")?;
+        if !config.database_path.exists() {
+            anyhow::bail!(
+                "database {} does not exist; restore it before marking generation",
+                config.database_path.display()
+            );
+        }
+        // Keep the generation sidecar adjacent to the configured database path. The
+        // same path is used by normal startup; rotating any other file has no effect.
+        std::fs::create_dir_all(
+            config
+                .database_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new(".")),
+        )?;
+        let generation_db = db::connect(&config.database_url())
+            .await
+            .context("opening database to mark restored generation")?;
+        let generation = uuid::Uuid::new_v4().to_string();
+        db::mark_restored(&generation_db, &config.database_path, &generation).await?;
         println!("Sync generation rotated. Start the server to resume sync.");
+        return Ok(());
+    }
+
+    // Hold the exclusive process lock through server lifetime. This serializes startup,
+    // pairing and restore marking and prevents multiple writers with stale generations.
+    let generation_lock = db::GenerationLock::acquire(&config.database_path)?;
+
+    if command.as_deref() == Some("pair") {
+        let db = db::connect(&config.database_url())
+            .await
+            .context("opening database")?;
+        db::reconcile_generation_locked(&db, &config.database_path).await?;
+        println!("{}", auth::create_pairing_code(&db).await?);
         return Ok(());
     }
 
     let db = db::connect(&config.database_url())
         .await
         .context("opening database")?;
-    let generation = db::read_or_create_generation(&config.database_path)?;
-    db::set_epoch(&db, &generation).await?;
-
-    if std::env::args().nth(1).as_deref() == Some("pair") {
-        println!("{}", auth::create_pairing_code(&db).await?);
-        return Ok(());
-    }
+    let generation = db::reconcile_generation_locked(&db, &config.database_path).await?;
 
     let sender: Arc<dyn push::PushSender> = match &config.fcm_service_account {
         Some(path) => Arc::new(push::Fcm::from_file(path).context("loading FCM service account")?),
@@ -60,7 +89,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let listen = config.listen.clone();
-    let state = AppState::new(db, config, sender);
+    let state = AppState::new(db, generation, config, sender);
+    let _generation_lock = generation_lock;
     push::spawn_scheduler(state.clone());
 
     let addr: SocketAddr = listen.parse().context("parsing BREADTRACKER_LISTEN")?;

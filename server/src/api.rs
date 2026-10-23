@@ -81,7 +81,8 @@ async fn pull(
     State(st): State<AppState>,
     Query(q): Query<PullQuery>,
 ) -> ApiResult<Json<SyncResponse>> {
-    let mut result = store::pull(&st.db, q.since).await?;
+    let generation = st.generation.read().unwrap().clone();
+    let mut result = store::pull(&st.db, q.since, Some(&generation)).await?;
     if q.since > result.cursor {
         result.items = store::all_items(&st.db).await?;
         result.completions = store::all_completions(&st.db).await?;
@@ -105,12 +106,14 @@ async fn sync(
     for c in &req.completions {
         c.validate().map_err(ApiError::BadRequest)?;
     }
-    let before = store::pull(&st.db, req.since).await?;
+    let generation = st.generation.read().unwrap().clone();
+    let before = store::pull(&st.db, req.since, Some(&generation)).await?;
     // New clients use an empty sync as preflight. On a generation mismatch return a full
     // snapshot without accepting writes. Legacy clients omit epoch and retain push behavior.
     let client_epoch = req.epoch.as_deref();
     // Databases created before generation support have no settings row. Return no wire field
     // so clients can use the legacy protocol without mistaking an unknown epoch for a restore.
+    // A missing generation keeps the historical push-then-pull contract for old clients.
     if client_epoch.is_some_and(|epoch| Some(epoch) != before.epoch.as_deref()) {
         let mut full = before;
         full.items = store::all_items(&st.db).await?;
@@ -123,7 +126,7 @@ async fn sync(
         return Ok(Json(full));
     }
     store::apply_push(&st.db, &req.items, &req.completions).await?;
-    let mut response = store::pull(&st.db, req.since).await?;
+    let mut response = store::pull(&st.db, req.since, Some(&generation)).await?;
     if req.since > response.cursor {
         response.items = store::all_items(&st.db).await?;
         response.completions = store::all_completions(&st.db).await?;

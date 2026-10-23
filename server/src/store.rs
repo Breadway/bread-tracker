@@ -99,7 +99,11 @@ const ITEM_COLS: &str =
 const COMPLETION_COLS: &str = "item_id, date, completed_at, updated_at, deleted_at, seq";
 
 /// Rows changed after `since`, read from one snapshot together with the new cursor.
-pub async fn pull(db: &Db, since: i64) -> Result<SyncResponse, sqlx::Error> {
+pub async fn pull(
+    db: &Db,
+    since: i64,
+    epoch_override: Option<&str>,
+) -> Result<SyncResponse, sqlx::Error> {
     let mut tx = db.begin().await?;
     let cursor: i64 = sqlx::query_scalar("SELECT val FROM meta WHERE key = 'seq'")
         .fetch_one(&mut *tx)
@@ -108,6 +112,7 @@ pub async fn pull(db: &Db, since: i64) -> Result<SyncResponse, sqlx::Error> {
         sqlx::query_scalar("SELECT value FROM settings WHERE key = 'sync_epoch'")
             .fetch_optional(&mut *tx)
             .await?;
+    let epoch = epoch_override.map(str::to_owned).or(epoch);
     let since = since.min(cursor);
     let items = sqlx::query_as::<_, Item>(&format!(
         "SELECT {ITEM_COLS} FROM items WHERE seq > ? AND seq <= ? ORDER BY seq"

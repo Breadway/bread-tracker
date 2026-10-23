@@ -23,7 +23,8 @@ struct Harness {
 async fn harness() -> Harness {
     let db = db::connect_memory().await.unwrap();
     let mock = Arc::new(MockSender::default());
-    let state = AppState::new(db, Config::from_env(), mock.clone());
+    let generation = db::current_epoch(&db).await.unwrap().unwrap();
+    let state = AppState::new(db, generation, Config::from_env(), mock.clone());
     Harness {
         app: api::router(state.clone()),
         state,
@@ -492,14 +493,9 @@ async fn sync_reports_a_stable_epoch_that_differs_between_databases() {
     assert_eq!(b["epoch"], epoch, "writes do not change it");
 
     // A normal database open preserves its identity. Explicit rotation changes it.
-    bread_tracker_server::db::ensure_epoch(&h.state.db)
-        .await
-        .unwrap();
     let (_, same) = call(&h.app, "GET", "/sync", Some(&tok), None).await;
     assert_eq!(same["epoch"], epoch);
-    bread_tracker_server::db::set_epoch(&h.state.db, "rotated-generation")
-        .await
-        .unwrap();
+    *h.state.generation.write().unwrap() = "rotated-generation".to_owned();
     let (_, c) = call(&h.app, "GET", "/sync", Some(&tok), None).await;
     assert_ne!(
         c["epoch"], epoch,
@@ -528,9 +524,7 @@ async fn generation_preflight_rejects_dirty_writes_then_returns_full_snapshot() 
         .fetch_one(&h.state.db)
         .await
         .unwrap();
-    bread_tracker_server::db::set_epoch(&h.state.db, "rotated-generation")
-        .await
-        .unwrap();
+    *h.state.generation.write().unwrap() = "rotated-generation".to_owned();
     let current: i64 = sqlx::query_scalar("SELECT val FROM meta WHERE key='seq'")
         .fetch_one(&h.state.db)
         .await
@@ -551,6 +545,24 @@ async fn generation_preflight_rejects_dirty_writes_then_returns_full_snapshot() 
     let (status, accepted) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"since": preflight["cursor"], "epoch": preflight["epoch"], "items": [item("22222222-2222-4222-8222-222222222222", "chore", "dirty", 127, None, now + 1000)]}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(accepted["items"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn legacy_request_against_generation_server_keeps_push_pull_contract() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    let (status, pushed) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"since": 0, "items": [item(C1, "chore", "legacy", 127, None, now)]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(pushed["items"][0]["name"], "legacy");
+    assert!(pushed["epoch"].as_str().is_some());
 }
 
 #[tokio::test]

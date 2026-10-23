@@ -16,6 +16,8 @@ class FakeServer {
   bool down = false;
   String epoch = 'epoch-1';
   bool supportsEpoch = true;
+  bool disconnectAfterFirstRequest = false;
+  bool firstRequest = false;
 
   /// A rebuilt server: empty database, new identity, counter back at zero.
   void rebuild(String newEpoch) {
@@ -109,7 +111,12 @@ class FakeApi extends Api {
         'server_time': 0,
       };
     }
-    return server.sync(since, items, completions, clientEpoch: epoch);
+    final response = server.sync(since, items, completions, clientEpoch: epoch);
+    if (server.disconnectAfterFirstRequest && !server.firstRequest) {
+      server.firstRequest = true;
+      server.supportsEpoch = false;
+    }
+    return response;
   }
 }
 
@@ -361,13 +368,80 @@ void main() {
   test('new app falls back to a server response without generation', () async {
     final server = FakeServer()..supportsEpoch = false;
     final (db, sync, store) = await device(server);
-    await db.upsertItem(ItemsCompanion.insert(
-      id: id1, kind: 'chore', name: 'old-server', points: 10,
-      updatedAt: 1000, dirty: const Value(true),
-    ));
+    await db.upsertItem(
+      ItemsCompanion.insert(
+        id: id1,
+        kind: 'chore',
+        name: 'old-server',
+        points: 10,
+        updatedAt: 1000,
+        dirty: const Value(true),
+      ),
+    );
     expect(await sync.sync(), SyncStatus.idle);
     expect(server.items[id1]!['name'], 'old-server');
     expect(store.epoch, isNull);
+  });
+
+  test(
+    'first contact with a legacy nonzero cursor performs a full exchange',
+    () async {
+      final server = FakeServer();
+      final (db, sync, store) = await device(server);
+      final remoteId = '22222222-2222-4222-8222-222222222222';
+      server.items[remoteId] = {
+        'id': remoteId,
+        'kind': 'chore',
+        'name': 'remote legacy row',
+        'weekdays': 127,
+        'remind_time': null,
+        'points': 10,
+        'due_date': null,
+        'sort': 0,
+        'active': true,
+        'updated_at': 500,
+        'deleted_at': null,
+        'seq': 1,
+      };
+      server.seq = 1;
+      await store.setCursor(40);
+      await db.upsertItem(
+        ItemsCompanion.insert(
+          id: id1,
+          kind: 'chore',
+          name: 'local legacy row',
+          points: 10,
+          updatedAt: 1000,
+        ),
+      );
+
+      expect(await sync.sync(), SyncStatus.idle);
+      expect(server.items.keys, contains(id1), reason: 'phone data is pushed');
+      expect(
+        (await db.select(db.items).get()).map((i) => i.id),
+        contains(remoteId),
+        reason: 'full remote snapshot is pulled',
+      );
+      expect(store.epoch, server.epoch);
+    },
+  );
+
+  test('legacy first contact retries safely if compatibility changes after preflight', () async {
+    final server = FakeServer()..disconnectAfterFirstRequest = true;
+    final (db, sync, store) = await device(server);
+    await store.setCursor(40);
+    await db.upsertItem(
+      ItemsCompanion.insert(
+        id: id1,
+        kind: 'chore',
+        name: 'local legacy row',
+        points: 10,
+        updatedAt: 1000,
+      ),
+    );
+    expect(await sync.sync(), SyncStatus.idle);
+    expect(server.items[id1]!['name'], 'local legacy row');
+    expect(store.epoch, server.epoch);
   });
 
   test('restore generation change detected before dirty writes even beyond old cursor', () async {

@@ -13,6 +13,8 @@ FROM docker.io/library/debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /s/target/release/bread-tracker-server /usr/local/bin/bread-tracker-server
+RUN mkdir -p /var/lib/bread-tracker && chown -R 10001:10001 /var/lib/bread-tracker
+USER 10001:10001
 ENV BREADTRACKER_LISTEN=0.0.0.0:7290 \
     BREADTRACKER_DATABASE_PATH=/var/lib/bread-tracker/bread-tracker.db
 VOLUME /var/lib/bread-tracker

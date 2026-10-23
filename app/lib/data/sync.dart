@@ -58,10 +58,14 @@ class SyncEngine {
       return SyncStatus.offline;
     }
     final serverEpoch = preflight['epoch'] as String?;
+    var establishedEpoch = false;
     if (serverEpoch != null &&
         requestEpoch != null &&
         serverEpoch != requestEpoch &&
         !afterReset) {
+      // Keep the two-part exchange consistent with the protocol: commit the full
+      // snapshot first, retain dirty local winners, then retry uploads under the new
+      // generation. Never clear sync metadata before the snapshot is committed.
       await db.transaction(() async {
         for (final j
             in (preflight['items'] as List).cast<Map<String, dynamic>>()) {
@@ -94,15 +98,23 @@ class SyncEngine {
               .into(db.completions)
               .insertOnConflictUpdate(_compCompanion(j));
         }
+        await db.markAllDirty();
       });
-      await db.markAllDirty();
-      await store.resetSync();
+      await store.setCursor(0);
       await store.setEpoch(serverEpoch);
-      await store.setCursor(preflight['cursor'] as int);
       return _once(afterReset: true);
     }
     if (serverEpoch != null && requestEpoch == null) {
+      // An upgraded install may already have a non-zero legacy cursor but has never
+      // recorded the generation it belongs to. Reconcile it as a full exchange once:
+      // this recovers phone rows after a pre-upgrade restore and pulls the whole server
+      // snapshot before accepting the new generation as the cursor's owner.
+      if (store.cursor > 0) {
+        await db.markAllDirty();
+        await store.setCursor(0);
+      }
       await store.setEpoch(serverEpoch);
+      establishedEpoch = true;
     }
 
     final dirtyItems = await (db.select(
@@ -118,7 +130,7 @@ class SyncEngine {
         store.cursor,
         [for (final i in dirtyItems) _itemJson(i)],
         [for (final c in dirtyComps) _compJson(c)],
-        epoch: requestEpoch,
+        epoch: store.epoch,
       );
     } on AuthLost {
       return SyncStatus.unpaired;
@@ -127,16 +139,15 @@ class SyncEngine {
     }
 
     final epoch = res['epoch'] as String?;
-    if (epoch != null &&
-        requestEpoch != null &&
-        epoch != requestEpoch &&
-        !afterReset) {
+    if (epoch != null && epoch != store.epoch && !afterReset) {
       await store.resetSync();
       await db.markAllDirty();
       await store.setEpoch(epoch);
       return _once(afterReset: true);
     }
-    if (epoch != null && requestEpoch == null) await store.setEpoch(epoch);
+    if (epoch != null && requestEpoch == null && !establishedEpoch) {
+      await store.setEpoch(epoch);
+    }
     await db.transaction(() async {
       // Rows unchanged since we pushed them are now clean.
       for (final i in dirtyItems) {

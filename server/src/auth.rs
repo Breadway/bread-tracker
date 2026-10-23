@@ -1,10 +1,7 @@
 //! Single-user device auth: a one-time pairing code is exchanged for a long-lived bearer
 //! token. Only the SHA-256 of codes and tokens is stored.
 
-use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
 use axum::http::header::AUTHORIZATION;
@@ -98,224 +95,220 @@ pub async fn device_count(db: &Db) -> Result<i64, sqlx::Error> {
         .await
 }
 
-/// Counts failed attempts per source and refuses further attempts from a source that has
-/// used up its allowance for the window. Successful attempts are not counted, and one
-/// source being blocked never affects another. Shared by `/pair` (and later `/signup`).
-///
-/// Memory is bounded: at most `MAX_SOURCES` sources are tracked and each keeps at most
-/// `max` timestamps. At capacity, new sources are admitted without a budget rather than
-/// evicting a live budget or globally rejecting valid pairings. Existing active blocks
-/// therefore cannot be reset by source churn.
-pub struct FailureLimiter {
-    max: usize,
-    window: Duration,
-    state: Mutex<LimiterState>,
-}
+/// Durable per-source failed-attempt budgets shared across server processes. Successful
+/// pairing attempts do not consume a budget. Storage holds at most 1,024 source rows;
+/// at capacity new invalid sources are refused until expired rows are reclaimed.
+pub const MAX_SOURCES: i64 = 1024;
+pub const FAILURE_WINDOW_MS: i64 = 600_000;
+pub const MAX_FAILURES: i64 = 5;
 
-struct LimiterState {
-    /// Monotonic counter stamped on each touch; the smallest stamp is the least recent.
-    tick: u64,
-    sources: HashMap<IpAddr, Source>,
-}
+/// Record an invalid attempt transactionally; return true when the source is
+/// already blocked. SQLite serializes competing writers across requests/processes.
+pub async fn record_pair_failure(db: &Db, source: IpAddr) -> Result<bool, sqlx::Error> {
+    let now = now_ms();
+    let source = source.to_string();
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    let existing: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT failures, window_started_at FROM pair_rate_limits WHERE source_ip = ?",
+    )
+    .bind(&source)
+    .fetch_optional(&mut *tx)
+    .await?;
 
-struct Source {
-    failures: VecDeque<Instant>,
-    last_seen: u64,
-}
-
-/// Hard ceiling on distinct sources held in memory at once.
-pub const MAX_SOURCES: usize = 1024;
-
-impl FailureLimiter {
-    pub fn new(max: usize, window: Duration) -> Self {
-        Self {
-            max,
-            window,
-            state: Mutex::new(LimiterState {
-                tick: 0,
-                sources: HashMap::new(),
-            }),
-        }
-    }
-
-    fn trim(q: &mut VecDeque<Instant>, now: Instant, window: Duration) {
-        while q.front().is_some_and(|t| now.duration_since(*t) > window) {
-            q.pop_front();
-        }
-    }
-
-    /// True when `src` has already failed `max` times within the window.
-    pub fn is_blocked(&self, src: IpAddr) -> bool {
-        let mut st = self.state.lock().unwrap();
-        st.tick += 1;
-        let tick = st.tick;
-        let now = Instant::now();
-        let Some(entry) = st.sources.get_mut(&src) else {
-            return false;
-        };
-        entry.last_seen = tick;
-        Self::trim(&mut entry.failures, now, self.window);
-        if entry.failures.is_empty() {
-            st.sources.remove(&src);
-            return false;
-        }
-        entry.failures.len() >= self.max
-    }
-
-    pub fn record_failure(&self, src: IpAddr) {
-        let mut st = self.state.lock().unwrap();
-        st.tick += 1;
-        let tick = st.tick;
-        let now = Instant::now();
-        if !st.sources.contains_key(&src) && st.sources.len() >= MAX_SOURCES {
-            // Drop expired sources first; only evict a live one if none are expired.
-            let window = self.window;
-            st.sources.retain(|_, s| {
-                Self::trim(&mut s.failures, now, window);
-                !s.failures.is_empty()
-            });
-            if st.sources.len() >= MAX_SOURCES {
-                // Fail closed for accounting, not for pairing: do not evict another
-                // source's live budget, and do not refuse the request globally.
-                return;
+    if let Some((failures, started)) = existing {
+        if now.saturating_sub(started) < FAILURE_WINDOW_MS {
+            if failures >= MAX_FAILURES {
+                tx.commit().await?;
+                return Ok(true);
             }
+            sqlx::query("UPDATE pair_rate_limits SET failures = failures + 1, updated_at = ? WHERE source_ip = ?")
+                .bind(now).bind(&source).execute(&mut *tx).await?;
+            tx.commit().await?;
+            return Ok(false);
         }
-        let entry = st.sources.entry(src).or_insert_with(|| Source {
-            failures: VecDeque::new(),
-            last_seen: tick,
-        });
-        entry.last_seen = tick;
-        Self::trim(&mut entry.failures, now, self.window);
-        if entry.failures.len() < self.max {
-            entry.failures.push_back(now);
-        }
+        sqlx::query("UPDATE pair_rate_limits SET failures = 1, window_started_at = ?, updated_at = ? WHERE source_ip = ?")
+            .bind(now).bind(now).bind(&source).execute(&mut *tx).await?;
+        tx.commit().await?;
+        return Ok(false);
     }
 
-    #[cfg(test)]
-    fn tracked_sources(&self) -> usize {
-        self.state.lock().unwrap().sources.len()
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pair_rate_limits")
+        .fetch_one(&mut *tx)
+        .await?;
+    if count >= MAX_SOURCES {
+        sqlx::query("DELETE FROM pair_rate_limits WHERE window_started_at <= ?")
+            .bind(now.saturating_sub(FAILURE_WINDOW_MS))
+            .execute(&mut *tx)
+            .await?;
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pair_rate_limits")
+            .fetch_one(&mut *tx)
+            .await?;
+        if remaining < MAX_SOURCES {
+            sqlx::query("INSERT INTO pair_rate_limits (source_ip, failures, window_started_at, updated_at) VALUES (?, 1, ?, ?)")
+                .bind(&source).bind(now).bind(now).execute(&mut *tx).await?;
+            tx.commit().await?;
+            return Ok(false);
+        }
+        tx.commit().await?;
+        return Ok(true);
     }
+    sqlx::query("INSERT INTO pair_rate_limits (source_ip, failures, window_started_at, updated_at) VALUES (?, 1, ?, ?)")
+        .bind(&source).bind(now).bind(now).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(false)
+}
 
-    #[cfg(test)]
-    fn failures_for(&self, src: IpAddr) -> usize {
-        self.state
-            .lock()
-            .unwrap()
-            .sources
-            .get(&src)
-            .map_or(0, |s| s.failures.len())
+/// Refuse attempts from a new source when every durable per-source slot is
+/// occupied. Existing sources retain their own failure counters. This check is
+/// only an early admission fast path; record_pair_failure repeats the cap check
+/// transactionally after an invalid redemption to handle concurrent admission.
+pub async fn source_capacity_exhausted(db: &Db, source: IpAddr) -> Result<bool, sqlx::Error> {
+    let source = source.to_string();
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    let known: i64 =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pair_rate_limits WHERE source_ip = ?)")
+            .bind(&source)
+            .fetch_one(&mut *tx)
+            .await?;
+    if known != 0 {
+        tx.commit().await?;
+        return Ok(false);
     }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pair_rate_limits")
+        .fetch_one(&mut *tx)
+        .await?;
+    if count >= MAX_SOURCES {
+        sqlx::query("DELETE FROM pair_rate_limits WHERE window_started_at <= ?")
+            .bind(now_ms().saturating_sub(FAILURE_WINDOW_MS))
+            .execute(&mut *tx)
+            .await?;
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pair_rate_limits")
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(count >= MAX_SOURCES)
+}
+
+pub async fn cleanup_pair_failures(db: &Db) -> Result<u64, sqlx::Error> {
+    let cutoff = now_ms().saturating_sub(FAILURE_WINDOW_MS);
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    let result = sqlx::query("DELETE FROM pair_rate_limits WHERE window_started_at <= ?")
+        .bind(cutoff)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn pairing_code_exists(db: &Db, code: &str) -> Result<bool, sqlx::Error> {
+    let exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pairing_codes WHERE code_hash = ? AND expires_at > ?)",
+    )
+    .bind(hash(&normalize_code(code)))
+    .bind(now_ms())
+    .fetch_one(db)
+    .await?;
+    Ok(exists != 0)
+}
+
+pub async fn pair_failure_count(db: &Db) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM pair_rate_limits")
+        .fetch_one(db)
+        .await
 }
 
 #[cfg(test)]
 mod limiter_tests {
     use super::*;
+    use crate::db::connect_memory;
     use std::net::Ipv4Addr;
 
     fn ip(n: u32) -> IpAddr {
         IpAddr::V4(Ipv4Addr::from(n))
     }
 
-    #[test]
-    fn a_source_is_blocked_after_max_failures_and_others_are_not() {
-        let l = FailureLimiter::new(5, Duration::from_secs(600));
-        for _ in 0..5 {
-            l.record_failure(ip(1));
+    #[tokio::test]
+    async fn sqlite_budget_is_per_source_persistent_and_capped() {
+        let db = connect_memory().await.unwrap();
+        for _ in 0..MAX_FAILURES {
+            assert!(!record_pair_failure(&db, ip(1)).await.unwrap());
         }
-        assert!(l.is_blocked(ip(1)));
-        assert!(!l.is_blocked(ip(2)));
+        assert!(record_pair_failure(&db, ip(1)).await.unwrap());
+        assert!(!record_pair_failure(&db, ip(2)).await.unwrap());
+        assert_eq!(pair_failure_count(&db).await.unwrap(), 2);
     }
 
-    #[test]
-    fn repeated_failures_from_one_source_are_capped_at_the_threshold() {
-        let l = FailureLimiter::new(5, Duration::from_secs(600));
-        for _ in 0..1000 {
-            l.record_failure(ip(1));
+    #[tokio::test]
+    async fn simultaneous_same_source_failures_cannot_exceed_budget() {
+        let db = connect_memory().await.unwrap();
+        let mut tasks = Vec::new();
+        for _ in 0..20 {
+            let db = db.clone();
+            tasks.push(tokio::spawn(async move {
+                record_pair_failure(&db, ip(3)).await.unwrap()
+            }));
         }
-        assert_eq!(l.failures_for(ip(1)), 5);
-        assert!(l.is_blocked(ip(1)));
-    }
-
-    #[test]
-    fn unique_source_flood_keeps_memory_at_the_cap() {
-        let l = FailureLimiter::new(5, Duration::from_secs(600));
-        for n in 1..=(MAX_SOURCES as u32 * 4) {
-            l.record_failure(ip(n));
-        }
-        assert_eq!(l.tracked_sources(), MAX_SOURCES);
-    }
-
-    #[test]
-    fn flood_of_new_sources_does_not_clear_a_recently_active_blocked_source() {
-        let l = FailureLimiter::new(5, Duration::from_secs(600));
-        for _ in 0..5 {
-            l.record_failure(ip(1));
-        }
-        // Keep the blocked source warm while many other sources fill the table.
-        for n in 2..=(MAX_SOURCES as u32 * 3) {
-            assert!(
-                l.is_blocked(ip(1)),
-                "blocked source was evicted before flood {n}"
-            );
-            l.record_failure(ip(n));
-        }
-        assert!(l.is_blocked(ip(1)));
-    }
-
-    #[test]
-    fn source_churn_cannot_reset_partial_failure_budget_at_capacity() {
-        let l = FailureLimiter::new(5, Duration::from_secs(600));
-        for _ in 0..4 {
-            l.record_failure(ip(1));
-        }
-        for n in 2..=(MAX_SOURCES as u32 + 100) {
-            l.record_failure(ip(n));
-        }
-        l.record_failure(ip(1));
-        assert!(l.is_blocked(ip(1)));
-        assert_eq!(l.tracked_sources(), MAX_SOURCES);
-    }
-
-    #[test]
-    fn all_blocked_budgets_survive_new_source_at_capacity() {
-        let l = FailureLimiter::new(5, Duration::from_secs(600));
-        for n in 1..=MAX_SOURCES as u32 {
-            for _ in 0..5 {
-                l.record_failure(ip(n));
+        let mut allowed = 0;
+        for task in tasks {
+            if !task.await.unwrap() {
+                allowed += 1;
             }
         }
-        l.record_failure(ip(MAX_SOURCES as u32 + 1));
-        assert!(l.is_blocked(ip(1)));
-        assert!(l.is_blocked(ip(MAX_SOURCES as u32)));
-        assert!(!l.is_blocked(ip(MAX_SOURCES as u32 + 1)));
+        assert_eq!(allowed, MAX_FAILURES as usize);
+        assert_eq!(pair_failure_count(&db).await.unwrap(), 1);
     }
 
-    #[test]
-    fn an_idle_blocked_source_survives_a_flood_of_unblocked_sources() {
-        let l = FailureLimiter::new(5, Duration::from_secs(600));
-        for _ in 0..5 {
-            l.record_failure(ip(1));
+    #[tokio::test]
+    async fn expired_budget_is_reset_and_expired_rows_are_cleaned() {
+        let db = connect_memory().await.unwrap();
+        for _ in 0..MAX_FAILURES {
+            assert!(!record_pair_failure(&db, ip(4)).await.unwrap());
         }
-        // No touches to ip(1) during the flood: it is idle but still inside its window.
-        for n in 2..=(MAX_SOURCES as u32 * 3) {
-            l.record_failure(ip(n));
-        }
-        assert!(
-            l.is_blocked(ip(1)),
-            "idle blocked source was evicted by a new-address flood"
-        );
+        sqlx::query("UPDATE pair_rate_limits SET updated_at = 0, window_started_at = 0")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert_eq!(cleanup_pair_failures(&db).await.unwrap(), 1);
+        assert!(!record_pair_failure(&db, ip(4)).await.unwrap());
+        assert_eq!(pair_failure_count(&db).await.unwrap(), 1);
     }
 
-    #[test]
-    fn expired_sources_are_reclaimed_before_live_ones_are_evicted() {
-        let l = FailureLimiter::new(1, Duration::from_millis(1));
-        l.record_failure(ip(1));
-        std::thread::sleep(Duration::from_millis(5));
-        for n in 2..=(MAX_SOURCES as u32 + 1) {
-            l.record_failure(ip(n));
-        }
-        assert!(l.tracked_sources() <= MAX_SOURCES);
-        assert!(!l.is_blocked(ip(1)));
+    #[tokio::test]
+    async fn populated_pre_migration_database_upgrades_without_changing_existing_data() {
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        use std::str::FromStr;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("existing.db");
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+            .unwrap()
+            .create_if_missing(true);
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::migrate!("../migrations").run(&db).await.unwrap();
+        sqlx::query("INSERT INTO items (id, kind, name, points, updated_at, seq) VALUES ('keep', 'chore', 'Existing', 2, 1, 1)")
+            .execute(&db).await.unwrap();
+        db.close().await;
+
+        let raw = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display())).unwrap(),
+            )
+            .await
+            .unwrap();
+        sqlx::migrate!("../migrations").run(&raw).await.unwrap();
+        let row: (String, String) = sqlx::query_as("SELECT id, name FROM items WHERE id = 'keep'")
+            .fetch_one(&raw)
+            .await
+            .unwrap();
+        assert_eq!(row, ("keep".to_owned(), "Existing".to_owned()));
+        assert_eq!(pair_failure_count(&raw).await.unwrap(), 0);
+        assert!(!record_pair_failure(&raw, ip(5)).await.unwrap());
+        assert_eq!(pair_failure_count(&raw).await.unwrap(), 1);
     }
 }
 

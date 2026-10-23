@@ -60,8 +60,16 @@ async fn pair(
     ClientIp(src): ClientIp,
     Json(req): Json<PairReq>,
 ) -> ApiResult<Json<PairResp>> {
-    // Only failed attempts count, and only against the caller's own address.
-    if st.pair_limiter.is_blocked(src) {
+    // At durable-table capacity, reject invalid-source admission before trying
+    // codes. This bounds guesses even for sources that cannot get a row, while
+    // checking known blocked sources against valid codes still cannot consume one.
+    let source_capacity_exhausted = auth::source_capacity_exhausted(&st.db, src).await?;
+    let code_exists = if source_capacity_exhausted {
+        Some(auth::pairing_code_exists(&st.db, &req.code).await?)
+    } else {
+        None
+    };
+    if code_exists == Some(false) {
         return Err(ApiError::TooManyRequests);
     }
     let name = if req.device_name.trim().is_empty() {
@@ -73,7 +81,11 @@ async fn pair(
     match auth::redeem(&st.db, &req.code, &name).await? {
         Some((device_id, token)) => Ok(Json(PairResp { device_id, token })),
         None => {
-            st.pair_limiter.record_failure(src);
+            // The failure budget is charged only after redeem confirms the code
+            // was invalid; this never consumes a valid single-use code on 429.
+            if code_exists.is_none() && auth::record_pair_failure(&st.db, src).await? {
+                return Err(ApiError::TooManyRequests);
+            }
             Err(ApiError::Unauthorized)
         }
     }

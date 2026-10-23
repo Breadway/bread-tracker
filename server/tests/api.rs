@@ -524,7 +524,7 @@ async fn failed_pair_attempts_from_one_source_do_not_block_another() {
     .await;
     assert_eq!(ok, StatusCode::OK);
 
-    // The blocked source is refused even with a valid code until its window passes.
+    // A valid code remains usable even from a source with a full failure budget.
     let code = auth::create_pairing_code(&h.state.db).await.unwrap();
     let blocked = call_from(
         &h.app,
@@ -534,7 +534,7 @@ async fn failed_pair_attempts_from_one_source_do_not_block_another() {
         json!({"code": code}),
     )
     .await;
-    assert_eq!(blocked, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(blocked, StatusCode::OK);
 }
 
 #[tokio::test]
@@ -559,13 +559,27 @@ async fn a_flood_of_distinct_sources_does_not_block_a_valid_pairing_from_another
     let h = harness().await;
     let bad = json!({"code": "AAAA-BBBB"});
     // Many distinct addresses each fail once: none is blocked, and the limiter must stay bounded.
-    for n in 1..=3000u32 {
+    for n in 1..auth::MAX_SOURCES as u32 {
         let src = format!("198.51.{}.{}:4000", (n / 256) % 256, n % 256);
+        let status = call_from(&h.app, &src, None, "/pair", bad.clone()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "source {n}");
+    }
+    let overflow = "192.0.2.66:4000";
+    for _ in 0..auth::MAX_FAILURES {
         assert_eq!(
-            call_from(&h.app, &src, None, "/pair", bad.clone()).await,
+            call_from(&h.app, overflow, None, "/pair", bad.clone()).await,
             StatusCode::UNAUTHORIZED
         );
     }
+    assert_eq!(
+        call_from(&h.app, overflow, None, "/pair", bad.clone()).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    assert_eq!(
+        call_from(&h.app, overflow, None, "/pair", json!({"code": code})).await,
+        StatusCode::OK
+    );
     // A brand-new source with a valid code still pairs.
     let code = auth::create_pairing_code(&h.state.db).await.unwrap();
     let ok = call_from(
@@ -577,6 +591,241 @@ async fn a_flood_of_distinct_sources_does_not_block_a_valid_pairing_from_another
     )
     .await;
     assert_eq!(ok, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn overflow_pair_guesses_are_bounded_without_rejecting_valid_code() {
+    let h = harness().await;
+    let bad = json!({"code": "AAAA-BBBB"});
+    for n in 1..=auth::MAX_SOURCES as u32 {
+        let src = format!("198.51.{}.{}:4000", (n / 256) % 256, n % 256);
+        assert_eq!(
+            call_from(&h.app, &src, None, "/pair", bad.clone()).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let overflow = "192.0.2.220:4000";
+    for _ in 0..100 {
+        assert_eq!(
+            call_from(&h.app, overflow, None, "/pair", bad.clone()).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    assert_eq!(
+        call_from(
+            &h.app,
+            "192.0.2.221:4000",
+            None,
+            "/pair",
+            json!({"code": code})
+        )
+        .await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn valid_pairing_at_full_source_capacity_is_not_rejected_by_storage_limit() {
+    let h = harness().await;
+    let bad = json!({"code": "AAAA-BBBB"});
+    for n in 1..=auth::MAX_SOURCES as u32 {
+        let src = format!("198.51.{}.{}:4000", (n / 256) % 256, n % 256);
+        call_from(&h.app, &src, None, "/pair", bad.clone()).await;
+    }
+    for n in 0..5 {
+        let src = format!("192.0.2.{}:4000", 10 + n);
+        assert_eq!(
+            call_from(&h.app, &src, None, "/pair", bad.clone()).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            call_from(&h.app, &src, None, "/pair", bad.clone()).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+    assert_eq!(
+        auth::pair_failure_count(&h.state.db).await.unwrap(),
+        auth::MAX_SOURCES
+    );
+    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    assert_eq!(
+        call_from(
+            &h.app,
+            "192.0.2.99:4000",
+            None,
+            "/pair",
+            json!({"code": code})
+        )
+        .await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn a_valid_code_from_a_source_with_five_previous_failures_is_still_redeemed() {
+    let h = harness().await;
+    let source = "192.0.2.177:4000";
+    let bad = json!({"code": "AAAA-BBBB"});
+    for _ in 0..5 {
+        assert_eq!(
+            call_from(&h.app, source, None, "/pair", bad.clone()).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        call_from(&h.app, source, None, "/pair", bad).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    assert_eq!(
+        call_from(&h.app, source, None, "/pair", json!({"code": code})).await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn expired_source_rows_are_reclaimed_before_capacity_denies_new_sources() {
+    let h = harness().await;
+    let bad = json!({"code": "AAAA-BBBB"});
+    for n in 1..=auth::MAX_SOURCES as u32 {
+        let src = format!("198.51.{}.{}:4000", (n / 256) % 256, n % 256);
+        call_from(&h.app, &src, None, "/pair", bad.clone()).await;
+    }
+    assert_eq!(
+        auth::pair_failure_count(&h.state.db).await.unwrap(),
+        auth::MAX_SOURCES
+    );
+    sqlx::query("UPDATE pair_rate_limits SET updated_at = 0, window_started_at = 0")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        call_from(&h.app, "192.0.2.201:4000", None, "/pair", bad).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(auth::pair_failure_count(&h.state.db).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn saturated_live_source_table_preserves_existing_budgets_and_allows_valid_pairing() {
+    let h = harness().await;
+    let bad = json!({"code": "AAAA-BBBB"});
+    for n in 1..=auth::MAX_SOURCES as u32 {
+        let src = format!("198.51.{}.{}:4000", (n / 256) % 256, n % 256);
+        call_from(&h.app, &src, None, "/pair", bad.clone()).await;
+    }
+    let source = "192.0.2.190:4000";
+    for _ in 0..5 {
+        assert_eq!(
+            call_from(&h.app, source, None, "/pair", bad.clone()).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+    assert_eq!(
+        call_from(&h.app, source, None, "/pair", bad.clone()).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        call_from(&h.app, source, None, "/pair", bad).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    assert_eq!(
+        call_from(
+            &h.app,
+            "192.0.2.222:4000",
+            None,
+            "/pair",
+            json!({"code": code})
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        auth::pair_failure_count(&h.state.db).await.unwrap(),
+        auth::MAX_SOURCES
+    );
+}
+
+#[tokio::test]
+async fn saturated_untracked_source_cannot_guess_repeatedly_and_valid_code_is_not_consumed() {
+    let h = harness().await;
+    let bad = json!({"code": "AAAA-BBBB"});
+    for n in 1..=auth::MAX_SOURCES as u32 {
+        let src = format!("198.51.{}.{}:4000", (n / 256) % 256, n % 256);
+        call_from(&h.app, &src, None, "/pair", bad.clone()).await;
+    }
+    let source = "192.0.2.250:4000";
+    for _ in 0..100 {
+        assert_eq!(
+            call_from(&h.app, source, None, "/pair", bad.clone()).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    assert_eq!(
+        call_from(&h.app, source, None, "/pair", json!({"code": code})).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        auth::pair_failure_count(&h.state.db).await.unwrap(),
+        auth::MAX_SOURCES
+    );
+}
+
+#[tokio::test]
+async fn reused_or_expired_pairing_codes_are_counted_as_failures_not_successes() {
+    let h = harness().await;
+    let source = "192.0.2.230:4000";
+    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    assert_eq!(
+        call_from(&h.app, source, None, "/pair", json!({"code": code})).await,
+        StatusCode::OK
+    );
+    for _ in 0..auth::MAX_FAILURES {
+        assert_eq!(
+            call_from(&h.app, source, None, "/pair", json!({"code": code})).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        call_from(&h.app, source, None, "/pair", json!({"code": code})).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
+async fn concurrent_pair_guesses_from_one_source_have_one_atomic_budget() {
+    let h = harness().await;
+    let app = h.app.clone();
+    let mut requests = Vec::new();
+    for _ in 0..20 {
+        let app = app.clone();
+        requests.push(tokio::spawn(async move {
+            call_from(
+                &app,
+                "192.0.2.240:4000",
+                None,
+                "/pair",
+                json!({"code": "AAAA-BBBB"}),
+            )
+            .await
+        }));
+    }
+    let mut unauthorized = 0;
+    let mut throttled = 0;
+    for request in requests {
+        match request.await.unwrap() {
+            StatusCode::UNAUTHORIZED => unauthorized += 1,
+            StatusCode::TOO_MANY_REQUESTS => throttled += 1,
+            other => panic!("unexpected concurrent response: {other}"),
+        }
+    }
+    assert_eq!(unauthorized, auth::MAX_FAILURES as usize);
+    assert_eq!(throttled, 20 - unauthorized);
+    assert_eq!(auth::pair_failure_count(&h.state.db).await.unwrap(), 1);
 }
 
 #[tokio::test]

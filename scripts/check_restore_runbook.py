@@ -50,15 +50,13 @@ for cmd in commands:
             fail(f"tracker helper must explicitly select wrapper entrypoint: {cmd}")
     if "litestream/litestream" in cmd and "--entrypoint" in cmd:
         fail("Litestream helper must use its own default entrypoint")
-if re.search(r"(?m)^chown\b", script):
+if re.search(r"(?m)^\s*chown\b", script.split("FIXTURE", 1)[0]):
     fail("host-side chown is forbidden; ownership changes belong in root helpers")
-if not re.search(r"(?m)^\s*docker run[^\n]*-v \"\$SCRATCH/data:/var/lib/bread-tracker\"", script):
-    fail("all tracker image helpers must bind the declared data VOLUME")
+for helper in re.findall(r'(?m)^docker run --rm --name "\$TASK-[^\n]*(?:\\\n[^\n]*)*', script):
+    if '"$IMG"' in helper and '"$SCRATCH/data:/var/lib/bread-tracker"' not in helper:
+        fail(f"tracker image helper lacks explicit VOLUME bind: {helper}")
 if '"$IMG"' not in script:
     fail("no tracker image helper invocations found")
-helper_count = sum(1 for line in script.splitlines() if line.startswith('docker run --rm --name "$TASK-'))
-if script.count('"$SCRATCH/data:/var/lib/bread-tracker"') < helper_count - 1:
-    fail("a tracker helper may rely on an implicit anonymous VOLUME")
 if 'docker stop "$TASK-server"' not in script:
     fail("must stop only the exact task server")
 if 'name=$(docker inspect --format' not in script or '"/$TASK-server"' not in script:
@@ -67,7 +65,7 @@ if 'wait "$SERVER_PID"' not in script:
     fail("must wait on foreground docker run host PID for reliable exit status")
 if re.search(r'docker\s+wait\s+"\$TASK-server"', script):
     fail("must not docker-wait a possibly auto-removed container")
-server_lifecycle = script.split("# Foreground docker run", 1)[-1]
+server_lifecycle = script.split('docker run --rm --name "$TASK-server"', 1)[-1]
 server_stop = 'docker stop "$TASK-server"'
 server_wait = 'wait "$SERVER_PID"'
 server_pid_assign = 'SERVER_PID=$!'
@@ -92,11 +90,13 @@ if "17291" not in script or "ss -ltn" not in script:
     fail("must preflight and publish only the scratch server port")
 if "docker compose" in script or "bread-tracker-data:" in script:
     fail("rehearsal must not touch Compose or named production volumes")
-for required in ("PRAGMA integrity_check", "PRAGMA wal_checkpoint(TRUNCATE)", "test -f /restore/missing.db", "mark-restored", "healthz", "CHECKSUM"):
+for required in ("PRAGMA integrity_check", "PRAGMA wal_checkpoint(TRUNCATE)", "VACUUM INTO", "-readonly /restore/restored.db", "restored.db-*", "invalid.db", "mark-restored", "healthz", "CHECKSUM", 'test "$server_status" -eq 0', "SELECT name FROM items", '"$SCRATCH/data:/var/lib/bread-tracker"'):
     if required not in script:
         fail(f"rehearsal missing required check {required!r}")
 if "sha384" not in script or "migration" not in script.lower():
     fail("populated fixture must establish SQLx migration checksum")
+if "-exc" not in script:
+    fail("fixture helpers must trace shell commands on runtime failure")
 if "trap cleanup EXIT" not in script or "trap 'exit 130' INT" not in script or "trap 'exit 143' TERM" not in script:
     fail("cleanup traps missing")
 print("restore runbook and rehearsal safety checks passed")

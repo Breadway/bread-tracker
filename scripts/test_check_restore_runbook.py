@@ -26,7 +26,7 @@ original = script.read_text()
 check(original, True)
 negative_fixtures = {
     "host-side chown": original.replace("TASK=\"track2-rehearsal-", "chown 0:10001 \"$SCRATCH/data\"\nTASK=\"track2-rehearsal-", 1),
-    "bad stop/wait order": original.replace('docker stop "$TASK-server" >/dev/null\nset +e\nwait "$SERVER_PID"', 'wait "$SERVER_PID"\ndocker stop "$TASK-server" >/dev/null', 1),
+    "bad stop/wait order": original.replace('docker stop "$TASK-server" >/dev/null\nset +e; wait "$SERVER_PID";', 'set +e; wait "$SERVER_PID";\ndocker stop "$TASK-server" >/dev/null', 1),
     "implicit image VOLUME": original.replace('"$SCRATCH/data:/var/lib/bread-tracker"', '"$SCRATCH/data:/data"'),
 }
 for label, fixture in negative_fixtures.items():

@@ -66,7 +66,8 @@ jobs:
         run: |
           set -euo pipefail
           cd src
-          python3 scripts/check_restore_runbook.py packaging/Containerfile packaging/DEPLOY.md
+          python3 scripts/check_restore_runbook.py packaging/Containerfile packaging/DEPLOY.md scripts/rehearse_restore.sh
+          python3 scripts/test_check_restore_runbook.py
 
   # server/src/xp.rs and app/lib/rules.dart must agree on spec/xp_vectors.json. Both full
   # test runs above already read it; this job runs just those two tests side by side and
@@ -122,4 +123,5 @@ jobs:
         run: |
           set -euo pipefail
           cd src
-          python3 scripts/check_restore_runbook.py packaging/Containerfile packaging/DEPLOY.md
+          python3 scripts/check_restore_runbook.py packaging/Containerfile packaging/DEPLOY.md scripts/rehearse_restore.sh
+          python3 scripts/test_check_restore_runbook.py

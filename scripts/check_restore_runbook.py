@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Static checks for ENTRYPOINT argv and disposable restore rehearsal docs."""
-
+"""Static safety checks for the operational restore runbook and rehearsal."""
 from pathlib import Path
 import re
+import subprocess
 import sys
 
 
@@ -12,7 +12,8 @@ def fail(message: str) -> None:
 
 containerfile = Path(sys.argv[1]).read_text()
 deploy = Path(sys.argv[2]).read_text()
-
+script_path = Path(sys.argv[3]) if len(sys.argv) > 3 else Path("scripts/rehearse_restore.sh")
+script = script_path.read_text()
 match = re.search(r"^ENTRYPOINT\s+\[([^\]]+)\]", containerfile, re.M)
 if not match:
     fail("Containerfile ENTRYPOINT is missing or not JSON-array form")
@@ -20,136 +21,82 @@ entrypoint = re.findall(r'"([^"]+)"', match.group(1))
 if len(entrypoint) != 2 or entrypoint[1] != "/usr/local/bin/bread-tracker-server":
     fail("unexpected image ENTRYPOINT contract")
 wrapper = entrypoint[0]
+if "mark-restored" not in deploy or f"--entrypoint {wrapper}" not in deploy:
+    fail("operational marker must explicitly invoke tracker wrapper")
+operational = deploy.split("## Disposable restore", 1)[0]
+litestream = re.search(r"docker run --rm --name \"\$TASK-litestream\"[^\n]*(?:\\\n[^\n]*)*", operational)
+if not litestream or "--entrypoint" in litestream.group(0):
+    fail("operational Litestream restore must use its image default entrypoint")
+if "docker compose" not in operational:
+    fail("operational service restore instructions missing")
+if "scripts/rehearse_restore.sh" not in deploy:
+    fail("DEPLOY must invoke the standalone rehearsal script")
+rehearsal_docs = deploy.split("## Disposable restore", 1)[-1]
+if re.search(r"(?m)^docker\s+", rehearsal_docs):
+    fail("DEPLOY must not retain stale inline rehearsal commands")
 
-blocks = re.findall(r"```sh\s*\n(.*?)\n```", deploy, re.S)
-if not blocks:
-    fail("no shell runbook blocks found")
-all_commands = "\n".join(blocks)
-commands = re.findall(r"(?m)^\s*docker\s+run\b[^\n]*(?:\\\n[^\n]*)*", all_commands)
-for command in commands:
-    if "--rm" not in command:
-        fail(f"docker run is not --rm: {command}")
-
-disposable_start = deploy.index("## Disposable restore and existing-volume rehearsal")
-disposable_end = deploy.find("\n## ", disposable_start + 4)
-if disposable_end < 0:
-    disposable_end = len(deploy)
-disposable = deploy[disposable_start:disposable_end]
-disposable_commands = re.findall(
-    r"(?m)^\s*docker\s+run\b[^\n]*(?:\\\n[^\n]*)*", disposable
-)
-for command in disposable_commands:
-    if "--rm" not in command or '--name "$TASK-' not in command:
-        fail(f"disposable container needs --rm and a unique task-prefixed name: {command}")
-    if "bread-tracker-server mark-restored" in command and f"--entrypoint {wrapper}" not in command:
-        fail("mark-restored invocation must explicitly select the image wrapper entrypoint")
-    if "--entrypoint" in command and wrapper not in command:
-        fail("utility command overrides must use the image wrapper entrypoint")
-    if "litestream/litestream" in command and "--entrypoint" in command:
-        fail("Litestream invocation must use its own image entrypoint, not tracker wrapper")
-    if '"$IMG"' in command:
-        if "/var/lib/bread-tracker" not in command:
-            fail(f"tracker helper does not bind image VOLUME /var/lib/bread-tracker: {command}")
-        if command.count(":/var/lib/bread-tracker") != 1:
-            fail(f"tracker helper must bind the VOLUME destination exactly once: {command}")
-        if "--entrypoint" not in command or wrapper not in command:
-            if "--name \"$TASK-server\"" not in command:
-                fail(f"tracker utility helper must explicitly select the image wrapper: {command}")
-
-if "--entrypoint /usr/local/bin/entrypoint-exec" not in deploy:
-    fail("runbook does not demonstrate explicit wrapper ENTRYPOINT")
-operational = deploy.split("## Disposable restore and existing-volume rehearsal", 1)[0]
-operational_commands = re.findall(
-    r"(?m)^\s*docker\s+run\b[^\n]*(?:\\\n[^\n]*)*", operational
-)
-for command in operational_commands:
-    if "mark-restored" in command and f"--entrypoint {wrapper}" not in command:
-        fail("operational mark-restored invocation must explicitly select the wrapper")
-    if "--entrypoint" in command and wrapper not in command and "litestream/litestream" not in command:
-        fail("operational helper invocation must explicitly select the wrapper")
-for required in (
-    "test -f /restore/not-present.db",
-    "PRAGMA integrity_check",
-    "PRAGMA wal_checkpoint(TRUNCATE)",
-    "chown -R 10001:10001",
-    "test -r /run/secrets/fcm.json",
-    "--name \"$TASK-server\"",
-):
-    if required not in disposable:
-        fail(f"disposable rehearsal is missing {required!r}")
-if "bread-tracker-data:" in disposable or "docker compose" in disposable:
-    fail("disposable rehearsal must not use Compose services or named volumes")
-if "-p 127.0.0.1:17291:7290" not in disposable or "-p 127.0.0.1:7290:7290" in disposable:
-    fail("disposable rehearsal must publish only the non-production host port")
-if '"$SCRATCH/data:/data"' not in disposable or 'chown -R 10001:10001 /data' not in disposable:
-    fail("full isolated data directory ownership transition is not tested")
-if 'chmod 0755 "$SCRATCH"' not in disposable or 'chown 0:10001 "$SCRATCH/data"' not in disposable:
-    fail("scratch parent traversal permissions for uid 10001 are not established")
-if "trap cleanup EXIT" not in disposable or "trap 'exit 130' INT" not in disposable or "trap 'exit 143' TERM" not in disposable:
-    fail("exit, interrupt and termination must run cleanup after the server is stopped")
-if 'chown 0:10001 /scratch/dummy-secret' not in disposable:
-    fail("dummy secret preparation must run through explicit root helper")
-if "--mount \"type=bind,src=$ROOT/migrations/0001_init.sql" not in disposable:
-    fail("fixture bind must be narrowly scoped to the migration file")
-if "PRAGMA journal_mode=WAL" not in disposable:
-    fail("fixture does not exercise a WAL-mode checkpoint")
-if 'test "$busy" = 0' not in disposable or 'test "$log_frames" = "$checkpointed"' not in disposable:
-    fail("checkpoint must validate busy status and completed frame counts")
-if 'test "$log_frames" = "-1"' not in disposable or 'test "$checkpointed" = "-1"' not in disposable:
-    fail("checkpoint must handle SQLite non-WAL -1/-1 results")
-if 'ss -ltn' not in disposable or '17291' not in disposable:
-    fail("disposable server must check/use a non-production host port")
-if 'docker wait "$TASK-server"' not in disposable or 'docker stop "$TASK-server"' not in disposable:
-    fail("server stop/wait cleanup must be in the same executable task-scoped script")
-cleanup = disposable.split("cleanup() {", 1)[1].split("\n}", 1)[0]
-if cleanup.find('docker stop "$TASK-server"') < 0 or cleanup.find('docker wait "$TASK-server"') < 0 or cleanup.find('rm -rf "$SCRATCH"') < 0:
-    fail("interrupt cleanup must stop the task server before deleting its bind directory")
-if cleanup.find('docker wait "$TASK-server"') > cleanup.find('rm -rf "$SCRATCH"'):
-    fail("cleanup deletes bound scratch data before stopping server")
-if 'grep -qx "0|0|0"' in deploy:
-    fail("checkpoint must not assume WAL mode's fixed frame counts")
-litestream = re.search(r'docker run --rm --name "\$TASK-litestream"[^\n]*(?:\\\n[^\n]*)*', operational)
-if not litestream or '--entrypoint' in litestream.group(0):
-    fail("Litestream restore must execute through its own image entrypoint")
-if "docker stop \"bread-tracker\"" in disposable or "docker compose" in disposable:
-    fail("disposable block must not stop production or use Compose")
-if "--mount \"type=bind,src=$ROOT/migrations/0001_init.sql" not in disposable:
-    fail("fixture must bind only the needed migration file, not the source checkout")
-if "REPLACE_WITH_PRINTED_SUFFIX" in deploy or "another terminal define" in deploy:
-    fail("runbook contains a health-stop handoff with undefined task state")
-if 'cleanup() {' not in disposable or 'docker stop "$TASK-server"' not in cleanup:
-    fail("exit/interrupt trap must stop task server before deleting bind-mounted data")
-if "ENTRYPOINT" not in disposable and f"--entrypoint {wrapper}" not in disposable:
-    fail("disposable rehearsal does not cover image ENTRYPOINT behavior")
-if "--name \"$TASK-server\"" not in disposable or '"$IMG"' not in disposable:
-    fail("default ENTRYPOINT foreground server invocation missing")
-if 'docker run --rm -d --name "$TASK-server"' not in disposable:
-    fail("server probe must run a named, auto-removed disposable instance")
-if 'docker wait "$TASK-server"' not in disposable or 'docker stop "$TASK-server"' not in disposable:
-    fail("server test must stop and capture exit before scratch cleanup")
-if 'chown 0:10001 "$SCRATCH/data" "$SCRATCH/restore"' not in disposable:
-    fail("uid 10001 parent-directory access must be set up within scratch only")
-if 'cp /work/existing.db /restore/restored.db' not in disposable:
-    fail("restored candidate must be prepared in a root helper, not host-chowned")
-if '--mount "type=bind,src=$ROOT/migrations/0001_init.sql' not in disposable:
-    fail("do not bind-mount the complete source checkout into helper containers")
-for command in disposable_commands:
-    if '"$IMG"' in command and "/var/lib/bread-tracker" not in command:
-        fail(f"tracker helper must bind the declared VOLUME destination: {command}")
-    if '"$IMG"' in command and command.count(":/var/lib/bread-tracker") != 1:
-        fail(f"tracker helper must bind image VOLUME exactly once: {command}")
-own_cmd = re.search(r'docker run --rm --name "\$TASK-own"[^\n]*(?:\\\n[^\n]*)*', operational)
-if not own_cmd or 'chown -R 10001:10001 /data' not in operational:
-    fail("root-owned volume data directory ownership transition is missing")
-own_at = operational.find('chown -R 10001:10001 /data')
-marker_at = operational.find('/usr/local/bin/bread-tracker-server mark-restored')
-if own_at < 0 or marker_at < 0 or own_at > marker_at:
-    fail("operational data directory ownership must happen before marker opens it")
-if 'PRAGMA journal_mode=WAL' not in disposable:
-    fail("fixture must validate WAL checkpoint behavior")
-if 'cp /work/existing.db /restore/restored.db' not in disposable:
-    fail("root helper must prepare restored fixture without host chown/read of root-owned file")
-
-if "mark-restored" not in operational:
-    fail("operational restore instructions missing")
-print("restore runbook ENTRYPOINT/argv and disposable safety checks passed")
+commands = re.findall(r"(?m)^\s*docker\s+run\b[^\n]*(?:\\\n[^\n]*)*", script)
+if not commands:
+    fail("rehearsal contains no Docker helpers")
+for cmd in commands:
+    if "--rm" not in cmd or '--name "$TASK-' not in cmd:
+        fail(f"helper must be --rm and task-prefixed: {cmd}")
+    if '"$IMG"' in cmd:
+        if "/var/lib/bread-tracker" not in cmd:
+            fail(f"tracker helper lacks explicit image VOLUME bind: {cmd}")
+        if cmd.count(":/var/lib/bread-tracker") != 1:
+            fail(f"tracker helper VOLUME destination must be bound exactly once: {cmd}")
+        if "--entrypoint" not in cmd or wrapper not in cmd:
+            fail(f"tracker helper must explicitly select wrapper entrypoint: {cmd}")
+    if "litestream/litestream" in cmd and "--entrypoint" in cmd:
+        fail("Litestream helper must use its own default entrypoint")
+if re.search(r"(?m)^chown\b", script):
+    fail("host-side chown is forbidden; ownership changes belong in root helpers")
+if not re.search(r"(?m)^\s*docker run[^\n]*-v \"\$SCRATCH/data:/var/lib/bread-tracker\"", script):
+    fail("all tracker image helpers must bind the declared data VOLUME")
+if '"$IMG"' not in script:
+    fail("no tracker image helper invocations found")
+helper_count = sum(1 for line in script.splitlines() if line.startswith('docker run --rm --name "$TASK-'))
+if script.count('"$SCRATCH/data:/var/lib/bread-tracker"') < helper_count - 1:
+    fail("a tracker helper may rely on an implicit anonymous VOLUME")
+if 'docker stop "$TASK-server"' not in script:
+    fail("must stop only the exact task server")
+if 'name=$(docker inspect --format' not in script or '"/$TASK-server"' not in script:
+    fail("must verify exact server container name before stopping")
+if 'wait "$SERVER_PID"' not in script:
+    fail("must wait on foreground docker run host PID for reliable exit status")
+if re.search(r'docker\s+wait\s+"\$TASK-server"', script):
+    fail("must not docker-wait a possibly auto-removed container")
+server_lifecycle = script.split("# Foreground docker run", 1)[-1]
+server_stop = 'docker stop "$TASK-server"'
+server_wait = 'wait "$SERVER_PID"'
+server_pid_assign = 'SERVER_PID=$!'
+if server_stop not in server_lifecycle or server_wait not in server_lifecycle:
+    fail("foreground server lifecycle must stop its verified container and wait on its host process")
+server_stop_line = server_lifecycle.index(server_stop)
+server_wait_line = server_lifecycle.rindex(server_wait)
+if not (server_pid_assign in server_lifecycle and server_lifecycle.index(server_pid_assign) < server_stop_line < server_wait_line):
+    fail("server must be stopped before waiting on foreground docker run")
+verify_line = server_lifecycle.index('name=$(docker inspect --format')
+if verify_line > server_stop_line:
+    fail("server name must be verified before stop")
+if "rm -rf -- \"$SCRATCH\"" not in script or script.index('rm -rf -- "$SCRATCH"') < script.index('docker stop "$TASK-server"'):
+    fail("scratch cleanup must follow server stop/wait")
+if "chown -R" not in script or "id -u" not in script or "id -g" not in script:
+    fail("cleanup must hand root-owned fixtures back to invoking host uid/gid")
+if "--user 0" not in script:
+    fail("fixture generation must happen inside explicit root helpers")
+if '"$SCRATCH/secret:/secret"' not in script or '"$SCRATCH/secret/fcm.json:/run/secrets/fcm.json:ro"' not in script:
+    fail("secret must use a distinct host path from recursive data ownership changes")
+if "17291" not in script or "ss -ltn" not in script:
+    fail("must preflight and publish only the scratch server port")
+if "docker compose" in script or "bread-tracker-data:" in script:
+    fail("rehearsal must not touch Compose or named production volumes")
+for required in ("PRAGMA integrity_check", "PRAGMA wal_checkpoint(TRUNCATE)", "test -f /restore/missing.db", "mark-restored", "healthz", "CHECKSUM"):
+    if required not in script:
+        fail(f"rehearsal missing required check {required!r}")
+if "sha384" not in script or "migration" not in script.lower():
+    fail("populated fixture must establish SQLx migration checksum")
+if "trap cleanup EXIT" not in script or "trap 'exit 130' INT" not in script or "trap 'exit 143' TERM" not in script:
+    fail("cleanup traps missing")
+print("restore runbook and rehearsal safety checks passed")

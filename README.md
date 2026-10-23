@@ -56,6 +56,8 @@ is paired yet, the server also prints a code at startup.
 # Prerequisites: Flutter, JDK 17, and Android SDK command-line/platform tools.
 # Set JAVA_HOME, ANDROID_SDK_ROOT (or ANDROID_HOME), and FLUTTER_ROOT as needed.
 source scripts/android-env.sh    # adds available tool directories without replacing your configuration
+# If both SDK variables are set differently, both explicit values are preserved;
+# tool lookup uses ANDROID_SDK_ROOT first.
 cd app
 flutter pub get
 flutter analyze

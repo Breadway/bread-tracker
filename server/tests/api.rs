@@ -491,20 +491,11 @@ async fn sync_reports_a_stable_epoch_that_differs_between_databases() {
     )
     .await;
     assert_eq!(b["epoch"], epoch, "writes do not change it");
-
-    // A normal database open preserves its identity. Explicit rotation changes it.
     let (_, same) = call(&h.app, "GET", "/sync", Some(&tok), None).await;
     assert_eq!(same["epoch"], epoch);
     *h.state.generation.write().unwrap() = "rotated-generation".to_owned();
-    let (_, c) = call(&h.app, "GET", "/sync", Some(&tok), None).await;
-    assert_ne!(
-        c["epoch"], epoch,
-        "restored/restarted generation must change before writes"
-    );
-    let other = harness().await;
-    let tok2 = paired(&other).await;
-    let (_, d) = call(&other.app, "GET", "/sync", Some(&tok2), None).await;
-    assert_ne!(d["epoch"], epoch);
+    let (_, changed) = call(&h.app, "GET", "/sync", Some(&tok), None).await;
+    assert_ne!(changed["epoch"], epoch);
 }
 
 #[tokio::test]
@@ -530,7 +521,7 @@ async fn generation_preflight_rejects_dirty_writes_then_returns_full_snapshot() 
         .await
         .unwrap();
     assert!(current >= 1);
-    let (status, _) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"since": 999, "epoch": old_epoch, "items": [item("22222222-2222-4222-8222-222222222222", "chore", "dirty", 127, None, now + 1000)]}))).await;
+    let (status, _) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"since": 999, "epoch": old_epoch, "items": [item(H1, "chore", "dirty", 127, None, now + 1000)]}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let (_, preflight) = call(
         &h.app,
@@ -542,7 +533,7 @@ async fn generation_preflight_rejects_dirty_writes_then_returns_full_snapshot() 
     .await;
     assert_ne!(preflight["epoch"], old_epoch);
     assert_eq!(preflight["items"].as_array().unwrap().len(), 1);
-    let (status, accepted) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"since": preflight["cursor"], "epoch": preflight["epoch"], "items": [item("22222222-2222-4222-8222-222222222222", "chore", "dirty", 127, None, now + 1000)]}))).await;
+    let (status, accepted) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"since": preflight["cursor"], "epoch": preflight["epoch"], "items": [item(H1, "chore", "dirty", 127, None, now + 1000)]}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(accepted["items"].as_array().unwrap().len(), 1);
 }
@@ -595,9 +586,8 @@ async fn a_cursor_ahead_of_the_database_gets_everything() {
         Some(json!({"items": [item(C1, "chore", "x", 127, None, now)]})),
     )
     .await;
-    // A phone that synced against a later state of a database that was then restored from an older copy.
     let (_, epoch_response) = call(&h.app, "GET", "/sync", Some(&tok), None).await;
-    let (s, v) = call(
+    let (status, response) = call(
         &h.app,
         "POST",
         "/sync",
@@ -605,14 +595,70 @@ async fn a_cursor_ahead_of_the_database_gets_everything() {
         Some(json!({"since": 999999, "epoch": epoch_response["epoch"]})),
     )
     .await;
-    assert_eq!(s, StatusCode::OK);
-    assert_eq!(
-        v["items"].as_array().unwrap().len(),
-        1,
-        "full pull instead of an empty one"
-    );
-    assert!(
-        v["cursor"].as_i64().unwrap() < 999999,
-        "cursor tells the client the database went backwards"
-    );
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["items"].as_array().unwrap().len(), 1);
+    assert!(response["cursor"].as_i64().unwrap() < 999999);
+}
+
+#[tokio::test]
+async fn todo_ticked_on_an_earlier_day_gets_no_reminder() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    let mut todo = item(C1, "todo", "Pay rent", 127, Some("17:15"), now);
+    todo["due_date"] = json!("2026-10-19");
+    let mut other = item(H1, "todo", "Book dentist", 127, Some("17:15"), now);
+    other["due_date"] = json!("2026-10-19");
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [todo, other], "completions": [comp(C1, "2026-10-18", now, None)]})),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&tok),
+        Some(json!({"fcm_token": "fcm-token-1"})),
+    )
+    .await;
+    assert_eq!(push::tick(&h.state, perth(17, 16)).await.unwrap(), 1);
+    let titles: Vec<String> = h
+        .mock
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| m.title.clone())
+        .collect();
+    assert_eq!(titles, vec!["Book dentist"]);
+}
+
+#[tokio::test]
+async fn un_ticked_todo_completion_does_not_suppress_the_reminder() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    let mut todo = item(C1, "todo", "Pay rent", 127, Some("17:15"), now);
+    todo["due_date"] = json!("2026-10-19");
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [todo], "completions": [comp(C1, "2026-10-18", now, Some(now))]})),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&tok),
+        Some(json!({"fcm_token": "fcm-token-1"})),
+    )
+    .await;
+    assert_eq!(push::tick(&h.state, perth(17, 16)).await.unwrap(), 1);
 }

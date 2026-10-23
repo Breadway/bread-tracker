@@ -86,11 +86,9 @@ test "$after" = "$before"
 INVALID
 docker run --rm --name "$TASK-invalid-fixture" --user 0 -v "$SCRATCH/restore:/restore" -v "$SCRATCH/restore:/var/lib/bread-tracker" \
   --entrypoint /usr/local/bin/entrypoint-exec "$IMG" /bin/sh -exc 'printf "invalid db\\n" >/restore/invalid.db; chown 0:0 /restore/invalid.db'
-if docker run --rm --name "$TASK-invalid" --user 0 -v "$SCRATCH/data:/data" -v "$SCRATCH/restore:/restore:ro" \
+docker run --rm --name "$TASK-invalid-check" --user 0 -v "$SCRATCH/data:/data" -v "$SCRATCH/restore:/restore:ro" \
   -v "$SCRATCH/invalid.sh:/invalid-helper.sh:ro" -v "$SCRATCH/data:/var/lib/bread-tracker" \
-  --entrypoint /usr/local/bin/entrypoint-exec "$IMG" /bin/sh -exc 'exec /bin/sh /invalid-helper.sh'; then
-  echo 'ERROR: invalid restore candidate accepted or existing database changed' >&2; exit 1
-fi
+  --entrypoint /usr/local/bin/entrypoint-exec "$IMG" /bin/sh -exc 'exec /bin/sh /invalid-helper.sh'
 echo 'stage: invalid candidate rejected without changing existing DB'
 cat >"$SCRATCH/restore.sh" <<'RESTORE'
 set -eu

@@ -97,6 +97,17 @@ if "sha384" not in script or "migration" not in script.lower():
     fail("populated fixture must establish SQLx migration checksum")
 if "-exc" not in script:
     fail("fixture helpers must trace shell commands on runtime failure")
+invalid_test = script.split("cat >\"$SCRATCH/invalid.sh\"", 1)[-1].split("INVALID\n", 1)[0]
+if 'before=$(sqlite3 /data/bread-tracker.db' not in invalid_test or 'after=$(sqlite3 /data/bread-tracker.db' not in invalid_test:
+    fail("invalid restore test must snapshot and recheck existing database contents")
+if 'if [ "$(sqlite3 /restore/invalid.db' not in invalid_test:
+    fail("invalid restore test must assert malformed SQLite fails integrity validation")
+if re.search(r'(?m)^if docker run --rm --name "\$TASK-invalid(?:-check)?"', script):
+    fail("invalid restore assertion success must not be inverted as an expected failure")
+if 'docker run --rm --name "$TASK-invalid-check"' not in script:
+    fail("invalid candidate and unchanged database assertions must run as a required helper")
+if "test \"$after\" = \"$before\"" not in invalid_test:
+    fail("invalid restore test must compare before and after data values")
 if "trap cleanup EXIT" not in script or "trap 'exit 130' INT" not in script or "trap 'exit 143' TERM" not in script:
     fail("cleanup traps missing")
 print("restore runbook and rehearsal safety checks passed")

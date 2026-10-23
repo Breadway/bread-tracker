@@ -92,7 +92,17 @@ async fn main() -> anyhow::Result<()> {
         .sync_all()?;
         db::mark_restored(&generation_db, &config.database_path, &generation).await?;
         marker_completed.store(true, Ordering::SeqCst);
-        std::fs::remove_file(&restore_failed_path)?;
+        match std::fs::remove_file(&restore_failed_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        std::fs::File::open(
+            restore_failed_path
+                .parent()
+                .unwrap_or(std::path::Path::new(".")),
+        )?
+        .sync_all()?;
         std::fs::File::open(
             restore_failed_path
                 .parent()

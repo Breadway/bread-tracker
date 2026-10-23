@@ -1,6 +1,8 @@
 import 'package:drift/drift.dart' show Value, driftRuntimeOptions;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:tracker/data/api.dart';
 import 'package:tracker/data/database.dart';
@@ -61,12 +63,9 @@ class FakeServer {
       };
     }
     if (clientEpoch != null && clientEpoch != epoch) {
-      if (pi.isNotEmpty || pc.isNotEmpty) {
-        throw ApiException('generation changed');
-      }
       return {
-        'epoch': epoch,
         'cursor': seq,
+        'epoch': epoch,
         'items': items.values.toList(),
         'completions': comps.values.toList(),
         'server_time': 0,
@@ -108,14 +107,14 @@ class FakeApi extends Api {
     }
     if (epoch != null && epoch != server.epoch) {
       return {
-        'epoch': server.epoch,
         'cursor': server.seq,
+        'epoch': server.epoch,
         'items': server.items.values.toList(),
         'completions': server.comps.values.toList(),
         'server_time': 0,
       };
     }
-    final response = server.sync(since, items, completions, clientEpoch: epoch);
+    final response = server.sync(since, items, completions);
     return response;
   }
 }
@@ -129,6 +128,7 @@ class MemStore extends Store {
   Future<void> saveToken(String t) async => _t = t;
   @override
   Future<void> clearToken() async => _t = null;
+  Future<void> seedEpoch(String value) => super.prefs.setString('epoch', value);
 }
 
 const id1 = '11111111-1111-4111-8111-111111111111';
@@ -147,8 +147,16 @@ void main() {
     'two offline devices converge, last write wins, un-tick syncs',
     () async {
       final server = FakeServer();
-      final (dbA, syncA, _) = await device(server);
+      final (dbA, syncA, storeA) = await device(server);
       final (dbB, syncB, _) = await device(server);
+      await (dbA.update(dbA.items))
+          .write(const ItemsCompanion(dirty: Value(false)));
+      await (dbB.update(dbB.items))
+          .write(const ItemsCompanion(dirty: Value(false)));
+      await (dbA.update(dbA.completions))
+          .write(const CompletionsCompanion(dirty: Value(false)));
+      await (dbB.update(dbB.completions))
+          .write(const CompletionsCompanion(dirty: Value(false)));
 
       // Phone A creates a chore and ticks it while offline.
       await dbA.upsertItem(
@@ -176,6 +184,7 @@ void main() {
 
       // B un-ticks later; A renames earlier (stale). Both offline, then sync.
       await dbB.setCompletion(id1, '2026-10-19', false, 9000);
+      await storeA.setEpoch(server.epoch);
       await dbB.upsertItem(
         ItemsCompanion(
           id: const Value(id1),
@@ -306,6 +315,7 @@ void main() {
     }
     await sync.sync();
     expect(store.cursor, 3);
+    await store.setEpoch('epoch-1');
 
     // Restore from a replica that only had the first item: counter goes back to 1, same epoch.
     final keep = server.items.entries.first;
@@ -315,6 +325,7 @@ void main() {
     server
       ..seq = 1
       ..epoch = 'epoch-restored';
+    await store.setEpoch('epoch-1');
     expect(await sync.sync(), SyncStatus.idle);
     expect(
       server.items.length,
@@ -767,6 +778,78 @@ void main() {
       hasLength(1),
     );
   });
+
+  test('non-JSON replies (HTML 502, captive portal 200) report offline, not a crash', () async {
+    for (final (code, body) in [
+      (502, '<html><body>Bad gateway</body></html>'),
+      (503, 'upstream down'),
+      (200, '<html>captive portal</html>'),
+      (200, '[1, 2, 3]'),
+    ]) {
+      SharedPreferences.setMockInitialValues({});
+      final prefs = await SharedPreferences.getInstance();
+      final db = AppDb(NativeDatabase.memory());
+      final store = MemStore(prefs);
+      final client = MockClient(
+        (_) async =>
+            http.Response(body, code, headers: {'content-type': 'text/html'}),
+      );
+      final engine = SyncEngine(
+        db,
+        store,
+        apiFactory: (b, t) => Api(b, token: t, client: client),
+      );
+      await db.upsertItem(
+        ItemsCompanion.insert(
+          id: id1,
+          kind: 'habit',
+          name: 'Read',
+          points: 15,
+          updatedAt: 1,
+          dirty: const Value(true),
+        ),
+      );
+      expect(await engine.sync(), SyncStatus.offline, reason: '$code $body');
+      expect(
+        await (db.select(db.items)..where((t) => t.dirty.equals(true))).get(),
+        hasLength(1),
+        reason: 'row stays dirty',
+      );
+      await db.close();
+    }
+  });
+
+  test(
+    'Api maps a JSON error body and an HTML error body to ApiException',
+    () async {
+      final json = Api(
+        'http://x',
+        token: 't',
+        client: MockClient((_) async => http.Response('{"error":"nope"}', 400)),
+      );
+      await expectLater(
+        json.pushTest(),
+        throwsA(
+          isA<ApiException>().having((e) => e.message, 'message', 'nope'),
+        ),
+      );
+      final html = Api(
+        'http://x',
+        token: 't',
+        client: MockClient((_) async => http.Response('<html/>', 502)),
+      );
+      await expectLater(
+        html.pushTest(),
+        throwsA(
+          isA<ApiException>().having(
+            (e) => e.message,
+            'message',
+            'Server error 502',
+          ),
+        ),
+      );
+    },
+  );
 
   test('an edit made while a sync is in flight stays dirty', () async {
     final server = FakeServer();

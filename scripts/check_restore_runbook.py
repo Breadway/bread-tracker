@@ -86,7 +86,7 @@ if "--user 0" not in script:
     fail("fixture generation must happen inside explicit root helpers")
 if '"$SCRATCH/secret:/secret"' not in script or '"$SCRATCH/secret/fcm.json:/run/secrets/fcm.json:ro"' not in script:
     fail("secret must use a distinct host path from recursive data ownership changes")
-if "17291" not in script or "ss -ltn" not in script:
+if "17291" not in script or "ss -H -ltn" not in script:
     fail("must preflight and publish only the scratch server port")
 if "docker compose" in script or "bread-tracker-data:" in script:
     fail("rehearsal must not touch Compose or named production volumes")
@@ -97,6 +97,14 @@ if "sha384" not in script or "migration" not in script.lower():
     fail("populated fixture must establish SQLx migration checksum")
 if "-exc" not in script:
     fail("fixture helpers must trace shell commands on runtime failure")
+if "ss -H -ltn '( sport = :17291 )'" not in script or "if ! ss -H -ltn" not in script:
+    fail("port preflight must use valid ss syntax and fail closed")
+if 'EVIDENCE_LOG="$EVIDENCE_DIR/$TASK-server.log"' not in script or '"$SCRATCH/server.log"' in script:
+    fail("server diagnostics must persist outside the cleaned scratch tree")
+if "--max-time 2" not in script or "--show-error" not in script:
+    fail("health probes need bounded transport and visible errors")
+if "server diagnostics:" not in script or "$EVIDENCE_LOG" not in script:
+    fail("exit cleanup must report where persistent server diagnostics were written")
 invalid_test = script.split("cat >\"$SCRATCH/invalid.sh\"", 1)[-1].split("INVALID\n", 1)[0]
 if 'before=$(sqlite3 /data/bread-tracker.db' not in invalid_test or 'after=$(sqlite3 /data/bread-tracker.db' not in invalid_test:
     fail("invalid restore test must snapshot and recheck existing database contents")

@@ -4,6 +4,8 @@ TASK="track2-rehearsal-$(date +%s)-$$"
 IMG="$TASK:local"
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 SCRATCH="$ROOT/.scratch-$TASK"
+EVIDENCE_DIR=${TRACK2_REHEARSAL_EVIDENCE_DIR:-/tmp/opencode/track2-rehearsal-evidence}
+EVIDENCE_LOG="$EVIDENCE_DIR/$TASK-server.log"
 SERVER_PID=
 SERVER_STARTED=0
 cleanup() {
@@ -32,6 +34,7 @@ cleanup() {
   fi
   docker image rm "$IMG" >/dev/null 2>&1 || true
   rm -rf -- "$SCRATCH"
+  printf 'server diagnostics: %s\n' "$EVIDENCE_LOG" >&2
   exit "$status"
 }
 trap cleanup EXIT
@@ -115,17 +118,35 @@ docker run --rm --name "$TASK-secret" --user 10001:10001 -v "$SCRATCH/data:/var/
 docker run --rm --name "$TASK-marker" --user 10001:10001 -v "$SCRATCH/data:/var/lib/bread-tracker" \
   --entrypoint /usr/local/bin/entrypoint-exec "$IMG" /usr/local/bin/bread-tracker-server mark-restored
 echo 'stage: secret readability and marker passed'
-test -z "$(ss -ltn sport=:17291 | tail -n +2)"
+mkdir -p "$EVIDENCE_DIR"
+chmod 0700 "$EVIDENCE_DIR"
+if ! ss -H -ltn '( sport = :17291 )' >"$EVIDENCE_DIR/$TASK-portcheck.txt" 2>&1; then
+  cat "$EVIDENCE_DIR/$TASK-portcheck.txt" >&2
+  echo 'Port 17291 preflight failed; not starting rehearsal server' >&2
+  exit 1
+fi
+if [ -s "$EVIDENCE_DIR/$TASK-portcheck.txt" ]; then
+  cat "$EVIDENCE_DIR/$TASK-portcheck.txt" >&2
+  echo 'Port 17291 is already occupied; not starting rehearsal server' >&2
+  exit 1
+fi
+echo 'stage: port 17291 preflight passed'
 docker run --rm --name "$TASK-server" --user 10001:10001 -v "$SCRATCH/data:/var/lib/bread-tracker" \
-  -e BREADTRACKER_DATABASE_PATH=/var/lib/bread-tracker/bread-tracker.db -p 127.0.0.1:17291:7290 "$IMG" >"$SCRATCH/server.log" 2>&1 &
+  -e BREADTRACKER_DATABASE_PATH=/var/lib/bread-tracker/bread-tracker.db -p 127.0.0.1:17291:7290 "$IMG" >"$EVIDENCE_LOG" 2>&1 &
 SERVER_PID=$!
 SERVER_STARTED=1
 attempt=0
-until curl --fail --silent http://127.0.0.1:17291/healthz >/dev/null; do
-  if ! kill -0 "$SERVER_PID" 2>/dev/null; then cat "$SCRATCH/server.log" >&2; wait "$SERVER_PID"; exit 1; fi
-  attempt=$((attempt + 1)); [ "$attempt" -lt 30 ] || { cat "$SCRATCH/server.log" >&2; exit 1; }
+until curl --fail --silent --show-error --max-time 2 http://127.0.0.1:17291/healthz >"$EVIDENCE_DIR/$TASK-health.txt" 2>&1; do
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    cat "$EVIDENCE_LOG" >&2
+    set +e; wait "$SERVER_PID"; startup_status=$?; set -e
+    echo "Rehearsal server exited before health probe; foreground status $startup_status" >&2
+    exit 1
+  fi
+  attempt=$((attempt + 1)); [ "$attempt" -lt 30 ] || { cat "$EVIDENCE_DIR/$TASK-health.txt" >&2; cat "$EVIDENCE_LOG" >&2; echo 'Health probe timed out' >&2; exit 1; }
   sleep 1
 done
+echo 'stage: health check passed'
 name=$(docker inspect --format '{{.Name}}' "$TASK-server")
 case "$name" in "/$TASK-server") printf 'Stopping verified task container %s\n' "$TASK-server" ;; *) echo 'Unexpected server container name' >&2; exit 1 ;; esac
 docker stop "$TASK-server" >/dev/null

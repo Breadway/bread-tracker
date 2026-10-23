@@ -29,10 +29,13 @@ negative_fixtures = {
     "bad stop/wait order": original.replace('docker stop "$TASK-server" >/dev/null\nset +e; wait "$SERVER_PID";', 'set +e; wait "$SERVER_PID";\ndocker stop "$TASK-server" >/dev/null', 1),
     "implicit image VOLUME": original.replace('"$SCRATCH/data:/var/lib/bread-tracker"', '"$SCRATCH/data:/data"'),
     "inverted invalid assertion": original.replace('docker run --rm --name "$TASK-invalid-check"', 'if docker run --rm --name "$TASK-invalid-check"', 1),
+    "invalid ss syntax": original.replace("ss -H -ltn '( sport = :17291 )'", "ss -H -ltn sport=:17291", 1),
+    "masked ss error": original.replace('if ! ss -H -ltn', 'ss -H -ltn', 1),
+    "deleted server diagnostics": original.replace('>"$EVIDENCE_LOG" 2>&1 &', '>"$SCRATCH/server.log" 2>&1 &', 1),
 }
 for label, fixture in negative_fixtures.items():
     try:
         check(fixture, False)
     except AssertionError as exc:
         raise SystemExit(f"negative fixture not rejected ({label}): {exc}")
-print("restore checker positive and 3 negative fixtures passed")
+print(f"restore checker positive and {len(negative_fixtures)} negative fixtures passed")

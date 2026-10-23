@@ -32,22 +32,26 @@ Litestream writes a file replica to `BREADTRACKER_BACKUP_DIR`. The sync-generati
 Restore while the server is stopped. Replace the database with the Litestream restore, then run `mark-restored` against the same database path, before starting the service again. For the default Compose setup:
 
 ```sh
-docker compose -f packaging/compose.yaml --project-directory . stop litestream
-docker compose -f packaging/compose.yaml --project-directory . stop bread-tracker
-docker run --rm --user 0 -v bread-tracker-data:/var/lib/bread-tracker \
-  -v /var/backups/bread-tracker:/b:ro -v /tmp:/o \
-  litestream/litestream:0.3.13 restore -o /o/restored.db file:///b/litestream
-docker run --rm --user 0 -v bread-tracker-data:/var/lib/bread-tracker \
-  -v /tmp:/o --entrypoint /usr/local/bin/entrypoint-exec bread-tracker:local \
-  /bin/sh -c 'sqlite3 /var/lib/bread-tracker/bread-tracker.db "PRAGMA wal_checkpoint(TRUNCATE);" || true; cp /o/restored.db /var/lib/bread-tracker/bread-tracker.db; chown -R 10001:10001 /var/lib/bread-tracker'
-docker run --rm --user 10001:10001 \
-  -v bread-tracker-data:/var/lib/bread-tracker \
-  --entrypoint /usr/local/bin/entrypoint-exec bread-tracker:local /usr/local/bin/bread-tracker-server mark-restored
-docker compose -f packaging/compose.yaml --project-directory . up -d bread-tracker
-docker compose -f packaging/compose.yaml --project-directory . up -d litestream
+# Use an isolated copy of the existing data volume for this rehearsal. Never point
+# these disposable commands at the live Compose volume or production service.
+TASK=track2-restore-check
+VOL=${TASK}-data
+IMG=${TASK}:local # build this image from the current Containerfile first
+set -euo pipefail
+docker volume create "$VOL"
+docker run --rm --user 0 -v "$VOL:/var/lib/bread-tracker" "$IMG" \
+  /bin/sh -c 'printf seeded > /var/lib/bread-tracker/sentinel'
+docker run --rm --user 0 -v "$VOL:/var/lib/bread-tracker" -v "$PWD/restored.db:/restore/restored.db:ro" "$IMG" \
+  /bin/sh -ec 'sqlite3 /restore/restored.db "PRAGMA integrity_check" | grep -qx ok; sqlite3 /var/lib/bread-tracker/bread-tracker.db "PRAGMA wal_checkpoint(TRUNCATE)"; cp /restore/restored.db /var/lib/bread-tracker/bread-tracker.db'
+docker run --rm --user 10001:10001 -v "$VOL:/var/lib/bread-tracker" "$IMG" \
+  /usr/local/bin/bread-tracker-server mark-restored
+docker run --rm --user 10001:10001 -v "$VOL:/var/lib/bread-tracker" "$IMG" \
+  /usr/local/bin/bread-tracker-server
+# For restore-failure injection, run a failing replacement command under `sh -ec`
+# on a separate disposable volume and assert neither marker nor server is started.
 ```
 
-Use the actual Compose volume name and configured `BREADTRACKER_DATABASE_PATH` if they differ from these defaults. Ensure no root/sidecar-managed SQLite process still has the DB open before replacement. Do not copy a `.sync-generation` or `.sync-generation-pending` file from a backup. The generation is created automatically on first server startup; subsequent restarts preserve it. `mark-restored` is specifically for after replacing the database, not routine restarts. Server processes hold a shared OS lock for their lifetime, and `mark-restored` takes the exclusive lock, so it refuses to overlap an active server. The one-shot `pair` command uses a short `BEGIN IMMEDIATE` SQLite transaction and does not acquire the lifetime lock. Server startup reconciles pending generation journal state inside a write transaction before binding/listening. The marker applies migrations to the restored DB and refuses to run if the database file is absent. Run commands as the Compose owner; the image uses uid 10001. For an existing root-owned volume, the root-only upgrade helper above updates the DB file and assigns only the named data volume to uid 10001, leaving the separate FCM secret mount untouched; keep Litestream and server stopped during that ownership migration. Until marking, clients cannot reliably distinguish a same-generation restore whose sequence has caught up with their saved cursor.
+Run the same rehearsal with an existing root-owned database/volume and confirm the marker and server can open it as uid 10001. Always use `set -e`; a failed checkpoint, integrity check, or copy must stop before marking or service restart. The marker creates a persistent `.restore-failed` sentinel before making changes and removes it only after successful generation publication. Server startup refuses while the sentinel remains. After any failure, inspect/restore the database, rerun a successful marker, and only then start the service. Checkpoint and close every SQLite user before replacement; never ignore checkpoint errors or copy just the main DB while WAL is live. Verify the restored DB with `PRAGMA integrity_check` before replacement. Do not copy `.sync-generation` or `.sync-generation-pending` from backup. `pair` remains a short `BEGIN IMMEDIATE` transaction independent of the generation lock. Mount the FCM secret read-only with permissions allowing uid 10001 to read it; verify readability without printing secret contents. Never recursively chown the host secret directory. Coordinator must run the disposable restore/failure-injection/root-owned-volume/entrypoint rehearsal before this runbook is accepted.
 
 Restore into a scratch file to verify the backup:
 

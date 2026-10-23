@@ -144,49 +144,6 @@ pub async fn all_items(db: &Db) -> Result<Vec<Item>, sqlx::Error> {
         .await
 }
 
-pub async fn apply_restore_snapshot(
-    db: &Db,
-    items: &[Item],
-    completions: &[Completion],
-) -> Result<(), sqlx::Error> {
-    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
-    for incoming in items {
-        let local = sqlx::query_as::<_, Item>(&format!("SELECT {ITEM_COLS} FROM items WHERE id=?"))
-            .bind(&incoming.id)
-            .fetch_optional(&mut *tx)
-            .await?;
-        if local
-            .as_ref()
-            .is_some_and(|row| row.updated_at > incoming.updated_at)
-        {
-            continue;
-        }
-        let seq = next_seq(&mut tx).await?;
-        sqlx::query("INSERT INTO items (id,kind,name,weekdays,remind_time,points,due_date,sort,active,updated_at,deleted_at,seq) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,name=excluded.name,weekdays=excluded.weekdays,remind_time=excluded.remind_time,points=excluded.points,due_date=excluded.due_date,sort=excluded.sort,active=excluded.active,updated_at=excluded.updated_at,deleted_at=excluded.deleted_at,seq=excluded.seq")
-            .bind(&incoming.id).bind(&incoming.kind).bind(&incoming.name).bind(incoming.weekdays)
-            .bind(&incoming.remind_time).bind(incoming.points).bind(&incoming.due_date).bind(incoming.sort)
-            .bind(incoming.active).bind(incoming.updated_at).bind(incoming.deleted_at).bind(seq)
-            .execute(&mut *tx).await?;
-    }
-    for incoming in completions {
-        let updated: Option<i64> =
-            sqlx::query_scalar("SELECT updated_at FROM completions WHERE item_id=? AND date=?")
-                .bind(&incoming.item_id)
-                .bind(&incoming.date)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if updated.is_some_and(|value| value > incoming.updated_at) {
-            continue;
-        }
-        let seq = next_seq(&mut tx).await?;
-        sqlx::query("INSERT INTO completions (item_id,date,completed_at,updated_at,deleted_at,seq) VALUES (?,?,?,?,?,?) ON CONFLICT(item_id,date) DO UPDATE SET completed_at=excluded.completed_at,updated_at=excluded.updated_at,deleted_at=excluded.deleted_at,seq=excluded.seq")
-            .bind(&incoming.item_id).bind(&incoming.date).bind(incoming.completed_at)
-            .bind(incoming.updated_at).bind(incoming.deleted_at).bind(seq)
-            .execute(&mut *tx).await?;
-    }
-    tx.commit().await
-}
-
 pub async fn all_completions(db: &Db) -> Result<Vec<Completion>, sqlx::Error> {
     sqlx::query_as::<_, Completion>(&format!("SELECT {COMPLETION_COLS} FROM completions"))
         .fetch_all(db)

@@ -539,7 +539,85 @@ async fn generation_preflight_rejects_dirty_writes_then_returns_full_snapshot() 
     assert_eq!(preflight["items"].as_array().unwrap().len(), 1);
     let (status, accepted) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"since": preflight["cursor"], "epoch": preflight["epoch"], "items": [item(H1, "chore", "dirty", 127, None, now + 1000)]}))).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(accepted["items"].as_array().unwrap().len(), 2);
+    assert_eq!(accepted["items"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn empty_stale_generation_preflight_does_not_rewrite_database_rows() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({
+            "items": [item(C1, "chore", "kept", 127, None, now)]
+        })),
+    )
+    .await;
+    let before: (i64, i64) = sqlx::query_as("SELECT seq, updated_at FROM items WHERE id=?")
+        .bind(C1)
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    let old_epoch: String = sqlx::query_scalar("SELECT value FROM settings WHERE key='sync_epoch'")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    *h.state.generation.write().unwrap() = "rotated-generation".into();
+    let (status, snapshot) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({
+            "since": 99, "epoch": old_epoch, "items": [], "completions": []
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(snapshot["items"].as_array().unwrap().len(), 1);
+    let after: (i64, i64) = sqlx::query_as("SELECT seq, updated_at FROM items WHERE id=?")
+        .bind(C1)
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "read-only generation discovery must not rewrite history"
+    );
+}
+
+#[tokio::test]
+async fn generation_mismatch_with_nonempty_batch_rejects_without_writes() {
+    let h = harness().await;
+    let token = paired(&h).await;
+    let old_epoch: String = sqlx::query_scalar("SELECT value FROM settings WHERE key='sync_epoch'")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    *h.state.generation.write().unwrap() = "rotated-generation".into();
+    let (status, _) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&token),
+        Some(json!({
+            "since": 0, "epoch": old_epoch,
+            "items": [item(C1, "chore", "must not be applied", 127, None, store::now_ms())],
+            "completions": []
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE id=?")
+        .bind(C1)
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
 }
 
 #[tokio::test]
@@ -558,15 +636,13 @@ async fn legacy_request_against_generation_server_keeps_push_pull_contract() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(pushed["items"][0]["name"], "legacy");
     assert!(pushed["epoch"].as_str().is_some());
-    let legacy_db = db::connect_memory().await.unwrap();
-    sqlx::query("INSERT INTO items (id,kind,name,weekdays,points,sort,active,updated_at,seq) VALUES ('33333333-3333-4333-8333-333333333333','chore','preexisting',127,10,0,1,1,1)")
-        .execute(&legacy_db).await.unwrap();
-    assert_eq!(
+    assert!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM items")
-            .fetch_one(&legacy_db)
+            .fetch_one(&h.state.db)
             .await
-            .unwrap(),
-        1
+            .unwrap()
+            >= 1,
+        "legacy sync request writes its row"
     );
 }
 
@@ -680,8 +756,31 @@ async fn populated_old_wire_client_and_missing_optional_fields_remain_compatible
     assert!(response.1["epoch"].as_str().is_some());
 }
 
-#[test]
-fn pair_cli_completes_while_the_http_server_holds_generation_lock() {
+#[tokio::test]
+async fn new_client_optional_wire_fields_are_ignored_and_legacy_rows_survive() {
+    let h = harness().await;
+    let token = paired(&h).await;
+    let now = store::now_ms();
+    let (status, response) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&token),
+        Some(json!({
+            "since": 0,
+            "epoch": null,
+            "items": [item(C1, "chore", "new client legacy request", 127, None, now)],
+            "completions": []
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["items"][0]["name"], "new client legacy request");
+    assert!(response["epoch"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn pair_cli_completes_while_the_http_server_holds_generation_lock() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("pair-process.db");
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -736,6 +835,18 @@ fn pair_cli_completes_while_the_http_server_holds_generation_lock() {
         String::from_utf8_lossy(&pair.stderr)
     );
     assert!(!String::from_utf8_lossy(&pair.stdout).trim().is_empty());
+    let code = String::from_utf8_lossy(&pair.stdout).trim().to_owned();
+    let paired = reqwest::Client::new()
+        .post(format!("http://{address}/pair"))
+        .json(&json!({"code": code, "device_name": "process-pair"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        paired.status(),
+        StatusCode::OK,
+        "generated code should redeem on the running server"
+    );
     let marker = Command::new(binary)
         .arg("mark-restored")
         .env("BREADTRACKER_DATABASE_PATH", &database)
@@ -749,6 +860,30 @@ fn pair_cli_completes_while_the_http_server_holds_generation_lock() {
     assert!(String::from_utf8_lossy(&marker.stderr).contains("server is running"));
     let _ = server.kill();
     let _ = server.wait();
+    let failed_marker = Command::new(binary)
+        .arg("mark-restored")
+        .env("BREADTRACKER_DATABASE_PATH", &database)
+        .env("BREADTRACKER_LISTEN", address.to_string())
+        .env("BREADTRACKER_INJECT_MARK_FAILURE", "after-journal")
+        .output()
+        .unwrap();
+    assert!(!failed_marker.status.success());
+    let refused_start = Command::new(binary)
+        .env("BREADTRACKER_DATABASE_PATH", &database)
+        .env("BREADTRACKER_LISTEN", address.to_string())
+        .env("BREADTRACKER_FCM_SERVICE_ACCOUNT", "")
+        .output()
+        .unwrap();
+    assert!(!refused_start.status.success());
+    assert!(String::from_utf8_lossy(&refused_start.stderr).contains("prior restore"));
+    let refused_marker = Command::new(binary)
+        .arg("mark-restored")
+        .env("BREADTRACKER_DATABASE_PATH", &database)
+        .env("BREADTRACKER_LISTEN", address.to_string())
+        .output()
+        .unwrap();
+    assert!(!refused_marker.status.success());
+    assert!(String::from_utf8_lossy(&refused_marker.stderr).contains("prior restore marker failed"));
 }
 
 #[test]

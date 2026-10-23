@@ -108,8 +108,8 @@ async fn sync(
     }
     let generation = st.generation.read().unwrap().clone();
     let before = store::pull(&st.db, req.since, Some(&generation)).await?;
-    // New clients use an empty sync as preflight. On a generation mismatch return a full
-    // snapshot without accepting writes. Legacy clients omit epoch and retain push behavior.
+    // New clients send an empty sync as preflight. On a true generation mismatch,
+    // return a full read-only snapshot without accepting writes. Legacy clients omit epoch.
     let client_epoch = req.epoch.as_deref();
     // Databases created before generation support have no settings row. Return no wire field
     // so clients can use the legacy protocol without mistaking an unknown epoch for a restore.
@@ -118,13 +118,12 @@ async fn sync(
         let mut full = before;
         full.items = store::all_items(&st.db).await?;
         full.completions = store::all_completions(&st.db).await?;
-        if !req.items.is_empty() || !req.completions.is_empty() {
-            return Err(ApiError::BadRequest(
-                "sync generation changed; apply snapshot before retrying uploads".into(),
-            ));
+        if req.items.is_empty() && req.completions.is_empty() {
+            return Ok(Json(full));
         }
-        store::apply_restore_snapshot(&st.db, &full.items, &full.completions).await?;
-        return Ok(Json(full));
+        return Err(ApiError::BadRequest(
+            "sync generation changed; apply snapshot before retrying uploads".into(),
+        ));
     }
     store::apply_push(&st.db, &req.items, &req.completions).await?;
     let mut response = store::pull(&st.db, req.since, Some(&generation)).await?;

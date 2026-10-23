@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:drift/drift.dart';
 
 import 'api.dart';
@@ -5,6 +7,12 @@ import 'database.dart';
 import 'store.dart';
 
 enum SyncStatus { idle, syncing, offline, unpaired }
+
+class _RestoreBatch {
+  const _RestoreBatch(this.items, this.completions);
+  final List<ItemRow> items;
+  final List<CompletionRow> completions;
+}
 
 class SyncEngine {
   SyncEngine(
@@ -38,7 +46,7 @@ class SyncEngine {
     }
   }
 
-  Future<SyncStatus> _once({bool afterReset = false}) async {
+  Future<SyncStatus> _once() async {
     final token = await store.token;
     if (token == null) return SyncStatus.unpaired;
     final api = _apiFactory(store.serverUrl, token);
@@ -58,16 +66,13 @@ class SyncEngine {
       return SyncStatus.offline;
     }
     final serverEpoch = preflight['epoch'] as String?;
-    var establishedEpoch = false;
-    if (serverEpoch != null && requestEpoch != null && !afterReset) {
+    if (serverEpoch != null &&
+        requestEpoch != null &&
+        serverEpoch != requestEpoch) {
       // Keep the two-part exchange consistent with the protocol: commit the full
       // snapshot first, retain dirty local winners, then retry uploads under the new
       // generation. Never clear sync metadata before the snapshot is committed.
-      await _applyRestoreSnapshot(preflight);
-      await db.markAllDirty();
-      await store.setCursor(0);
-      await store.setEpoch(serverEpoch);
-      return _once(afterReset: true);
+      return _reuploadAfterRestore(preflight, serverEpoch);
     }
     if (serverEpoch != null && requestEpoch == null) {
       // An upgraded install may already have a non-zero legacy cursor but has never
@@ -75,11 +80,20 @@ class SyncEngine {
       // this recovers phone rows after a pre-upgrade restore and pulls the whole server
       // snapshot before accepting the new generation as the cursor's owner.
       if (store.cursor > 0) {
-        await db.markAllDirty();
+        await db.transaction(() async {
+          for (final row
+              in (preflight['items'] as List).cast<Map<String, dynamic>>()) {
+            await db.upsertItemIfNewer(_itemCompanion(row));
+          }
+          for (final row
+              in (preflight['completions'] as List)
+                  .cast<Map<String, dynamic>>()) {
+            await db.upsertCompletionIfNewer(_compCompanion(row));
+          }
+          await db.markAllDirty();
+        });
         await store.setCursor(0);
       }
-      await store.setEpoch(serverEpoch);
-      establishedEpoch = true;
     }
 
     final dirtyItems = await (db.select(
@@ -105,12 +119,9 @@ class SyncEngine {
 
     final epoch = res['epoch'] as String?;
     if (epoch != null && epoch != store.epoch) {
-      await _applyRestoreSnapshot(res);
-      await store.setCursor(0);
-      await store.setEpoch(epoch);
-      return _once(afterReset: true);
+      return _reuploadAfterRestore(res, epoch);
     }
-    if (epoch != null && requestEpoch == null && !establishedEpoch) {
+    if (epoch != null && requestEpoch == null) {
       await store.setEpoch(epoch);
     }
     await db.transaction(() async {
@@ -161,20 +172,171 @@ class SyncEngine {
     return SyncStatus.idle;
   }
 
-  Future<void> _applyRestoreSnapshot(Map<String, dynamic> snapshot) async {
-    await db.transaction(() async {
-      for (final j
+  Future<SyncStatus> _reuploadAfterRestore(
+    Map<String, dynamic> snapshot,
+    String epoch,
+  ) async {
+    final winners = await db.transaction(() async {
+      for (final row
           in (snapshot['items'] as List).cast<Map<String, dynamic>>()) {
-        await db.upsertItemIfNewer(_itemCompanion(j));
+        await db.upsertItemIfNewer(_itemCompanion(row));
       }
-      // Snapshot rows are pulled as clean, but any local LWW winner that was newer
-      // must be retried so the restored server learns the value/tombstone.
-      for (final j
+      for (final row
           in (snapshot['completions'] as List).cast<Map<String, dynamic>>()) {
-        await db.upsertCompletionIfNewer(_compCompanion(j));
+        await db.upsertCompletionIfNewer(_compCompanion(row));
       }
       await db.markAllDirty();
+      await store.setCursor(0);
+      await store.setEpoch(epoch);
+      return (
+        await (db.select(db.items)..where((r) => r.dirty.equals(true))).get(),
+        await (db.select(
+          db.completions,
+        )..where((r) => r.dirty.equals(true))).get(),
+      );
     });
+    return _sendRestoreWinners(winners.$1, winners.$2, epoch);
+  }
+
+  Future<SyncStatus> _sendRestoreWinners(
+    List<ItemRow> items,
+    List<CompletionRow> completions,
+    String epoch,
+  ) async {
+    final token = await store.token;
+    if (token == null) return SyncStatus.unpaired;
+    final api = _apiFactory(store.serverUrl, token);
+    var cursor = 0;
+    var sentBatch = false;
+    for (final batch in _restoreBatches(items, completions)) {
+      sentBatch = true;
+      final Map<String, dynamic> response;
+      try {
+        response = await api.sync(
+          cursor,
+          [for (final row in batch.items) _itemJson(row)],
+          [for (final row in batch.completions) _compJson(row)],
+          epoch: epoch,
+        );
+      } on AuthLost {
+        return SyncStatus.unpaired;
+      } on ApiException {
+        return SyncStatus.offline;
+      }
+      final responseEpoch = response['epoch'] as String?;
+      if (responseEpoch != null && responseEpoch != epoch) {
+        return SyncStatus.offline;
+      }
+      await db.transaction(() async {
+        for (final row in batch.items) {
+          await (db.update(db.items)..where(
+                (r) => r.id.equals(row.id) & r.updatedAt.equals(row.updatedAt),
+              ))
+              .write(const ItemsCompanion(dirty: Value(false)));
+        }
+        for (final row in batch.completions) {
+          await (db.update(db.completions)..where(
+                (r) =>
+                    r.itemId.equals(row.itemId) &
+                    r.date.equals(row.date) &
+                    r.updatedAt.equals(row.updatedAt),
+              ))
+              .write(const CompletionsCompanion(dirty: Value(false)));
+        }
+        for (final row
+            in (response['items'] as List).cast<Map<String, dynamic>>()) {
+          final local = await (db.select(
+            db.items,
+          )..where((r) => r.id.equals(row['id']))).getSingleOrNull();
+          if (local == null || local.updatedAt <= (row['updated_at'] as int)) {
+            await db.upsertItem(_itemCompanion(row));
+          }
+        }
+        for (final row
+            in (response['completions'] as List).cast<Map<String, dynamic>>()) {
+          final local =
+              await (db.select(db.completions)..where(
+                    (r) =>
+                        r.itemId.equals(row['item_id']) &
+                        r.date.equals(row['date']),
+                  ))
+                  .getSingleOrNull();
+          if (local == null || local.updatedAt <= (row['updated_at'] as int)) {
+            await db
+                .into(db.completions)
+                .insertOnConflictUpdate(_compCompanion(row));
+          }
+        }
+      });
+      cursor = response['cursor'] as int;
+      await store.setCursor(cursor);
+    }
+    if (!sentBatch) {
+      await store.setCursor(0);
+    }
+    return SyncStatus.idle;
+  }
+
+  Iterable<_RestoreBatch> _restoreBatches(
+    List<ItemRow> items,
+    List<CompletionRow> completions,
+  ) sync* {
+    var batchItems = <ItemRow>[];
+    var batchCompletions = <CompletionRow>[];
+    for (final row in items) {
+      final candidate = [...batchItems, row];
+      if (batchItems.isNotEmpty &&
+          (candidate.length + batchCompletions.length > 5000 ||
+              utf8
+                      .encode(
+                        jsonEncode({
+                          'since': 0,
+                          'epoch': store.epoch,
+                          'items': [
+                            for (final value in candidate) _itemJson(value),
+                          ],
+                          'completions': [
+                            for (final value in batchCompletions)
+                              _compJson(value),
+                          ],
+                        }),
+                      )
+                      .length >
+                  1024 * 1024)) {
+        yield _RestoreBatch(batchItems, batchCompletions);
+        batchItems = [];
+        batchCompletions = [];
+      }
+      batchItems.add(row);
+    }
+    for (final row in completions) {
+      final candidate = [...batchCompletions, row];
+      if (batchItems.length + batchCompletions.length >= 5000 ||
+          (batchItems.isNotEmpty || batchCompletions.isNotEmpty) &&
+              utf8
+                      .encode(
+                        jsonEncode({
+                          'since': 0,
+                          'epoch': store.epoch,
+                          'items': [
+                            for (final value in batchItems) _itemJson(value),
+                          ],
+                          'completions': [
+                            for (final value in candidate) _compJson(value),
+                          ],
+                        }),
+                      )
+                      .length >
+                  1024 * 1024) {
+        yield _RestoreBatch(batchItems, batchCompletions);
+        batchItems = [];
+        batchCompletions = [];
+      }
+      batchCompletions.add(row);
+    }
+    if (batchItems.isNotEmpty || batchCompletions.isNotEmpty) {
+      yield _RestoreBatch(batchItems, batchCompletions);
+    }
   }
 
   Map<String, dynamic> _itemJson(ItemRow i) => {

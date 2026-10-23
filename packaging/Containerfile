@@ -12,6 +12,7 @@ RUN cargo build --release --locked -p bread-tracker-server
 FROM docker.io/library/debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates sqlite3 \
     && rm -rf /var/lib/apt/lists/*
+RUN groupadd --gid 10001 tracker && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent tracker
 COPY --from=build /s/target/release/bread-tracker-server /usr/local/bin/bread-tracker-server
 RUN mkdir -p /var/lib/bread-tracker && chown -R 10001:10001 /var/lib/bread-tracker
 RUN printf '#!/bin/sh\nset -eu\nexec "$@"\n' > /usr/local/bin/entrypoint-exec && chmod 755 /usr/local/bin/entrypoint-exec

@@ -5,6 +5,7 @@
 //!   bread-tracker-server mark-restored  rotate generation after restoring a DB
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -13,6 +14,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let marker_completed = Arc::new(AtomicBool::new(false));
+    let marker_completed_on_drop = marker_completed.clone();
+    let _marker_failure_guard = MarkerFailureGuard(marker_completed_on_drop);
     tracing_subscriber::registry()
         .with(
             EnvFilter::try_from_default_env()
@@ -23,6 +27,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env();
     let command = std::env::args().nth(1);
+    let restore_failed_path = config.database_path.with_extension("sync-restore-failed");
     if let Some(parent) = config
         .database_path
         .parent()
@@ -30,7 +35,14 @@ async fn main() -> anyhow::Result<()> {
     {
         std::fs::create_dir_all(parent)?;
     }
-    if command.as_deref() == Some("mark-restored") {
+    let is_marking_restore = command.as_deref() == Some("mark-restored");
+    if !is_marking_restore && restore_failed_path.exists() {
+        anyhow::bail!("a prior restore or generation marker failed; verify the database and rerun mark-restored before starting");
+    }
+    if is_marking_restore && restore_failed_path.exists() {
+        anyhow::bail!("a prior restore marker failed; verify or restore the database before attempting another marker");
+    }
+    if is_marking_restore {
         if !config.database_path.exists() {
             anyhow::bail!(
                 "database {} does not exist; restore it before marking generation",
@@ -53,7 +65,40 @@ async fn main() -> anyhow::Result<()> {
             .await
             .context("opening database to mark restored generation")?;
         let generation = db::next_generation(&config.database_path)?;
+        if let Some(parent) = restore_failed_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut failure_marker = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&restore_failed_path)
+            .with_context(|| {
+                format!(
+                    "restore marker already exists at {}; verify database before retry",
+                    restore_failed_path.display()
+                )
+            })?;
+        use std::io::Write;
+        writeln!(failure_marker, "restore in progress")?;
+        failure_marker.sync_all()?;
+        std::fs::File::open(
+            restore_failed_path
+                .parent()
+                .unwrap_or(std::path::Path::new(".")),
+        )?
+        .sync_all()?;
         db::mark_restored(&generation_db, &config.database_path, &generation).await?;
+        marker_completed.store(true, Ordering::SeqCst);
+        std::fs::remove_file(&restore_failed_path)?;
+        std::fs::File::open(
+            restore_failed_path
+                .parent()
+                .unwrap_or(std::path::Path::new(".")),
+        )?
+        .sync_all()?;
         println!("Sync generation rotated. Start the server to resume sync.");
         return Ok(());
     }
@@ -67,7 +112,8 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Server lifetime ownership excludes restore marking for the entire listener life.
+    // A server owns the generation exclusively for its listener lifetime. Pair is a
+    // short SQLite transaction and does not acquire the generation file lock.
     let startup_lock = db::GenerationLock::try_acquire_lifetime_exclusive(&config.database_path)
         .context("another server or restore operation already owns this database")?;
     let db = db::connect(&config.database_url())
@@ -105,4 +151,30 @@ async fn main() -> anyhow::Result<()> {
         })
         .await
         .context("server error")
+}
+
+struct MarkerFailureGuard(Arc<AtomicBool>);
+
+impl Drop for MarkerFailureGuard {
+    fn drop(&mut self) {
+        if self.0.load(Ordering::SeqCst) {
+            return;
+        }
+        let Ok(database) = std::env::var("BREADTRACKER_DATABASE_PATH") else {
+            return;
+        };
+        if std::env::args().nth(1).as_deref() != Some("mark-restored") {
+            return;
+        }
+        let path = std::path::PathBuf::from(database).with_extension("sync-restore-failed");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "restore marker exited before completion");
+            let _ = file.sync_all();
+        }
+    }
 }

@@ -247,7 +247,19 @@ pub async fn mark_restored(
     database_path: &std::path::Path,
     generation: &str,
 ) -> anyhow::Result<()> {
-    mark_restored_inner(db, database_path, generation, || Ok(()), || Ok(())).await
+    mark_restored_inner(
+        db,
+        database_path,
+        generation,
+        || {
+            if std::env::var("BREADTRACKER_INJECT_MARK_FAILURE").as_deref() == Ok("after-journal") {
+                anyhow::bail!("injected restore marker failure after journal publication");
+            }
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .await
 }
 
 #[cfg(test)]

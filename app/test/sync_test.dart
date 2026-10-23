@@ -18,6 +18,8 @@ class FakeServer {
   bool supportsEpoch = true;
   bool disconnectAfterFirstRequest = false;
   bool firstRequest = false;
+  final outgoingItemCounts = <int>[];
+  final outgoingCompletionCounts = <int>[];
 
   /// A rebuilt server: empty database, new identity, counter back at zero.
   void rebuild(String newEpoch) {
@@ -33,6 +35,8 @@ class FakeServer {
     List<Map<String, dynamic>> pc, {
     String? clientEpoch,
   }) {
+    outgoingItemCounts.add(pi.length);
+    outgoingCompletionCounts.add(pc.length);
     if (down) throw ApiException('Cannot reach the server');
     if (reject) throw AuthLost();
     if (!supportsEpoch) {
@@ -112,10 +116,6 @@ class FakeApi extends Api {
       };
     }
     final response = server.sync(since, items, completions, clientEpoch: epoch);
-    if (server.disconnectAfterFirstRequest && !server.firstRequest) {
-      server.firstRequest = true;
-      server.supportsEpoch = false;
-    }
     return response;
   }
 }
@@ -482,10 +482,74 @@ void main() {
       ),
     );
     await sync.sync();
+    final outgoingAfterFirst = server.outgoingItemCounts.length;
+    expect(server.outgoingItemCounts.last, 1);
     final seqAfterFirst = server.seq;
     await sync.sync();
     await sync.sync();
     expect(server.seq, seqAfterFirst, reason: 'nothing was pushed again');
+    expect(server.outgoingItemCounts.length, greaterThan(outgoingAfterFirst));
+    expect(server.outgoingItemCounts.skip(outgoingAfterFirst), everyElement(0));
+  });
+
+  test('empty stale generation preflight only discovers, then a real change reuploads once', () async {
+    final server = FakeServer();
+    final (db, sync, store) = await device(server);
+    await db.upsertItem(
+      ItemsCompanion.insert(
+        id: id1,
+        kind: 'chore',
+        name: 'saved',
+        points: 10,
+        updatedAt: 1000,
+        dirty: const Value(true),
+      ),
+    );
+    await sync.sync();
+    final seqBefore = server.seq;
+    final cleanBatchesBefore = server.outgoingItemCounts.length;
+    expect(await sync.sync(), SyncStatus.idle);
+    expect(server.seq, seqBefore);
+    expect(server.outgoingItemCounts.last, 0);
+
+    // A true generation change returns the snapshot, then retries the retained local row.
+    server.epoch = 'generation-2';
+    expect(await sync.sync(), SyncStatus.idle);
+    expect(server.items[id1]!['name'], 'saved');
+    expect(server.epoch, store.epoch);
+    expect(server.outgoingItemCounts.length, greaterThan(cleanBatchesBefore));
+    expect(server.outgoingItemCounts.last, 1);
+  });
+
+  test('restore reupload chunks data below the server row cap', () async {
+    final server = FakeServer();
+    final (db, sync, _) = await device(server);
+    for (var i = 0; i < 5001; i++) {
+      final id = '00000000-0000-4000-8000-${i.toString().padLeft(12, '0')}';
+      await db.upsertItem(
+        ItemsCompanion.insert(
+          id: id,
+          kind: 'chore',
+          name: 'bulk-$i',
+          points: 1,
+          updatedAt: i + 1,
+          dirty: const Value(true),
+        ),
+      );
+    }
+    expect(await sync.sync(), SyncStatus.idle);
+    final before = server.seq;
+    server.epoch = 'bulk-restore';
+    expect(await sync.sync(), SyncStatus.idle);
+    expect(server.items.length, 5001);
+    expect(server.seq, before);
+    expect(
+      server.outgoingItemCounts
+          .where((n) => n > 0)
+          .skip(2)
+          .every((n) => n <= 5000),
+      isTrue,
+    );
   });
 
   test('new app falls back to a server response without generation', () async {
@@ -551,6 +615,9 @@ void main() {
 
   test('legacy first contact retries safely if compatibility changes after preflight', () async {
     final server = FakeServer()..disconnectAfterFirstRequest = true;
+    server
+      ..firstRequest = true
+      ..supportsEpoch = false;
     final (db, sync, store) = await device(server);
     await store.setCursor(40);
     await db.upsertItem(
@@ -560,11 +627,13 @@ void main() {
         name: 'local legacy row',
         points: 10,
         updatedAt: 1000,
+        dirty: const Value(true),
       ),
     );
     expect(await sync.sync(), SyncStatus.idle);
     expect(server.items[id1]!['name'], 'local legacy row');
-    expect(store.epoch, server.epoch);
+    expect((await db.select(db.items).getSingle()).dirty, isFalse);
+    expect(store.epoch, isNull);
   });
 
   test('restore generation change detected before dirty writes even beyond old cursor', () async {

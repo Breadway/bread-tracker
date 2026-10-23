@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import 'package:drift/drift.dart' show Value;
 
+import 'data/api.dart';
 import 'data/database.dart';
 import 'data/store.dart';
 import 'data/sync.dart';
@@ -27,6 +28,10 @@ final dbProvider = Provider<AppDb>((ref) {
 });
 final syncEngineProvider = Provider<SyncEngine>(
   (ref) => SyncEngine(ref.watch(dbProvider), ref.watch(storeProvider)),
+);
+/// How the app builds an [Api] for one-off calls (settings, sign out). Tests override it.
+final apiFactoryProvider = Provider<Api Function(String base, String token)>(
+  (ref) => (base, token) => Api(base, token: token),
 );
 final sfxProvider = Provider<Sfx>((ref) => NoSfx());
 final pushProvider = Provider<PushService>((ref) => NoPushService());

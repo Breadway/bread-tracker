@@ -156,7 +156,13 @@ class AppController {
   }
 
   Future<void> syncNow() async {
-    final status = await ref.read(syncEngineProvider).sync();
+    SyncStatus status;
+    try {
+      status = await ref.read(syncEngineProvider).sync();
+    } catch (_) {
+      // A sync failure must never escape as an unhandled async error from a timer.
+      status = SyncStatus.offline;
+    }
     if (status != SyncStatus.syncing) {
       ref.read(syncStatusProvider.notifier).set(status);
     }

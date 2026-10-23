@@ -76,16 +76,31 @@ class Api {
       throw ApiException('Cannot reach the server');
     }
     if (res.statusCode == 401 && token != null) throw AuthLost();
-    final decoded = res.body.isEmpty
-        ? <String, dynamic>{}
-        : jsonDecode(res.body);
+    // Decode defensively: an edge proxy (502 HTML) or a captive portal (200 HTML)
+    // can answer with a body that is not the JSON object the server sends.
+    Object? decoded;
+    var parsed = false;
+    if (res.body.isEmpty) {
+      decoded = <String, dynamic>{};
+      parsed = true;
+    } else {
+      try {
+        decoded = jsonDecode(res.body);
+        parsed = true;
+      } on FormatException {
+        parsed = false;
+      }
+    }
     if (res.statusCode >= 400) {
       throw ApiException(
-        (decoded is Map ? decoded['error'] : null)?.toString() ??
+        (parsed && decoded is Map ? decoded['error'] : null)?.toString() ??
             'Server error ${res.statusCode}',
       );
     }
-    return decoded as Map<String, dynamic>;
+    if (!parsed || decoded is! Map) {
+      throw ApiException('Unexpected response from the server');
+    }
+    return decoded.cast<String, dynamic>();
   }
 
   Future<String> pair(String code, String deviceName) async {

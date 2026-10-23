@@ -139,6 +139,18 @@ pub async fn all_completions(db: &Db) -> Result<Vec<Completion>, sqlx::Error> {
         .await
 }
 
+/// Completions the scheduler needs: everything dated `date`, plus every completion of a
+/// to-do (a to-do ticked on an earlier day is still done on its due date).
+pub async fn reminder_completions(db: &Db, date: &str) -> Result<Vec<Completion>, sqlx::Error> {
+    sqlx::query_as::<_, Completion>(&format!(
+        "SELECT {COMPLETION_COLS} FROM completions
+         WHERE date = ? OR item_id IN (SELECT id FROM items WHERE kind = 'todo')"
+    ))
+    .bind(date)
+    .fetch_all(db)
+    .await
+}
+
 pub async fn get_setting(db: &Db, key: &str) -> Result<String, sqlx::Error> {
     sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ?")
         .bind(key)

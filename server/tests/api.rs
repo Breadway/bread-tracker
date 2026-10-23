@@ -282,6 +282,27 @@ async fn settings_round_trip_and_validation() {
     let tok = paired(&h).await;
     let (_, v) = call(&h.app, "GET", "/settings", Some(&tok), None).await;
     assert_eq!(v["timezone"], "Australia/Perth");
+    assert_eq!(v["utc_offset_minutes"], 480, "Perth has no DST");
+    let (s, v) = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"timezone": "Asia/Kolkata"})),
+    )
+    .await;
+    assert_eq!(
+        (s, v["utc_offset_minutes"].as_i64()),
+        (StatusCode::OK, Some(330))
+    );
+    call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"timezone": "Australia/Perth"})),
+    )
+    .await;
     let (s, v) = call(
         &h.app,
         "PUT",
@@ -302,6 +323,78 @@ async fn settings_round_trip_and_validation() {
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"quiet_start": "22:00", "quiet_end": "not-a-time"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (_, after) = call(&h.app, "GET", "/settings", Some(&tok), None).await;
+    assert_eq!(
+        after["quiet_start"], "22:00",
+        "invalid patch must not partially mutate settings"
+    );
+    assert_eq!(after["quiet_end"], "07:00");
+    let concurrent = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"timezone":"Australia/Sydney","reminders_enabled":false})),
+    );
+    let concurrent2 = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"quiet_start":"21:00","quiet_end":"06:00"})),
+    );
+    let (a, b) = tokio::join!(concurrent, concurrent2);
+    assert_eq!(a.0, StatusCode::OK);
+    assert_eq!(b.0, StatusCode::OK);
+    let (_, final_settings) = call(&h.app, "GET", "/settings", Some(&tok), None).await;
+    assert_eq!(final_settings["timezone"], "Australia/Sydney");
+    assert_eq!(final_settings["quiet_start"], "21:00");
+    assert_eq!(final_settings["quiet_end"], "06:00");
+    assert_eq!(final_settings["reminders_enabled"], false);
+}
+
+#[tokio::test]
+async fn concurrent_settings_patches_preserve_both_fields() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let app = h.app.clone();
+    let token = tok.clone();
+    let first = tokio::spawn(async move {
+        call(
+            &app,
+            "PUT",
+            "/settings",
+            Some(&token),
+            Some(json!({"timezone": "Australia/Sydney"})),
+        )
+        .await
+    });
+    let app = h.app.clone();
+    let token = tok.clone();
+    let second = tokio::spawn(async move {
+        call(
+            &app,
+            "PUT",
+            "/settings",
+            Some(&token),
+            Some(json!({"reminders_enabled": false})),
+        )
+        .await
+    });
+    assert_eq!(first.await.unwrap().0, StatusCode::OK);
+    assert_eq!(second.await.unwrap().0, StatusCode::OK);
+    let (_, settings) = call(&h.app, "GET", "/settings", Some(&tok), None).await;
+    assert_eq!(settings["timezone"], "Australia/Sydney");
+    assert_eq!(settings["reminders_enabled"], false);
 }
 
 // Monday 2026-10-19, 17:15 Perth = 09:15 UTC.
@@ -498,334 +591,160 @@ async fn push_test_route_needs_a_registered_token() {
 }
 
 #[tokio::test]
-async fn failed_pair_attempts_from_one_source_do_not_block_another() {
+async fn blocked_source_is_denied_before_even_correct_code_validation() {
     let h = harness().await;
-    let bad = json!({"code": "AAAA-BBBB"});
-    for _ in 0..5 {
+    for _ in 0..auth::MAX_FAILURES {
         assert_eq!(
-            call_from(&h.app, "203.0.113.9:5000", None, "/pair", bad.clone()).await,
+            call_from(
+                &h.app,
+                "203.0.113.9:5000",
+                None,
+                "/pair",
+                json!({"code":"invalid"})
+            )
+            .await,
             StatusCode::UNAUTHORIZED
         );
     }
+    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
     assert_eq!(
-        call_from(&h.app, "203.0.113.9:5001", None, "/pair", bad.clone()).await,
-        StatusCode::TOO_MANY_REQUESTS
-    );
-
-    // A different source can still pair with a valid code.
-    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
-    let ok = call_from(
-        &h.app,
-        "198.51.100.7:4000",
-        None,
-        "/pair",
-        json!({"code": code}),
-    )
-    .await;
-    assert_eq!(ok, StatusCode::OK);
-
-    // A valid code remains usable even from a source with a full failure budget.
-    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
-    let blocked = call_from(
-        &h.app,
-        "203.0.113.9:5002",
-        None,
-        "/pair",
-        json!({"code": code}),
-    )
-    .await;
-    assert_eq!(blocked, StatusCode::OK);
-}
-
-#[tokio::test]
-async fn successful_pairings_do_not_count_against_the_limit() {
-    let h = harness().await;
-    for _ in 0..8 {
-        let code = auth::create_pairing_code(&h.state.db).await.unwrap();
-        let s = call_from(
+        call_from(
             &h.app,
             "203.0.113.9:5000",
             None,
             "/pair",
-            json!({"code": code}),
+            json!({"code":code})
         )
-        .await;
-        assert_eq!(s, StatusCode::OK);
-    }
-}
-
-#[tokio::test]
-async fn a_flood_of_distinct_sources_does_not_block_a_valid_pairing_from_another() {
-    let h = harness().await;
-    let bad = json!({"code": "AAAA-BBBB"});
-    // Many distinct addresses each fail once: none is blocked, and the limiter must stay bounded.
-    for n in 1..auth::MAX_SOURCES as u32 {
-        let src = format!("198.51.{}.{}:4000", (n / 256) % 256, n % 256);
-        let status = call_from(&h.app, &src, None, "/pair", bad.clone()).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "source {n}");
-    }
-    let overflow = "192.0.2.66:4000";
-    for _ in 0..auth::MAX_FAILURES {
-        assert_eq!(
-            call_from(&h.app, overflow, None, "/pair", bad.clone()).await,
-            StatusCode::UNAUTHORIZED
-        );
-    }
-    assert_eq!(
-        call_from(&h.app, overflow, None, "/pair", bad.clone()).await,
+        .await,
         StatusCode::TOO_MANY_REQUESTS
     );
-    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    assert_eq!(auth::device_count(&h.state.db).await.unwrap(), 0);
+    let other = auth::create_pairing_code(&h.state.db).await.unwrap();
     assert_eq!(
-        call_from(&h.app, overflow, None, "/pair", json!({"code": code})).await,
+        call_from(
+            &h.app,
+            "198.51.100.7:4000",
+            None,
+            "/pair",
+            json!({"code":other})
+        )
+        .await,
         StatusCode::OK
     );
-    // A brand-new source with a valid code still pairs.
-    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
-    let ok = call_from(
-        &h.app,
-        "192.0.2.77:4000",
-        None,
-        "/pair",
-        json!({"code": code}),
-    )
-    .await;
-    assert_eq!(ok, StatusCode::OK);
 }
 
 #[tokio::test]
-async fn overflow_pair_guesses_are_bounded_without_rejecting_valid_code() {
+async fn successful_pairings_do_not_consume_failure_budget() {
     let h = harness().await;
-    let bad = json!({"code": "AAAA-BBBB"});
-    for n in 1..=auth::MAX_SOURCES as u32 {
-        let src = format!("198.51.{}.{}:4000", (n / 256) % 256, n % 256);
+    for _ in 0..8 {
+        let code = auth::create_pairing_code(&h.state.db).await.unwrap();
         assert_eq!(
-            call_from(&h.app, &src, None, "/pair", bad.clone()).await,
+            call_from(
+                &h.app,
+                "203.0.113.8:5000",
+                None,
+                "/pair",
+                json!({"code":code})
+            )
+            .await,
+            StatusCode::OK
+        );
+    }
+    let failures: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(failures), 0) FROM pair_rate_limits")
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(failures, 0);
+}
+
+#[tokio::test]
+async fn saturated_live_table_rejects_one_hundred_attempts_before_code_validation() {
+    let h = harness().await;
+    for n in 0..auth::MAX_SOURCES as u32 {
+        let source = format!("198.51.{}.{}:4000", (n / 256) % 256, n % 256);
+        assert_eq!(
+            call_from(&h.app, &source, None, "/pair", json!({"code":"invalid"})).await,
             StatusCode::UNAUTHORIZED
         );
     }
-    let overflow = "192.0.2.220:4000";
+    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
     for _ in 0..100 {
         assert_eq!(
-            call_from(&h.app, overflow, None, "/pair", bad.clone()).await,
+            call_from(
+                &h.app,
+                "192.0.2.222:4000",
+                None,
+                "/pair",
+                json!({"code":code})
+            )
+            .await,
             StatusCode::TOO_MANY_REQUESTS
         );
     }
-
-    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
-    assert_eq!(
-        call_from(
-            &h.app,
-            "192.0.2.221:4000",
-            None,
-            "/pair",
-            json!({"code": code})
-        )
-        .await,
-        StatusCode::OK
-    );
-}
-
-#[tokio::test]
-async fn valid_pairing_at_full_source_capacity_is_not_rejected_by_storage_limit() {
-    let h = harness().await;
-    let bad = json!({"code": "AAAA-BBBB"});
-    for n in 1..=auth::MAX_SOURCES as u32 {
-        let src = format!("198.51.{}.{}:4000", (n / 256) % 256, n % 256);
-        call_from(&h.app, &src, None, "/pair", bad.clone()).await;
-    }
-    for n in 0..5 {
-        let src = format!("192.0.2.{}:4000", 10 + n);
-        assert_eq!(
-            call_from(&h.app, &src, None, "/pair", bad.clone()).await,
-            StatusCode::TOO_MANY_REQUESTS
-        );
-        assert_eq!(
-            call_from(&h.app, &src, None, "/pair", bad.clone()).await,
-            StatusCode::TOO_MANY_REQUESTS
-        );
-    }
+    assert_eq!(auth::device_count(&h.state.db).await.unwrap(), 0);
     assert_eq!(
         auth::pair_failure_count(&h.state.db).await.unwrap(),
         auth::MAX_SOURCES
     );
-    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
-    assert_eq!(
-        call_from(
-            &h.app,
-            "192.0.2.99:4000",
-            None,
-            "/pair",
-            json!({"code": code})
-        )
-        .await,
-        StatusCode::OK
-    );
 }
 
 #[tokio::test]
-async fn a_valid_code_from_a_source_with_five_previous_failures_is_still_redeemed() {
+async fn expired_capacity_is_reclaimed_without_evicting_live_budgets() {
     let h = harness().await;
-    let source = "192.0.2.177:4000";
-    let bad = json!({"code": "AAAA-BBBB"});
-    for _ in 0..5 {
+    for n in 0..auth::MAX_SOURCES as u32 {
+        let source = format!("198.51.{}.{}:4000", (n / 256) % 256, n % 256);
         assert_eq!(
-            call_from(&h.app, source, None, "/pair", bad.clone()).await,
+            call_from(&h.app, &source, None, "/pair", json!({"code":"invalid"})).await,
             StatusCode::UNAUTHORIZED
         );
     }
-    assert_eq!(
-        call_from(&h.app, source, None, "/pair", bad).await,
-        StatusCode::TOO_MANY_REQUESTS
-    );
-    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
-    assert_eq!(
-        call_from(&h.app, source, None, "/pair", json!({"code": code})).await,
-        StatusCode::OK
-    );
-}
-
-#[tokio::test]
-async fn expired_source_rows_are_reclaimed_before_capacity_denies_new_sources() {
-    let h = harness().await;
-    let bad = json!({"code": "AAAA-BBBB"});
-    for n in 1..=auth::MAX_SOURCES as u32 {
-        let src = format!("198.51.{}.{}:4000", (n / 256) % 256, n % 256);
-        call_from(&h.app, &src, None, "/pair", bad.clone()).await;
-    }
-    assert_eq!(
-        auth::pair_failure_count(&h.state.db).await.unwrap(),
-        auth::MAX_SOURCES
-    );
-    sqlx::query("UPDATE pair_rate_limits SET updated_at = 0, window_started_at = 0")
+    sqlx::query("UPDATE pair_rate_limits SET window_started_at=0, updated_at=0")
         .execute(&h.state.db)
         .await
         .unwrap();
-    assert_eq!(
-        call_from(&h.app, "192.0.2.201:4000", None, "/pair", bad).await,
-        StatusCode::UNAUTHORIZED
-    );
-    assert_eq!(auth::pair_failure_count(&h.state.db).await.unwrap(), 1);
-}
-
-#[tokio::test]
-async fn saturated_live_source_table_preserves_existing_budgets_and_allows_valid_pairing() {
-    let h = harness().await;
-    let bad = json!({"code": "AAAA-BBBB"});
-    for n in 1..=auth::MAX_SOURCES as u32 {
-        let src = format!("198.51.{}.{}:4000", (n / 256) % 256, n % 256);
-        call_from(&h.app, &src, None, "/pair", bad.clone()).await;
-    }
-    let source = "192.0.2.190:4000";
-    for _ in 0..5 {
-        assert_eq!(
-            call_from(&h.app, source, None, "/pair", bad.clone()).await,
-            StatusCode::TOO_MANY_REQUESTS
-        );
-    }
-    assert_eq!(
-        call_from(&h.app, source, None, "/pair", bad.clone()).await,
-        StatusCode::TOO_MANY_REQUESTS
-    );
-    assert_eq!(
-        call_from(&h.app, source, None, "/pair", bad).await,
-        StatusCode::TOO_MANY_REQUESTS
-    );
     let code = auth::create_pairing_code(&h.state.db).await.unwrap();
     assert_eq!(
         call_from(
             &h.app,
-            "192.0.2.222:4000",
+            "192.0.2.201:4000",
             None,
             "/pair",
-            json!({"code": code})
+            json!({"code":code})
         )
         .await,
         StatusCode::OK
     );
-    assert_eq!(
-        auth::pair_failure_count(&h.state.db).await.unwrap(),
-        auth::MAX_SOURCES
-    );
 }
 
 #[tokio::test]
-async fn saturated_untracked_source_cannot_guess_repeatedly_and_valid_code_is_not_consumed() {
+async fn concurrent_guesses_have_atomic_five_attempt_limit() {
     let h = harness().await;
-    let bad = json!({"code": "AAAA-BBBB"});
-    for n in 1..=auth::MAX_SOURCES as u32 {
-        let src = format!("198.51.{}.{}:4000", (n / 256) % 256, n % 256);
-        call_from(&h.app, &src, None, "/pair", bad.clone()).await;
-    }
-    let source = "192.0.2.250:4000";
-    for _ in 0..100 {
-        assert_eq!(
-            call_from(&h.app, source, None, "/pair", bad.clone()).await,
-            StatusCode::TOO_MANY_REQUESTS
-        );
-    }
-    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
-    assert_eq!(
-        call_from(&h.app, source, None, "/pair", json!({"code": code})).await,
-        StatusCode::OK
-    );
-    assert_eq!(
-        auth::pair_failure_count(&h.state.db).await.unwrap(),
-        auth::MAX_SOURCES
-    );
-}
-
-#[tokio::test]
-async fn reused_or_expired_pairing_codes_are_counted_as_failures_not_successes() {
-    let h = harness().await;
-    let source = "192.0.2.230:4000";
-    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
-    assert_eq!(
-        call_from(&h.app, source, None, "/pair", json!({"code": code})).await,
-        StatusCode::OK
-    );
-    for _ in 0..auth::MAX_FAILURES {
-        assert_eq!(
-            call_from(&h.app, source, None, "/pair", json!({"code": code})).await,
-            StatusCode::UNAUTHORIZED
-        );
-    }
-    assert_eq!(
-        call_from(&h.app, source, None, "/pair", json!({"code": code})).await,
-        StatusCode::TOO_MANY_REQUESTS
-    );
-}
-
-#[tokio::test]
-async fn concurrent_pair_guesses_from_one_source_have_one_atomic_budget() {
-    let h = harness().await;
-    let app = h.app.clone();
-    let mut requests = Vec::new();
+    let mut tasks = Vec::new();
     for _ in 0..20 {
-        let app = app.clone();
-        requests.push(tokio::spawn(async move {
+        let app = h.app.clone();
+        tasks.push(tokio::spawn(async move {
             call_from(
                 &app,
                 "192.0.2.240:4000",
                 None,
                 "/pair",
-                json!({"code": "AAAA-BBBB"}),
+                json!({"code":"invalid"}),
             )
             .await
         }));
     }
-    let mut unauthorized = 0;
+    let mut invalid = 0;
     let mut throttled = 0;
-    for request in requests {
-        match request.await.unwrap() {
-            StatusCode::UNAUTHORIZED => unauthorized += 1,
+    for task in tasks {
+        match task.await.unwrap() {
+            StatusCode::UNAUTHORIZED => invalid += 1,
             StatusCode::TOO_MANY_REQUESTS => throttled += 1,
-            other => panic!("unexpected concurrent response: {other}"),
+            other => panic!("unexpected status {other}"),
         }
     }
-    assert_eq!(unauthorized, auth::MAX_FAILURES as usize);
-    assert_eq!(throttled, 20 - unauthorized);
-    assert_eq!(auth::pair_failure_count(&h.state.db).await.unwrap(), 1);
+    assert_eq!(invalid, 5);
+    assert_eq!(throttled, 15);
 }
 
 #[tokio::test]
@@ -927,4 +846,254 @@ fn client_ip_resolution() {
     );
     assert!(TrustedProxy::parse("10.0.0.0/33").is_none());
     assert!(TrustedProxy::parse("nope").is_none());
+}
+
+#[tokio::test]
+async fn todo_ticked_on_an_earlier_day_gets_no_reminder() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    let mut todo = item(C1, "todo", "Pay rent", 127, Some("17:15"), now);
+    todo["due_date"] = json!("2026-10-19");
+    let mut other = item(H1, "todo", "Book dentist", 127, Some("17:15"), now);
+    other["due_date"] = json!("2026-10-19");
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({
+            "items": [todo, other],
+            // C1 was ticked yesterday, ahead of its due date.
+            "completions": [comp(C1, "2026-10-18", now, None)]
+        })),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&tok),
+        Some(json!({"fcm_token": "fcm-token-1"})),
+    )
+    .await;
+
+    assert_eq!(push::tick(&h.state, perth(17, 16)).await.unwrap(), 1);
+    let titles: Vec<String> = h
+        .mock
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| m.title.clone())
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["Book dentist"],
+        "only the untouched to-do is reminded"
+    );
+}
+
+#[tokio::test]
+async fn un_ticked_todo_completion_does_not_suppress_the_reminder() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    let mut todo = item(C1, "todo", "Pay rent", 127, Some("17:15"), now);
+    todo["due_date"] = json!("2026-10-19");
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({
+            "items": [todo],
+            "completions": [comp(C1, "2026-10-18", now, Some(now))]
+        })),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&tok),
+        Some(json!({"fcm_token": "fcm-token-1"})),
+    )
+    .await;
+    assert_eq!(push::tick(&h.state, perth(17, 16)).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn quiet_hours_longer_than_grace_defer_the_reminder_to_when_they_end() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    // 22:30 chore every day; quiet hours 22:00-07:00 (9h, longer than the 6h grace).
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [item(C1, "chore", "Night", 127, Some("22:30"), now)]})),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&tok),
+        Some(json!({"fcm_token": "fcm-token-1"})),
+    )
+    .await;
+    let (s, _) = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"quiet_start": "22:00", "quiet_end": "07:00"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    assert_eq!(
+        push::tick(&h.state, perth(22, 31)).await.unwrap(),
+        0,
+        "quiet"
+    );
+    let next = |h: u32, m: u32| perth(h, m) + Duration::days(1);
+    assert_eq!(
+        push::tick(&h.state, next(4, 31)).await.unwrap(),
+        0,
+        "still quiet, past the old grace cutoff"
+    );
+    assert_eq!(push::tick(&h.state, next(6, 59)).await.unwrap(), 0);
+    assert_eq!(
+        push::tick(&h.state, next(7, 1)).await.unwrap(),
+        1,
+        "released when quiet hours end"
+    );
+    {
+        let sent = h.mock.sent.lock().unwrap();
+        assert_eq!(
+            sent[0].data["date"], "2026-10-19",
+            "keeps the date it was scheduled for"
+        );
+    }
+    assert_eq!(
+        push::tick(&h.state, next(7, 2)).await.unwrap(),
+        0,
+        "only once"
+    );
+}
+
+#[tokio::test]
+async fn held_reminder_still_expires_after_grace_from_the_end_of_quiet_hours() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [item(C1, "chore", "Night", 127, Some("22:30"), now)]})),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&tok),
+        Some(json!({"fcm_token": "fcm-token-1"})),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"quiet_start": "22:00", "quiet_end": "07:00"})),
+    )
+    .await;
+    // Server was down until 14:00 the next day: the held reminder is stale, not sent that late.
+    assert_eq!(
+        push::tick(&h.state, perth(14, 0) + Duration::days(1))
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn ordinary_missed_reminder_is_not_carried_past_midnight() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [item(C1, "chore", "Late", 127, Some("23:00"), now)]})),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&tok),
+        Some(json!({"fcm_token": "fcm-token-1"})),
+    )
+    .await;
+    assert_eq!(
+        push::tick(&h.state, perth(0, 30) + Duration::days(1))
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn half_set_quiet_window_is_rejected() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let (s, _) = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"quiet_start": "22:00"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (_, v) = call(&h.app, "GET", "/settings", Some(&tok), None).await;
+    assert_eq!(v["quiet_start"], "", "nothing was stored");
+    let (s, _) = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"quiet_start": "22:00", "quiet_end": "07:00"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"quiet_end": ""})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "clearing only one end");
+    let (s, v) = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"quiet_start": "", "quiet_end": ""})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["quiet_start"], "");
 }

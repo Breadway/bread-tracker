@@ -7,7 +7,7 @@ use axum::extract::{Query, State};
 use axum::middleware;
 use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
-use chrono::{NaiveDate, NaiveTime, Utc};
+use chrono::{NaiveDate, NaiveTime, Offset, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -60,34 +60,16 @@ async fn pair(
     ClientIp(src): ClientIp,
     Json(req): Json<PairReq>,
 ) -> ApiResult<Json<PairResp>> {
-    // At durable-table capacity, reject invalid-source admission before trying
-    // codes. This bounds guesses even for sources that cannot get a row, while
-    // checking known blocked sources against valid codes still cannot consume one.
-    let source_capacity_exhausted = auth::source_capacity_exhausted(&st.db, src).await?;
-    let code_exists = if source_capacity_exhausted {
-        Some(auth::pairing_code_exists(&st.db, &req.code).await?)
-    } else {
-        None
-    };
-    if code_exists == Some(false) {
-        return Err(ApiError::TooManyRequests);
-    }
     let name = if req.device_name.trim().is_empty() {
         "Android"
     } else {
         req.device_name.trim()
     };
     let name: String = name.chars().take(80).collect();
-    match auth::redeem(&st.db, &req.code, &name).await? {
-        Some((device_id, token)) => Ok(Json(PairResp { device_id, token })),
-        None => {
-            // The failure budget is charged only after redeem confirms the code
-            // was invalid; this never consumes a valid single-use code on 429.
-            if code_exists.is_none() && auth::record_pair_failure(&st.db, src).await? {
-                return Err(ApiError::TooManyRequests);
-            }
-            Err(ApiError::Unauthorized)
-        }
+    match auth::pair_with_limit(&st.db, src, &req.code, &name).await? {
+        auth::PairAttempt::Paired(device_id, token) => Ok(Json(PairResp { device_id, token })),
+        auth::PairAttempt::InvalidCode => Err(ApiError::Unauthorized),
+        auth::PairAttempt::Throttled => Err(ApiError::TooManyRequests),
     }
 }
 
@@ -184,11 +166,24 @@ struct Settings {
     quiet_start: String,
     quiet_end: String,
     reminders_enabled: bool,
+    /// The timezone's current offset from UTC in minutes. Read only: lets a client compare
+    /// the server's zone with the phone's without carrying a timezone database.
+    #[serde(default)]
+    utc_offset_minutes: i64,
 }
 
 async fn load_settings(st: &AppState) -> ApiResult<Settings> {
+    let timezone = store::get_setting(&st.db, "timezone").await?;
+    let tz = Tz::from_str(&timezone).unwrap_or(chrono_tz::Australia::Perth);
+    let utc_offset_minutes = Utc::now()
+        .with_timezone(&tz)
+        .offset()
+        .fix()
+        .local_minus_utc() as i64
+        / 60;
     Ok(Settings {
-        timezone: store::get_setting(&st.db, "timezone").await?,
+        utc_offset_minutes,
+        timezone,
         quiet_start: store::get_setting(&st.db, "quiet_start").await?,
         quiet_end: store::get_setting(&st.db, "quiet_end").await?,
         reminders_enabled: store::get_setting(&st.db, "reminders_enabled").await? == "1",
@@ -215,23 +210,57 @@ async fn put_settings(
     State(st): State<AppState>,
     Json(p): Json<SettingsPatch>,
 ) -> ApiResult<Json<Settings>> {
+    // Validate the complete resulting object before mutating any settings.
+    let mut tx = st.db.begin_with("BEGIN IMMEDIATE").await?;
+    let current: HashMap<String, String> = sqlx::query_as("SELECT key, value FROM settings")
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .collect();
+    let cur = Settings {
+        timezone: current
+            .get("timezone")
+            .cloned()
+            .unwrap_or_else(|| "Australia/Perth".into()),
+        quiet_start: current.get("quiet_start").cloned().unwrap_or_default(),
+        quiet_end: current.get("quiet_end").cloned().unwrap_or_default(),
+        reminders_enabled: current.get("reminders_enabled").is_none_or(|v| v == "1"),
+        // This value is read-only response metadata, not persisted settings.
+        utc_offset_minutes: 0,
+    };
+    let start = p.quiet_start.clone().unwrap_or(cur.quiet_start);
+    let end = p.quiet_end.clone().unwrap_or(cur.quiet_end);
+    if start.is_empty() != end.is_empty() {
+        return Err(ApiError::BadRequest(
+            "quiet_start and quiet_end must both be set or both be empty".into(),
+        ));
+    }
+    if !valid_time_or_empty(&start) || !valid_time_or_empty(&end) {
+        return Err(ApiError::BadRequest(
+            "quiet hours must be HH:MM or empty".into(),
+        ));
+    }
     if let Some(tz) = &p.timezone {
         Tz::from_str(tz).map_err(|_| ApiError::BadRequest("unknown timezone".into()))?;
-        store::set_setting(&st.db, "timezone", tz).await?;
     }
-    for (key, val) in [("quiet_start", &p.quiet_start), ("quiet_end", &p.quiet_end)] {
-        if let Some(v) = val {
-            if !valid_time_or_empty(v) {
-                return Err(ApiError::BadRequest(format!(
-                    "{key} must be HH:MM or empty"
-                )));
-            }
-            store::set_setting(&st.db, key, v).await?;
-        }
+
+    if let Some(tz) = &p.timezone {
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('timezone', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+            .bind(tz).execute(&mut *tx).await?;
+    }
+    if p.quiet_start.is_some() {
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('quiet_start', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+            .bind(&start).execute(&mut *tx).await?;
+    }
+    if p.quiet_end.is_some() {
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('quiet_end', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+            .bind(&end).execute(&mut *tx).await?;
     }
     if let Some(on) = p.reminders_enabled {
-        store::set_setting(&st.db, "reminders_enabled", if on { "1" } else { "0" }).await?;
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('reminders_enabled', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+            .bind(if on { "1" } else { "0" }).execute(&mut *tx).await?;
     }
+    tx.commit().await?;
     Ok(Json(load_settings(&st).await?))
 }
 

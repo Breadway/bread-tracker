@@ -57,25 +57,59 @@ pub async fn create_pairing_code(db: &Db) -> Result<String, sqlx::Error> {
     Ok(format!("{}-{}", &raw[..4], &raw[4..]))
 }
 
-/// Redeem a code (single use). Returns `(device_id, token)` on success.
-pub async fn redeem(
+/// Redeem a pairing code under the durable per-source attempt budget.
+/// The writer transaction serializes admission, validation, and accounting across
+/// processes, so a crash rolls back both code use and its paired budget update.
+pub async fn pair_with_limit(
     db: &Db,
+    source: IpAddr,
     code: &str,
     device_name: &str,
-) -> Result<Option<(String, String)>, sqlx::Error> {
+) -> Result<PairAttempt, sqlx::Error> {
+    let now = now_ms();
+    let source = source.to_string();
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    sqlx::query("DELETE FROM pair_rate_limits WHERE window_started_at <= ?")
+        .bind(now.saturating_sub(FAILURE_WINDOW_MS))
+        .execute(&mut *tx)
+        .await?;
+    let existing: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT failures, window_started_at FROM pair_rate_limits WHERE source_ip = ?",
+    )
+    .bind(&source)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((failures, started)) = existing {
+        if now.saturating_sub(started) < FAILURE_WINDOW_MS && failures >= MAX_FAILURES {
+            tx.commit().await?;
+            return Ok(PairAttempt::Throttled);
+        }
+    } else {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pair_rate_limits")
+            .fetch_one(&mut *tx)
+            .await?;
+        if count >= MAX_SOURCES {
+            tx.commit().await?;
+            return Ok(PairAttempt::Throttled);
+        }
+    }
+    sqlx::query("INSERT INTO pair_rate_limits (source_ip, failures, window_started_at, updated_at) VALUES (?, 1, ?, ?) ON CONFLICT(source_ip) DO UPDATE SET failures = CASE WHEN pair_rate_limits.window_started_at <= ? THEN 1 ELSE pair_rate_limits.failures + 1 END, window_started_at = CASE WHEN pair_rate_limits.window_started_at <= ? THEN excluded.window_started_at ELSE pair_rate_limits.window_started_at END, updated_at = excluded.updated_at")
+        .bind(&source).bind(now).bind(now).bind(now.saturating_sub(FAILURE_WINDOW_MS)).bind(now.saturating_sub(FAILURE_WINDOW_MS))
+        .execute(&mut *tx).await?;
+
     let used: Option<String> = sqlx::query_scalar(
         "DELETE FROM pairing_codes WHERE code_hash = ? AND expires_at > ? RETURNING code_hash",
     )
     .bind(hash(&normalize_code(code)))
-    .bind(now_ms())
-    .fetch_optional(db)
+    .bind(now)
+    .fetch_optional(&mut *tx)
     .await?;
-    if used.is_none() {
-        return Ok(None);
-    }
+    let Some(_) = used else {
+        tx.commit().await?;
+        return Ok(PairAttempt::InvalidCode);
+    };
     let id = uuid::Uuid::new_v4().to_string();
     let token = random_token();
-    let now = now_ms();
     sqlx::query(
         "INSERT INTO devices (id, name, token_hash, created_at, last_seen) VALUES (?, ?, ?, ?, ?)",
     )
@@ -84,9 +118,32 @@ pub async fn redeem(
     .bind(hash(&token))
     .bind(now)
     .bind(now)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
-    Ok(Some((id, token)))
+    let current: i64 =
+        sqlx::query_scalar("SELECT failures FROM pair_rate_limits WHERE source_ip = ?")
+            .bind(&source)
+            .fetch_one(&mut *tx)
+            .await?;
+    if current <= 1 {
+        sqlx::query("DELETE FROM pair_rate_limits WHERE source_ip = ?")
+            .bind(&source)
+            .execute(&mut *tx)
+            .await?;
+    } else {
+        sqlx::query("UPDATE pair_rate_limits SET failures = failures - 1 WHERE source_ip = ?")
+            .bind(&source)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(PairAttempt::Paired(id, token))
+}
+
+pub enum PairAttempt {
+    Throttled,
+    InvalidCode,
+    Paired(String, String),
 }
 
 pub async fn device_count(db: &Db) -> Result<i64, sqlx::Error> {
@@ -95,110 +152,20 @@ pub async fn device_count(db: &Db) -> Result<i64, sqlx::Error> {
         .await
 }
 
-/// Durable per-source failed-attempt budgets shared across server processes. Successful
-/// pairing attempts do not consume a budget. Storage holds at most 1,024 source rows;
-/// at capacity new invalid sources are refused until expired rows are reclaimed.
+/// Durable per-source failed-attempt budgets shared across processes.
 pub const MAX_SOURCES: i64 = 1024;
 pub const FAILURE_WINDOW_MS: i64 = 600_000;
 pub const MAX_FAILURES: i64 = 5;
 
-/// Record an invalid attempt transactionally; return true when the source is
-/// already blocked. SQLite serializes competing writers across requests/processes.
-pub async fn record_pair_failure(db: &Db, source: IpAddr) -> Result<bool, sqlx::Error> {
-    let now = now_ms();
-    let source = source.to_string();
-    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
-    let existing: Option<(i64, i64)> = sqlx::query_as(
-        "SELECT failures, window_started_at FROM pair_rate_limits WHERE source_ip = ?",
-    )
-    .bind(&source)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    if let Some((failures, started)) = existing {
-        if now.saturating_sub(started) < FAILURE_WINDOW_MS {
-            if failures >= MAX_FAILURES {
-                tx.commit().await?;
-                return Ok(true);
-            }
-            sqlx::query("UPDATE pair_rate_limits SET failures = failures + 1, updated_at = ? WHERE source_ip = ?")
-                .bind(now).bind(&source).execute(&mut *tx).await?;
-            tx.commit().await?;
-            return Ok(false);
-        }
-        sqlx::query("UPDATE pair_rate_limits SET failures = 1, window_started_at = ?, updated_at = ? WHERE source_ip = ?")
-            .bind(now).bind(now).bind(&source).execute(&mut *tx).await?;
-        tx.commit().await?;
-        return Ok(false);
-    }
-
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pair_rate_limits")
-        .fetch_one(&mut *tx)
-        .await?;
-    if count >= MAX_SOURCES {
-        sqlx::query("DELETE FROM pair_rate_limits WHERE window_started_at <= ?")
-            .bind(now.saturating_sub(FAILURE_WINDOW_MS))
-            .execute(&mut *tx)
-            .await?;
-        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pair_rate_limits")
-            .fetch_one(&mut *tx)
-            .await?;
-        if remaining < MAX_SOURCES {
-            sqlx::query("INSERT INTO pair_rate_limits (source_ip, failures, window_started_at, updated_at) VALUES (?, 1, ?, ?)")
-                .bind(&source).bind(now).bind(now).execute(&mut *tx).await?;
-            tx.commit().await?;
-            return Ok(false);
-        }
-        tx.commit().await?;
-        return Ok(true);
-    }
-    sqlx::query("INSERT INTO pair_rate_limits (source_ip, failures, window_started_at, updated_at) VALUES (?, 1, ?, ?)")
-        .bind(&source).bind(now).bind(now).execute(&mut *tx).await?;
-    tx.commit().await?;
-    Ok(false)
-}
-
-/// Refuse attempts from a new source when every durable per-source slot is
-/// occupied. Existing sources retain their own failure counters. This check is
-/// only an early admission fast path; record_pair_failure repeats the cap check
-/// transactionally after an invalid redemption to handle concurrent admission.
-pub async fn source_capacity_exhausted(db: &Db, source: IpAddr) -> Result<bool, sqlx::Error> {
-    let source = source.to_string();
-    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
-    let known: i64 =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pair_rate_limits WHERE source_ip = ?)")
-            .bind(&source)
-            .fetch_one(&mut *tx)
-            .await?;
-    if known != 0 {
-        tx.commit().await?;
-        return Ok(false);
-    }
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pair_rate_limits")
-        .fetch_one(&mut *tx)
-        .await?;
-    if count >= MAX_SOURCES {
-        sqlx::query("DELETE FROM pair_rate_limits WHERE window_started_at <= ?")
-            .bind(now_ms().saturating_sub(FAILURE_WINDOW_MS))
-            .execute(&mut *tx)
-            .await?;
-    }
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pair_rate_limits")
-        .fetch_one(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(count >= MAX_SOURCES)
-}
-
 pub async fn cleanup_pair_failures(db: &Db) -> Result<u64, sqlx::Error> {
     let cutoff = now_ms().saturating_sub(FAILURE_WINDOW_MS);
-    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
-    let result = sqlx::query("DELETE FROM pair_rate_limits WHERE window_started_at <= ?")
-        .bind(cutoff)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(result.rows_affected())
+    Ok(
+        sqlx::query("DELETE FROM pair_rate_limits WHERE window_started_at <= ?")
+            .bind(cutoff)
+            .execute(db)
+            .await?
+            .rows_affected(),
+    )
 }
 
 pub async fn pairing_code_exists(db: &Db, code: &str) -> Result<bool, sqlx::Error> {
@@ -228,50 +195,122 @@ mod limiter_tests {
         IpAddr::V4(Ipv4Addr::from(n))
     }
 
-    #[tokio::test]
-    async fn sqlite_budget_is_per_source_persistent_and_capped() {
-        let db = connect_memory().await.unwrap();
-        for _ in 0..MAX_FAILURES {
-            assert!(!record_pair_failure(&db, ip(1)).await.unwrap());
-        }
-        assert!(record_pair_failure(&db, ip(1)).await.unwrap());
-        assert!(!record_pair_failure(&db, ip(2)).await.unwrap());
-        assert_eq!(pair_failure_count(&db).await.unwrap(), 2);
+    async fn issue_code(db: &Db) -> String {
+        create_pairing_code(db).await.unwrap()
     }
 
     #[tokio::test]
-    async fn simultaneous_same_source_failures_cannot_exceed_budget() {
+    async fn simultaneous_pair_validations_are_serialized_and_limited() {
         let db = connect_memory().await.unwrap();
+        let code = issue_code(&db).await;
         let mut tasks = Vec::new();
         for _ in 0..20 {
             let db = db.clone();
+            let code = code.clone();
+            let guess = format!("bad-{code}");
             tasks.push(tokio::spawn(async move {
-                record_pair_failure(&db, ip(3)).await.unwrap()
+                pair_with_limit(&db, ip(3), &guess, "test").await.unwrap()
             }));
         }
-        let mut allowed = 0;
+        let mut throttled = 0;
         for task in tasks {
-            if !task.await.unwrap() {
-                allowed += 1;
+            match task.await.unwrap() {
+                PairAttempt::Throttled => throttled += 1,
+                PairAttempt::Paired(..) | PairAttempt::InvalidCode => {}
             }
         }
-        assert_eq!(allowed, MAX_FAILURES as usize);
+        assert_eq!(throttled, 15);
+        assert_eq!(device_count(&db).await.unwrap(), 0);
         assert_eq!(pair_failure_count(&db).await.unwrap(), 1);
     }
 
     #[tokio::test]
-    async fn expired_budget_is_reset_and_expired_rows_are_cleaned() {
+    async fn invalid_codes_charge_budget_and_valid_pair_does_not() {
+        let db = connect_memory().await.unwrap();
+        for n in 0..MAX_FAILURES {
+            let result = pair_with_limit(&db, ip(4), "invalid", "test")
+                .await
+                .unwrap();
+            if n < MAX_FAILURES - 1 {
+                assert!(matches!(result, PairAttempt::InvalidCode));
+            }
+        }
+        let code = issue_code(&db).await;
+        assert!(matches!(
+            pair_with_limit(&db, ip(4), &code, "test").await.unwrap(),
+            PairAttempt::Throttled
+        ));
+        assert_eq!(device_count(&db).await.unwrap(), 0);
+
+        let successful = issue_code(&db).await;
+        assert!(matches!(
+            pair_with_limit(&db, ip(5), &successful, "test")
+                .await
+                .unwrap(),
+            PairAttempt::Paired(..)
+        ));
+        let success_budget: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pair_rate_limits WHERE source_ip = ?")
+                .bind(ip(5).to_string())
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(success_budget, 0);
+        let _ = pair_with_limit(&db, ip(5), "invalid", "test")
+            .await
+            .unwrap();
+        let code = issue_code(&db).await;
+        assert!(matches!(
+            pair_with_limit(&db, ip(5), &code, "test").await.unwrap(),
+            PairAttempt::Paired(..)
+        ));
+        let sum: i64 =
+            sqlx::query_scalar("SELECT failures FROM pair_rate_limits WHERE source_ip = ?")
+                .bind(ip(5).to_string())
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(sum, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_device_insert_rolls_back_code_and_budget_charge() {
+        let db = connect_memory().await.unwrap();
+        let code = issue_code(&db).await;
+        sqlx::query("CREATE TRIGGER reject_test_device BEFORE INSERT ON devices BEGIN SELECT RAISE(ABORT, 'test failure'); END")
+            .execute(&db).await.unwrap();
+        assert!(pair_with_limit(&db, ip(7), &code, "test").await.is_err());
+        sqlx::query("DROP TRIGGER reject_test_device")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert!(auth_code_exists(&db, &code).await);
+        assert_eq!(pair_failure_count(&db).await.unwrap(), 0);
+    }
+
+    async fn auth_code_exists(db: &Db, code: &str) -> bool {
+        pairing_code_exists(db, code).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn crash_after_committed_bad_attempt_expires_with_window() {
         let db = connect_memory().await.unwrap();
         for _ in 0..MAX_FAILURES {
-            assert!(!record_pair_failure(&db, ip(4)).await.unwrap());
+            let _ = pair_with_limit(&db, ip(6), "wrong", "test").await.unwrap();
         }
-        sqlx::query("UPDATE pair_rate_limits SET updated_at = 0, window_started_at = 0")
+        assert!(matches!(
+            pair_with_limit(&db, ip(6), "wrong", "test").await.unwrap(),
+            PairAttempt::Throttled
+        ));
+        sqlx::query("UPDATE pair_rate_limits SET window_started_at = 0, updated_at = 0")
             .execute(&db)
             .await
             .unwrap();
         assert_eq!(cleanup_pair_failures(&db).await.unwrap(), 1);
-        assert!(!record_pair_failure(&db, ip(4)).await.unwrap());
-        assert_eq!(pair_failure_count(&db).await.unwrap(), 1);
+        assert!(matches!(
+            pair_with_limit(&db, ip(6), "wrong", "test").await.unwrap(),
+            PairAttempt::InvalidCode
+        ));
     }
 
     #[tokio::test]
@@ -288,7 +327,26 @@ mod limiter_tests {
             .connect_with(options)
             .await
             .unwrap();
-        sqlx::migrate!("../migrations").run(&db).await.unwrap();
+        let migration_0001 = include_str!("../../migrations/0001_init.sql");
+        for statement in migration_0001
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            sqlx::query(statement).execute(&db).await.unwrap();
+        }
+        sqlx::query("CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL)")
+            .execute(&db).await.unwrap();
+        let migration = sqlx::migrate::Migration::new(
+            1,
+            std::borrow::Cow::Borrowed("init"),
+            sqlx::migrate::MigrationType::Simple,
+            std::borrow::Cow::Borrowed(migration_0001),
+            false,
+        );
+        sqlx::query("INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (?, ?, 1, ?, 0)")
+            .bind(migration.version).bind(migration.description.as_ref()).bind(migration.checksum.as_ref())
+            .execute(&db).await.unwrap();
         sqlx::query("INSERT INTO items (id, kind, name, points, updated_at, seq) VALUES ('keep', 'chore', 'Existing', 2, 1, 1)")
             .execute(&db).await.unwrap();
         db.close().await;
@@ -307,7 +365,12 @@ mod limiter_tests {
             .unwrap();
         assert_eq!(row, ("keep".to_owned(), "Existing".to_owned()));
         assert_eq!(pair_failure_count(&raw).await.unwrap(), 0);
-        assert!(!record_pair_failure(&raw, ip(5)).await.unwrap());
+        assert!(matches!(
+            pair_with_limit(&raw, ip(5), "invalid", "test")
+                .await
+                .unwrap(),
+            PairAttempt::InvalidCode
+        ));
         assert_eq!(pair_failure_count(&raw).await.unwrap(), 1);
     }
 }

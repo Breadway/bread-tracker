@@ -1,6 +1,8 @@
 import 'package:drift/drift.dart' show Value, driftRuntimeOptions;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:tracker/data/api.dart';
 import 'package:tracker/data/database.dart';
@@ -116,6 +118,33 @@ void main() {
     server.reject = false;
     expect(await sync.sync(), SyncStatus.idle);
     expect(await (db.select(db.items)..where((t) => t.dirty.equals(true))).get(), isEmpty);
+  });
+
+  test('non-JSON replies (HTML 502, captive portal 200) report offline, not a crash', () async {
+    for (final (code, body) in [
+      (502, '<html><body>Bad gateway</body></html>'),
+      (503, 'upstream down'),
+      (200, '<html>captive portal</html>'),
+      (200, '[1, 2, 3]'),
+    ]) {
+      SharedPreferences.setMockInitialValues({});
+      final prefs = await SharedPreferences.getInstance();
+      final db = AppDb(NativeDatabase.memory());
+      final store = MemStore(prefs);
+      final client = MockClient((_) async => http.Response(body, code, headers: {'content-type': 'text/html'}));
+      final engine = SyncEngine(db, store, apiFactory: (b, t) => Api(b, token: t, client: client));
+      await db.upsertItem(ItemsCompanion.insert(id: id1, kind: 'habit', name: 'Read', points: 15, updatedAt: 1, dirty: const Value(true)));
+      expect(await engine.sync(), SyncStatus.offline, reason: '$code $body');
+      expect(await (db.select(db.items)..where((t) => t.dirty.equals(true))).get(), hasLength(1), reason: 'row stays dirty');
+      await db.close();
+    }
+  });
+
+  test('Api maps a JSON error body and an HTML error body to ApiException', () async {
+    final json = Api('http://x', token: 't', client: MockClient((_) async => http.Response('{"error":"nope"}', 400)));
+    await expectLater(json.pushTest(), throwsA(isA<ApiException>().having((e) => e.message, 'message', 'nope')));
+    final html = Api('http://x', token: 't', client: MockClient((_) async => http.Response('<html/>', 502)));
+    await expectLater(html.pushTest(), throwsA(isA<ApiException>().having((e) => e.message, 'message', 'Server error 502')));
   });
 
   test('an edit made while a sync is in flight stays dirty', () async {

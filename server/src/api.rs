@@ -7,7 +7,7 @@ use axum::extract::{Query, State};
 use axum::middleware;
 use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
-use chrono::{NaiveDate, NaiveTime, Utc};
+use chrono::{NaiveDate, NaiveTime, Offset, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -164,11 +164,24 @@ struct Settings {
     quiet_start: String,
     quiet_end: String,
     reminders_enabled: bool,
+    /// The timezone's current offset from UTC in minutes. Read only: lets a client compare
+    /// the server's zone with the phone's without carrying a timezone database.
+    #[serde(default)]
+    utc_offset_minutes: i64,
 }
 
 async fn load_settings(st: &AppState) -> ApiResult<Settings> {
+    let timezone = store::get_setting(&st.db, "timezone").await?;
+    let tz = Tz::from_str(&timezone).unwrap_or(chrono_tz::Australia::Perth);
+    let utc_offset_minutes = Utc::now()
+        .with_timezone(&tz)
+        .offset()
+        .fix()
+        .local_minus_utc() as i64
+        / 60;
     Ok(Settings {
-        timezone: store::get_setting(&st.db, "timezone").await?,
+        utc_offset_minutes,
+        timezone,
         quiet_start: store::get_setting(&st.db, "quiet_start").await?,
         quiet_end: store::get_setting(&st.db, "quiet_end").await?,
         reminders_enabled: store::get_setting(&st.db, "reminders_enabled").await? == "1",
@@ -210,6 +223,8 @@ async fn put_settings(
         quiet_start: current.get("quiet_start").cloned().unwrap_or_default(),
         quiet_end: current.get("quiet_end").cloned().unwrap_or_default(),
         reminders_enabled: current.get("reminders_enabled").is_none_or(|v| v == "1"),
+        // This value is read-only response metadata, not persisted settings.
+        utc_offset_minutes: 0,
     };
     let start = p.quiet_start.clone().unwrap_or(cur.quiet_start);
     let end = p.quiet_end.clone().unwrap_or(cur.quiet_end);

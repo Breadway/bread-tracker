@@ -31,8 +31,6 @@ async fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     if command.as_deref() == Some("mark-restored") {
-        let _generation_lock = db::GenerationLock::try_acquire_exclusive(&config.database_path)
-            .context("server is running; stop it before marking a restored database")?;
         if !config.database_path.exists() {
             anyhow::bail!(
                 "database {} does not exist; restore it before marking generation",
@@ -48,32 +46,36 @@ async fn main() -> anyhow::Result<()> {
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or(std::path::Path::new(".")),
         )?;
-        let generation_db = db::connect(&config.database_url())
+        let _generation_lock =
+            db::GenerationLock::try_acquire_lifetime_exclusive(&config.database_path)
+                .context("server is running; stop it before marking a restored database")?;
+        let generation_db = db::connect_existing(&config.database_url())
             .await
             .context("opening database to mark restored generation")?;
-        let generation = uuid::Uuid::new_v4().to_string();
+        let generation = db::next_generation(&config.database_path)?;
         db::mark_restored(&generation_db, &config.database_path, &generation).await?;
         println!("Sync generation rotated. Start the server to resume sync.");
         return Ok(());
     }
 
-    // Hold the exclusive process lock through server lifetime. This serializes startup,
-    // pairing and restore marking and prevents multiple writers with stale generations.
-    let generation_lock = db::GenerationLock::acquire(&config.database_path)?;
-
     if command.as_deref() == Some("pair") {
+        // A serialized SQLite transaction can coexist with a running server.
         let db = db::connect(&config.database_url())
             .await
-            .context("opening database")?;
-        db::reconcile_generation_locked(&db, &config.database_path).await?;
+            .context("opening database for pairing code")?;
         println!("{}", auth::create_pairing_code(&db).await?);
         return Ok(());
     }
 
+    // Serialize generation publication under SQLite's writer lock, then hold the shared
+    // process lock for the lifetime of this server instance.
+    let startup_lock = db::GenerationLock::try_acquire_exclusive(&config.database_path)
+        .context("another server or restore operation already owns this database")?;
     let db = db::connect(&config.database_url())
         .await
         .context("opening database")?;
     let generation = db::reconcile_generation_locked(&db, &config.database_path).await?;
+    let generation_lock = startup_lock;
 
     let sender: Arc<dyn push::PushSender> = match &config.fcm_service_account {
         Some(path) => Arc::new(push::Fcm::from_file(path).context("loading FCM service account")?),

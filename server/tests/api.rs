@@ -1,4 +1,8 @@
+use std::process::{Command, Stdio};
+use std::str::FromStr;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration as StdDuration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -535,7 +539,7 @@ async fn generation_preflight_rejects_dirty_writes_then_returns_full_snapshot() 
     assert_eq!(preflight["items"].as_array().unwrap().len(), 1);
     let (status, accepted) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"since": preflight["cursor"], "epoch": preflight["epoch"], "items": [item(H1, "chore", "dirty", 127, None, now + 1000)]}))).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(accepted["items"].as_array().unwrap().len(), 1);
+    assert_eq!(accepted["items"].as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -554,6 +558,252 @@ async fn legacy_request_against_generation_server_keeps_push_pull_contract() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(pushed["items"][0]["name"], "legacy");
     assert!(pushed["epoch"].as_str().is_some());
+    let legacy_db = db::connect_memory().await.unwrap();
+    sqlx::query("INSERT INTO items (id,kind,name,weekdays,points,sort,active,updated_at,seq) VALUES ('33333333-3333-4333-8333-333333333333','chore','preexisting',127,10,0,1,1,1)")
+        .execute(&legacy_db).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM items")
+            .fetch_one(&legacy_db)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn stale_epoch_rejects_push_before_it_can_mask_restore_sequence_rollback() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    for idx in 0..3 {
+        let id = format!("1111111{idx}-1111-4111-8111-111111111111");
+        call(
+            &h.app,
+            "POST",
+            "/sync",
+            Some(&tok),
+            Some(json!({"items": [item(&id, "chore", "backup", 127, None, now + idx)]})),
+        )
+        .await;
+    }
+    let old_epoch = h.state.generation.read().unwrap().clone();
+    let current: i64 = sqlx::query_scalar("SELECT val FROM meta WHERE key='seq'")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert!(current >= 3);
+    *h.state.generation.write().unwrap() = "rotated-with-cursor-past-client".to_owned();
+    let dirty_id = "22222222-2222-4222-8222-222222222222";
+    let (status, _) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"since": 3, "epoch": old_epoch, "items": [item(dirty_id, "chore", "offline", 127, None, now + 1000)]}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE id=?")
+        .bind(dirty_id)
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "stale generation request must be rejected before dirty rows are inserted"
+    );
+    let (_, snapshot) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"since": 3, "epoch": old_epoch})),
+    )
+    .await;
+    assert_eq!(snapshot["items"].as_array().unwrap().len(), 3);
+    assert_ne!(snapshot["epoch"], old_epoch);
+}
+
+#[tokio::test]
+async fn populated_old_wire_client_and_missing_optional_fields_remain_compatible() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy-wire.db");
+    let database_url = format!("sqlite://{}", path.display());
+    let legacy_options = sqlx::sqlite::SqliteConnectOptions::from_str(&database_url)
+        .unwrap()
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+    let legacy = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(legacy_options)
+        .await
+        .unwrap();
+    sqlx::migrate!("../migrations").run(&legacy).await.unwrap();
+    sqlx::query("INSERT INTO items (id,kind,name,weekdays,points,sort,active,updated_at,seq) VALUES (?, 'chore','legacy preserved',127,10,0,1,1,1)")
+        .bind(C1).execute(&legacy).await.unwrap();
+    sqlx::query("UPDATE meta SET val=1 WHERE key='seq'")
+        .execute(&legacy)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO devices VALUES (?,?,?,?,?,?)")
+        .bind("legacy-device")
+        .bind("Legacy")
+        .bind(bread_tracker_server::auth::hash("legacy-token"))
+        .bind(Option::<String>::None)
+        .bind(1_i64)
+        .bind(1_i64)
+        .execute(&legacy)
+        .await
+        .unwrap();
+    legacy.close().await;
+    let db = db::connect_existing(&database_url).await.unwrap();
+    let generation = db::reconcile_generation_locked(&db, &path).await.unwrap();
+    let preserved: String = sqlx::query_scalar("SELECT name FROM items WHERE id=?")
+        .bind(C1)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        preserved, "legacy preserved",
+        "upgrade path preserves populated row"
+    );
+    assert!(!generation.is_empty());
+    let state = AppState::new(db, generation, Config::from_env(), Arc::new(push::NoPush));
+    let app = api::router(state);
+    let response = call(
+        &app,
+        "POST",
+        "/sync",
+        Some("legacy-token"),
+        Some(json!({"since": 0, "items": [], "completions": []})),
+    )
+    .await;
+    assert_eq!(response.0, StatusCode::OK);
+    assert_eq!(
+        response.1["items"][0]["name"], "legacy preserved",
+        "wire response: {:#}",
+        response.1
+    );
+    assert!(response.1["epoch"].as_str().is_some());
+}
+
+#[test]
+fn pair_cli_completes_while_the_http_server_holds_generation_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("pair-process.db");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let binary = env!("CARGO_BIN_EXE_bread-tracker-server");
+    let mut server = Command::new(binary)
+        .env("BREADTRACKER_DATABASE_PATH", &database)
+        .env("BREADTRACKER_LISTEN", address.to_string())
+        .env("BREADTRACKER_FCM_SERVICE_ACCOUNT", "")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
+    let mut ready = false;
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect_timeout(&address, StdDuration::from_millis(50)).is_ok() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(StdDuration::from_millis(20));
+    }
+    assert!(ready, "server did not become ready");
+    let mut pair = Command::new(binary)
+        .arg("pair")
+        .env("BREADTRACKER_DATABASE_PATH", &database)
+        .env("BREADTRACKER_LISTEN", address.to_string())
+        .env("BREADTRACKER_FCM_SERVICE_ACCOUNT", "")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pair_deadline = std::time::Instant::now() + StdDuration::from_secs(5);
+    while std::time::Instant::now() < pair_deadline && pair.try_wait().unwrap().is_none() {
+        thread::sleep(StdDuration::from_millis(10));
+    }
+    if pair.try_wait().unwrap().is_none() {
+        let _ = pair.kill();
+        let output = pair.wait_with_output().unwrap();
+        let _ = server.kill();
+        let _ = server.wait();
+        panic!(
+            "pair CLI hung against running server: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let pair = pair.wait_with_output().unwrap();
+    assert!(
+        pair.status.success(),
+        "pair stderr: {}",
+        String::from_utf8_lossy(&pair.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&pair.stdout).trim().is_empty());
+    let marker = Command::new(binary)
+        .arg("mark-restored")
+        .env("BREADTRACKER_DATABASE_PATH", &database)
+        .env("BREADTRACKER_LISTEN", address.to_string())
+        .output()
+        .unwrap();
+    assert!(
+        !marker.status.success(),
+        "restore marker must refuse an active server"
+    );
+    assert!(String::from_utf8_lossy(&marker.stderr).contains("server is running"));
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+#[test]
+fn concurrent_startup_fails_closed_while_another_server_holds_generation_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("concurrent-start.db");
+    let address1 = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let address2 = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let binary = env!("CARGO_BIN_EXE_bread-tracker-server");
+    let spawn = |address: std::net::SocketAddr| {
+        Command::new(binary)
+            .env("BREADTRACKER_DATABASE_PATH", &database)
+            .env("BREADTRACKER_LISTEN", address.to_string())
+            .env("BREADTRACKER_FCM_SERVICE_ACCOUNT", "")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let mut first = spawn(address1);
+    let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect_timeout(&address1, StdDuration::from_millis(50)).is_ok() {
+            break;
+        }
+        if first.try_wait().unwrap().is_some() {
+            panic!("first server exited during startup");
+        }
+        thread::sleep(StdDuration::from_millis(20));
+    }
+    let mut second = spawn(address2);
+    let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
+    let mut exited = false;
+    while std::time::Instant::now() < deadline {
+        if second.try_wait().unwrap().is_some() {
+            exited = true;
+            break;
+        }
+        thread::sleep(StdDuration::from_millis(20));
+    }
+    let _ = second.kill();
+    let output = second.wait_with_output().unwrap();
+    let _ = first.kill();
+    let _ = first.wait();
+    assert!(exited, "competing startup should promptly fail closed instead of waiting for the running server lock");
+    assert!(
+        !output.status.success(),
+        "concurrent startup must fail closed rather than serve on a competing cached generation"
+    );
 }
 
 #[tokio::test]

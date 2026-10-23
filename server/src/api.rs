@@ -123,6 +123,7 @@ async fn sync(
                 "sync generation changed; apply snapshot before retrying uploads".into(),
             ));
         }
+        store::apply_restore_snapshot(&st.db, &full.items, &full.completions).await?;
         return Ok(Json(full));
     }
     store::apply_push(&st.db, &req.items, &req.completions).await?;

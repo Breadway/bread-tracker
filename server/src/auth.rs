@@ -42,20 +42,33 @@ fn normalize_code(code: &str) -> String {
 
 /// Create a pairing code valid for 15 minutes. Returned in `XXXX-XXXX` form.
 pub async fn create_pairing_code(db: &Db) -> Result<String, sqlx::Error> {
+    create_pairing_code_on(db).await
+}
+
+pub async fn create_pairing_code_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<String, sqlx::Error> {
     let mut rng = rand::thread_rng();
     let raw: String = (0..8)
         .map(|_| CODE_ALPHABET[rng.gen_range(0..CODE_ALPHABET.len())] as char)
         .collect();
     sqlx::query("DELETE FROM pairing_codes WHERE expires_at < ?")
         .bind(now_ms())
-        .execute(db)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("INSERT INTO pairing_codes (code_hash, expires_at) VALUES (?, ?)")
         .bind(hash(&raw))
         .bind(now_ms() + CODE_TTL_MS)
-        .execute(db)
+        .execute(&mut **tx)
         .await?;
     Ok(format!("{}-{}", &raw[..4], &raw[4..]))
+}
+
+async fn create_pairing_code_on(db: &Db) -> Result<String, sqlx::Error> {
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    let code = create_pairing_code_in(&mut tx).await?;
+    tx.commit().await?;
+    Ok(code)
 }
 
 /// Redeem a code (single use). Returns `(device_id, token)` on success.

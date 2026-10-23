@@ -59,47 +59,12 @@ class SyncEngine {
     }
     final serverEpoch = preflight['epoch'] as String?;
     var establishedEpoch = false;
-    if (serverEpoch != null &&
-        requestEpoch != null &&
-        serverEpoch != requestEpoch &&
-        !afterReset) {
+    if (serverEpoch != null && requestEpoch != null && !afterReset) {
       // Keep the two-part exchange consistent with the protocol: commit the full
       // snapshot first, retain dirty local winners, then retry uploads under the new
       // generation. Never clear sync metadata before the snapshot is committed.
-      await db.transaction(() async {
-        for (final j
-            in (preflight['items'] as List).cast<Map<String, dynamic>>()) {
-          final local = await (db.select(
-            db.items,
-          )..where((t) => t.id.equals(j['id']))).getSingleOrNull();
-          if (local != null &&
-              local.dirty &&
-              local.updatedAt > (j['updated_at'] as int)) {
-            continue;
-          }
-          await db.upsertItem(_itemCompanion(j));
-        }
-        for (final j
-            in (preflight['completions'] as List)
-                .cast<Map<String, dynamic>>()) {
-          final local =
-              await (db.select(db.completions)..where(
-                    (t) =>
-                        t.itemId.equals(j['item_id']) &
-                        t.date.equals(j['date']),
-                  ))
-                  .getSingleOrNull();
-          if (local != null &&
-              local.dirty &&
-              local.updatedAt > (j['updated_at'] as int)) {
-            continue;
-          }
-          await db
-              .into(db.completions)
-              .insertOnConflictUpdate(_compCompanion(j));
-        }
-        await db.markAllDirty();
-      });
+      await _applyRestoreSnapshot(preflight);
+      await db.markAllDirty();
       await store.setCursor(0);
       await store.setEpoch(serverEpoch);
       return _once(afterReset: true);
@@ -139,9 +104,9 @@ class SyncEngine {
     }
 
     final epoch = res['epoch'] as String?;
-    if (epoch != null && epoch != store.epoch && !afterReset) {
-      await store.resetSync();
-      await db.markAllDirty();
+    if (epoch != null && epoch != store.epoch) {
+      await _applyRestoreSnapshot(res);
+      await store.setCursor(0);
       await store.setEpoch(epoch);
       return _once(afterReset: true);
     }
@@ -194,6 +159,22 @@ class SyncEngine {
     });
     await store.setCursor(res['cursor'] as int);
     return SyncStatus.idle;
+  }
+
+  Future<void> _applyRestoreSnapshot(Map<String, dynamic> snapshot) async {
+    await db.transaction(() async {
+      for (final j
+          in (snapshot['items'] as List).cast<Map<String, dynamic>>()) {
+        await db.upsertItemIfNewer(_itemCompanion(j));
+      }
+      // Snapshot rows are pulled as clean, but any local LWW winner that was newer
+      // must be retried so the restored server learns the value/tombstone.
+      for (final j
+          in (snapshot['completions'] as List).cast<Map<String, dynamic>>()) {
+        await db.upsertCompletionIfNewer(_compCompanion(j));
+      }
+      await db.markAllDirty();
+    });
   }
 
   Map<String, dynamic> _itemJson(ItemRow i) => {

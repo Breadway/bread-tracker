@@ -345,6 +345,130 @@ void main() {
     );
   });
 
+  test(
+    'restore applies LWW against newer clean local values and tombstones',
+    () async {
+      final server = FakeServer();
+      final (db, sync, store) = await device(server);
+      await db.upsertItem(
+        ItemsCompanion.insert(
+          id: id1,
+          kind: 'chore',
+          name: 'backup name',
+          points: 10,
+          updatedAt: 1000,
+          dirty: const Value(true),
+        ),
+      );
+      await db.setCompletion(id1, '2026-10-19', true, 1100);
+      await sync.sync();
+      final savedItem = Map<String, dynamic>.from(server.items[id1]!);
+      final savedCompletion = Map<String, dynamic>.from(
+        server.comps.values.single,
+      );
+
+      // A newer edit and untick have already reached the server and local DB, so both
+      // local rows are clean when a backup from the old generation is restored.
+      await db.upsertItem(
+        ItemsCompanion(
+          id: const Value(id1),
+          kind: const Value('chore'),
+          name: const Value('new synced name'),
+          points: const Value(10),
+          updatedAt: const Value(2000),
+          dirty: const Value(true),
+        ),
+      );
+      await db.setCompletion(id1, '2026-10-19', false, 2100);
+      await sync.sync();
+      expect((await db.select(db.items).getSingle()).dirty, false);
+      expect((await db.select(db.completions).getSingle()).dirty, false);
+
+      server.items[id1] = savedItem;
+      server.comps[server.comps.keys.single] = savedCompletion;
+      server.epoch = 'restore-epoch';
+      server.seq = 1;
+      await db.markAllDirty();
+      expect(await sync.sync(), SyncStatus.idle);
+      expect(server.items[id1]!['name'], 'new synced name');
+      expect(server.comps.values.single['deleted_at'], 2100);
+      expect((await db.select(db.items).getSingle()).name, 'new synced name');
+      expect((await db.select(db.completions).getSingle()).deletedAt, 2100);
+      expect(store.epoch, 'restore-epoch');
+    },
+  );
+
+  test('restore equal timestamps retain local state and dirty winners are retried', () async {
+    final server = FakeServer();
+    final (db, sync, store) = await device(server);
+    await db.upsertItem(
+      ItemsCompanion.insert(
+        id: id1,
+        kind: 'chore',
+        name: 'backup',
+        points: 10,
+        updatedAt: 1000,
+        dirty: const Value(true),
+      ),
+    );
+    await sync.sync();
+    final backup = Map<String, dynamic>.from(server.items[id1]!);
+    server.epoch = 'restore-equal';
+    server.items[id1] = {...backup, 'name': 'equal remote conflict'};
+    await db.upsertItem(
+      ItemsCompanion(
+        id: const Value(id1),
+        kind: const Value('chore'),
+        name: const Value('equal local'),
+        points: const Value(10),
+        updatedAt: const Value(1000),
+        dirty: const Value(false),
+      ),
+    );
+    await sync.sync();
+    // Equal timestamps are not ordered by LWW; the server snapshot wins the tie,
+    // and the phone converges to that same value without a repeat upload loop.
+    expect(
+      (await db.select(db.items).getSingle()).name,
+      'equal remote conflict',
+    );
+    expect(server.items[id1]!['name'], 'equal remote conflict');
+    expect(store.epoch, 'restore-equal');
+  });
+
+  test('response-time generation change applies snapshot before reuploading dirty winners', () async {
+    final server = FakeServer();
+    final (db, sync, store) = await device(server);
+    await db.upsertItem(
+      ItemsCompanion.insert(
+        id: id1,
+        kind: 'chore',
+        name: 'before backup',
+        points: 10,
+        updatedAt: 1000,
+        dirty: const Value(true),
+      ),
+    );
+    await sync.sync();
+    final backup = Map<String, dynamic>.from(server.items[id1]!);
+    server.epoch = 'restore-after-upload';
+    server.items[id1] = backup;
+    await db.upsertItem(
+      ItemsCompanion(
+        id: const Value(id1),
+        kind: const Value('chore'),
+        name: const Value('new offline'),
+        points: const Value(10),
+        updatedAt: const Value(3000),
+        dirty: const Value(true),
+      ),
+    );
+    await sync.sync();
+    expect(server.items[id1]!['name'], 'new offline');
+    expect((await db.select(db.items).getSingle()).name, 'new offline');
+    expect(store.epoch, 'restore-after-upload');
+  });
+
   test('an unchanged server does not trigger a full re-push', () async {
     final server = FakeServer();
     final (db, sync, _) = await device(server);

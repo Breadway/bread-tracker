@@ -23,15 +23,7 @@ pub fn next_generation(database_path: &std::path::Path) -> anyhow::Result<String
 pub struct GenerationLock(std::fs::File);
 
 impl GenerationLock {
-    pub fn acquire(database_path: &std::path::Path) -> anyhow::Result<Self> {
-        Self::acquire_mode(database_path, true)
-    }
-
-    pub fn acquire_shared(database_path: &std::path::Path) -> anyhow::Result<Self> {
-        Self::acquire_mode(database_path, false)
-    }
-
-    fn acquire_mode(database_path: &std::path::Path, exclusive: bool) -> anyhow::Result<Self> {
+    pub fn acquire_exclusive(database_path: &std::path::Path) -> anyhow::Result<Self> {
         use fs2::FileExt;
         let lock_path = database_path.with_extension("sync-lock");
         if let Some(parent) = lock_path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -43,11 +35,23 @@ impl GenerationLock {
             .create(true)
             .truncate(false)
             .open(lock_path)?;
-        if exclusive {
-            file.lock_exclusive()?;
-        } else {
-            file.lock_shared()?;
-        }
+        file.lock_exclusive()?;
+        Ok(Self(file))
+    }
+
+    pub fn acquire_shared(database_path: &std::path::Path) -> anyhow::Result<Self> {
+        Self::try_acquire_shared(database_path)
+    }
+
+    pub fn try_acquire_shared(database_path: &std::path::Path) -> anyhow::Result<Self> {
+        let lock_path = database_path.with_extension("sync-lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?;
+        file.try_lock_shared()?;
         Ok(Self(file))
     }
 
@@ -62,6 +66,10 @@ impl GenerationLock {
             .open(lock_path)?;
         file.try_lock_exclusive()?;
         Ok(Self(file))
+    }
+
+    pub fn try_acquire_lifetime_exclusive(database_path: &std::path::Path) -> anyhow::Result<Self> {
+        Self::try_acquire_exclusive(database_path)
     }
 }
 
@@ -136,6 +144,21 @@ pub async fn connect(database_url: &str) -> anyhow::Result<Db> {
     Ok(pool)
 }
 
+pub async fn connect_existing(database_url: &str) -> anyhow::Result<Db> {
+    let opts = SqliteConnectOptions::from_str(database_url)?
+        .create_if_missing(false)
+        .journal_mode(SqliteJournalMode::Wal)
+        .foreign_keys(true)
+        .busy_timeout(std::time::Duration::from_secs(5));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await?;
+    sqlx::migrate!("../migrations").run(&pool).await?;
+    ensure_epoch(&pool).await?;
+    Ok(pool)
+}
+
 /// Ensure the legacy-compatible database-local identity exists.
 pub async fn ensure_epoch(db: &Db) -> anyhow::Result<()> {
     let existing: Option<String> =
@@ -165,7 +188,7 @@ pub async fn reconcile_generation(
     db: &Db,
     database_path: &std::path::Path,
 ) -> anyhow::Result<String> {
-    let _lock = GenerationLock::acquire(database_path)?;
+    let _lock = GenerationLock::acquire_exclusive(database_path)?;
     reconcile_generation_locked(db, database_path).await
 }
 
@@ -225,6 +248,32 @@ pub async fn mark_restored(
     generation: &str,
 ) -> anyhow::Result<()> {
     mark_restored_inner(db, database_path, generation, || Ok(()), || Ok(())).await
+}
+
+#[cfg(test)]
+fn apply_restore_snapshot_to_values<T, K, FKey, FUpdated, FMerge>(
+    local: &mut std::collections::HashMap<K, T>,
+    incoming: impl IntoIterator<Item = T>,
+    key: FKey,
+    updated_at: FUpdated,
+    merge: FMerge,
+) where
+    K: std::hash::Hash + Eq,
+    T: Clone,
+    FKey: Fn(&T) -> K,
+    FUpdated: Fn(&T) -> i64,
+    FMerge: Fn(&mut T, &T),
+{
+    for row in incoming {
+        let k = key(&row);
+        if let Some(existing) = local.get_mut(&k) {
+            if updated_at(existing) < updated_at(&row) {
+                merge(existing, &row);
+            }
+        } else {
+            local.insert(k, row);
+        }
+    }
 }
 
 async fn mark_restored_inner<F>(
@@ -381,27 +430,43 @@ mod generation_tests {
 
     #[tokio::test]
     async fn forward_generation_initialization_preserves_populated_legacy_database() {
-        let db = connect_memory().await.unwrap();
-        sqlx::query("INSERT INTO items (id,kind,name,weekdays,points,sort,active,updated_at,seq) VALUES ('legacy','chore','preserved',127,10,0,1,1,1)")
-            .execute(&db).await.unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.db");
-        let generation = read_or_create_generation(&path).unwrap();
-        set_epoch(&db, &generation).await.unwrap();
-        assert_eq!(generation, read_or_create_generation(&path).unwrap());
+        let database_url = format!("sqlite://{}", path.display());
+        let legacy = SqliteConnectOptions::from_str(&database_url)
+            .unwrap()
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal);
+        let legacy_db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(legacy)
+            .await
+            .unwrap();
+        sqlx::migrate!("../migrations")
+            .run(&legacy_db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO items (id,kind,name,weekdays,points,sort,active,updated_at,seq) VALUES ('legacy','chore','preserved',127,10,0,1,1,1)")
+            .execute(&legacy_db).await.unwrap();
+        legacy_db.close().await;
+
+        let upgraded = connect_existing(&database_url).await.unwrap();
+        reconcile_generation_locked(&upgraded, &path).await.unwrap();
         let name: String = sqlx::query_scalar("SELECT name FROM items WHERE id='legacy'")
-            .fetch_one(&db)
+            .fetch_one(&upgraded)
             .await
             .unwrap();
         assert_eq!(name, "preserved");
+        assert!(current_epoch(&upgraded).await.unwrap().is_some());
+        upgraded.close().await;
     }
 
     #[test]
-    fn restore_lock_waits_for_running_server_shared_lock() {
+    fn restore_lock_waits_for_running_server_lock() {
         use fs2::FileExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tracker.db");
-        let server = GenerationLock::acquire_shared(&path).unwrap();
+        let server = GenerationLock::try_acquire_shared(&path).unwrap();
         let marker = path.with_extension("sync-lock");
         let contender = std::fs::OpenOptions::new()
             .read(true)
@@ -415,10 +480,27 @@ mod generation_tests {
     }
 
     #[test]
-    fn exclusive_restore_lock_reports_running_server_without_waiting() {
+    fn restore_lock_reports_running_server_without_waiting() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tracker.db");
-        let _server = GenerationLock::acquire_shared(&path).unwrap();
+        let _server = GenerationLock::try_acquire_shared(&path).unwrap();
+        assert!(GenerationLock::try_acquire_lifetime_exclusive(&path).is_err());
+    }
+
+    #[test]
+    fn pair_shared_lock_coexists_with_running_server_and_excludes_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tracker.db");
+        let _server = GenerationLock::try_acquire_shared(&path).unwrap();
+        let _pair = GenerationLock::try_acquire_shared(&path).unwrap();
+        assert!(GenerationLock::try_acquire_exclusive(&path).is_err());
+    }
+
+    #[tokio::test]
+    async fn startup_lock_conflicts_with_server_lifetime_shared_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tracker.db");
+        let _server = GenerationLock::try_acquire_shared(&path).unwrap();
         assert!(GenerationLock::try_acquire_exclusive(&path).is_err());
     }
 
@@ -543,5 +625,75 @@ mod generation_tests {
             current_epoch(&db).await.unwrap().as_deref(),
             Some(proposed.as_str())
         );
+    }
+
+    #[test]
+    fn restore_snapshot_value_merge_preserves_newer_clean_item_and_tombstone() {
+        let mut items = std::collections::HashMap::from([(
+            "item".to_owned(),
+            crate::model::Item {
+                id: "item".into(),
+                kind: "chore".into(),
+                name: "new synced name".into(),
+                weekdays: 127,
+                remind_time: None,
+                points: 10,
+                due_date: None,
+                sort: 0,
+                active: true,
+                updated_at: 2000,
+                deleted_at: None,
+                seq: 3,
+            },
+        )]);
+        let backup = crate::model::Item {
+            id: "item".into(),
+            kind: "chore".into(),
+            name: "backup old".into(),
+            weekdays: 127,
+            remind_time: None,
+            points: 10,
+            due_date: None,
+            sort: 0,
+            active: true,
+            updated_at: 1000,
+            deleted_at: None,
+            seq: 1,
+        };
+        apply_restore_snapshot_to_values(
+            &mut items,
+            [backup],
+            |r| r.id.clone(),
+            |r| r.updated_at,
+            |a, b| *a = b.clone(),
+        );
+        assert_eq!(items.get("item").unwrap().name, "new synced name");
+        let mut completions = std::collections::HashMap::from([(
+            ("item".to_owned(), "2026-10-19".to_owned()),
+            crate::model::Completion {
+                item_id: "item".into(),
+                date: "2026-10-19".into(),
+                completed_at: 0,
+                updated_at: 2100,
+                deleted_at: Some(2100),
+                seq: 4,
+            },
+        )]);
+        let backup_completion = crate::model::Completion {
+            item_id: "item".into(),
+            date: "2026-10-19".into(),
+            completed_at: 1100,
+            updated_at: 1100,
+            deleted_at: None,
+            seq: 2,
+        };
+        apply_restore_snapshot_to_values(
+            &mut completions,
+            [backup_completion],
+            |r| (r.item_id.clone(), r.date.clone()),
+            |r| r.updated_at,
+            |a, b| *a = b.clone(),
+        );
+        assert_eq!(completions.values().next().unwrap().deleted_at, Some(2100));
     }
 }

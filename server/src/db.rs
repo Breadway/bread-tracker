@@ -55,6 +55,10 @@ impl GenerationLock {
         Ok(Self(file))
     }
 
+    pub fn try_acquire_lifetime_exclusive(database_path: &std::path::Path) -> anyhow::Result<Self> {
+        Self::try_acquire_exclusive(database_path)
+    }
+
     pub fn try_acquire_exclusive(database_path: &std::path::Path) -> anyhow::Result<Self> {
         use fs2::FileExt;
         let lock_path = database_path.with_extension("sync-lock");
@@ -66,10 +70,6 @@ impl GenerationLock {
             .open(lock_path)?;
         file.try_lock_exclusive()?;
         Ok(Self(file))
-    }
-
-    pub fn try_acquire_lifetime_exclusive(database_path: &std::path::Path) -> anyhow::Result<Self> {
-        Self::try_acquire_exclusive(database_path)
     }
 }
 

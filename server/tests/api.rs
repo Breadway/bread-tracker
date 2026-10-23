@@ -752,7 +752,7 @@ fn pair_cli_completes_while_the_http_server_holds_generation_lock() {
 }
 
 #[test]
-fn concurrent_startup_fails_closed_while_another_server_holds_generation_lock() {
+fn second_server_startup_fails_closed_while_first_owns_generation_lock() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("concurrent-start.db");
     let address1 = std::net::TcpListener::bind("127.0.0.1:0")
@@ -786,23 +786,24 @@ fn concurrent_startup_fails_closed_while_another_server_holds_generation_lock() 
         thread::sleep(StdDuration::from_millis(20));
     }
     let mut second = spawn(address2);
-    let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
-    let mut exited = false;
-    while std::time::Instant::now() < deadline {
+    let second_deadline = std::time::Instant::now() + StdDuration::from_secs(5);
+    let mut failed = false;
+    while std::time::Instant::now() < second_deadline {
         if second.try_wait().unwrap().is_some() {
-            exited = true;
+            failed = true;
             break;
         }
         thread::sleep(StdDuration::from_millis(20));
     }
-    let _ = second.kill();
+    if !failed {
+        let _ = second.kill();
+    }
     let output = second.wait_with_output().unwrap();
     let _ = first.kill();
     let _ = first.wait();
-    assert!(exited, "competing startup should promptly fail closed instead of waiting for the running server lock");
     assert!(
-        !output.status.success(),
-        "concurrent startup must fail closed rather than serve on a competing cached generation"
+        failed && !output.status.success(),
+        "second server must fail closed promptly while first holds generation lock"
     );
 }
 

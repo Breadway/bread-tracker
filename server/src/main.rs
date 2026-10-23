@@ -67,9 +67,8 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Serialize generation publication under SQLite's writer lock, then hold the shared
-    // process lock for the lifetime of this server instance.
-    let startup_lock = db::GenerationLock::try_acquire_exclusive(&config.database_path)
+    // Server lifetime ownership excludes restore marking for the entire listener life.
+    let startup_lock = db::GenerationLock::try_acquire_lifetime_exclusive(&config.database_path)
         .context("another server or restore operation already owns this database")?;
     let db = db::connect(&config.database_url())
         .await

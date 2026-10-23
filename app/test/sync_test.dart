@@ -388,7 +388,6 @@ void main() {
       server.comps[server.comps.keys.single] = savedCompletion;
       server.epoch = 'restore-epoch';
       server.seq = 1;
-      await db.markAllDirty();
       expect(await sync.sync(), SyncStatus.idle);
       expect(server.items[id1]!['name'], 'new synced name');
       expect(server.comps.values.single['deleted_at'], 2100);

@@ -62,6 +62,12 @@ jobs:
           cd src && source scripts/android-env.sh
           cd app && flutter test
 
+      - name: restore runbook argv contract
+        run: |
+          set -euo pipefail
+          cd src
+          python3 scripts/check_restore_runbook.py packaging/Containerfile packaging/DEPLOY.md
+
   # server/src/xp.rs and app/lib/rules.dart must agree on spec/xp_vectors.json. Both full
   # test runs above already read it; this job runs just those two tests side by side and
   # refuses an empty or malformed vector file, so a drift is named in the job list.
@@ -111,3 +117,9 @@ jobs:
           cd src
           docker build -f packaging/Containerfile -t "bread-tracker:ci-${GITHUB_SHA}" .
           docker image rm "bread-tracker:ci-${GITHUB_SHA}"
+
+      - name: restore runbook argv contract
+        run: |
+          set -euo pipefail
+          cd src
+          python3 scripts/check_restore_runbook.py packaging/Containerfile packaging/DEPLOY.md

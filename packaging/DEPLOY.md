@@ -47,7 +47,7 @@ test "$(sqlite3 "$SCRATCH/restored.db" 'PRAGMA integrity_check;')" = ok
 # Keep DB, WAL, SHM and candidate until replacement passes integrity_check. Change
 # ownership of the complete data directory, including generation sidecars and lock files.
 docker run --rm --name "$TASK-replace" --user 0 \
-  -v bread-tracker-data:/data -v "$SCRATCH:/restore" \
+  -v bread-tracker-data:/data -v bread-tracker-data:/var/lib/bread-tracker -v "$SCRATCH:/restore" \
   --entrypoint /usr/local/bin/entrypoint-exec bread-tracker:local /bin/sh -ec '
     sqlite3 /data/bread-tracker.db "PRAGMA wal_checkpoint(TRUNCATE);" > /tmp/checkpoint
     IFS="|" read -r busy log_frames checkpointed < /tmp/checkpoint
@@ -63,17 +63,19 @@ docker run --rm --name "$TASK-replace" --user 0 \
     rm -f /data/bread-tracker.db-wal /data/bread-tracker.db-shm
     chown -R 10001:10001 /data
   '
+# Change ownership of the full data directory before marker/server, not the separate
+# FCM secret mount. This includes generation sidecars, lock files and SQLite files.
+docker run --rm --name "$TASK-own" --user 0 -v bread-tracker-data:/data -v bread-tracker-data:/var/lib/bread-tracker \
+  --entrypoint /usr/local/bin/entrypoint-exec bread-tracker:local \
+  /bin/sh -ec 'chown -R 10001:10001 /data'
 # Explicit ENTRYPOINT override is required: otherwise this command is appended to
 # bread-tracker-server and mark-restored will not execute.
 docker run --rm --name "$TASK-marker" --user 10001:10001 \
   -v bread-tracker-data:/var/lib/bread-tracker \
   --entrypoint /usr/local/bin/entrypoint-exec bread-tracker:local \
   /usr/local/bin/bread-tracker-server mark-restored
-docker run --rm --name "$TASK-own" --user 0 -v bread-tracker-data:/data \
-  --entrypoint /usr/local/bin/entrypoint-exec bread-tracker:local \
-  /bin/sh -ec 'chown -R 10001:10001 /data'
-docker compose -f packaging/compose.yaml --project-directory . up -d bread-tracker
 docker compose -f packaging/compose.yaml --project-directory . up -d litestream
+docker compose -f packaging/compose.yaml --project-directory . up -d bread-tracker
 rm -rf "$SCRATCH"
 ```
 
@@ -90,10 +92,15 @@ IMG="$TASK:local"
 ROOT="$(pwd)"
 SCRATCH="$ROOT/.scratch-$TASK"
 cleanup() {
-  if docker inspect "$TASK-server" >/dev/null 2>&1; then
+  running=$(docker inspect --format '{{.Name}} {{.State.Running}}' "$TASK-server" 2>/dev/null || true)
+  if [ "$running" = "/$TASK-server true" ]; then
     printf 'Stopping verified task container %s\n' "$TASK-server"
     docker stop "$TASK-server" >/dev/null
     docker wait "$TASK-server" >/dev/null
+  fi
+  if docker inspect "$TASK-server" >/dev/null 2>&1; then
+    echo "Refusing to remove bind data while task server still exists" >&2
+    return 1
   fi
   docker image rm "$IMG" >/dev/null 2>&1 || true
   rm -rf "$SCRATCH"
@@ -110,7 +117,7 @@ docker build -f packaging/Containerfile -t "$IMG" .
 
 # Make a populated root-owned pre-upgrade 0001 database and a restored candidate.
 docker run --rm --name "$TASK-init" --user 0 -v "$SCRATCH/data:/work" \
-  -v "$SCRATCH/restore:/restore" \
+  -v "$SCRATCH/restore:/restore" -v "$SCRATCH/data:/var/lib/bread-tracker" \
   --mount "type=bind,src=$ROOT/migrations/0001_init.sql,dst=/fixture/0001_init.sql,readonly" \
   --entrypoint /usr/local/bin/entrypoint-exec "$IMG" /bin/sh -ec '
   chmod 0770 /work /restore
@@ -135,7 +142,7 @@ docker run --rm --name "$TASK-init" --user 0 -v "$SCRATCH/data:/work" \
 # Failure path: invalid/missing restore candidate exits nonzero. Do not invoke marker
 # or server in this branch; this is an explicit assertion that shell failure propagates.
 if docker run --rm --name "$TASK-failure" --user 0 -v "$SCRATCH/data:/work" \
-  -v "$SCRATCH/restore:/restore" \
+  -v "$SCRATCH/restore:/restore" -v "$SCRATCH/data:/var/lib/bread-tracker" \
   --entrypoint /usr/local/bin/entrypoint-exec "$IMG" /bin/sh -ec '
   test -f /restore/not-present.db
   cp /restore/not-present.db /work/existing.db
@@ -147,6 +154,7 @@ fi
 # Create a pre-existing root-owned database at the configured filename from inside
 # the explicitly root-run helper. The host user never needs to read/chown fixture data.
 docker run --rm --name "$TASK-fixture" --user 0 -v "$SCRATCH/data:/data" \
+  -v "$SCRATCH/data:/var/lib/bread-tracker" \
   --entrypoint /usr/local/bin/entrypoint-exec "$IMG" /bin/sh -ec '
     cp /data/existing.db /data/bread-tracker.db
     chown 0:0 /data/bread-tracker.db
@@ -155,7 +163,8 @@ docker run --rm --name "$TASK-fixture" --user 0 -v "$SCRATCH/data:/data" \
 
 # Restore into an already-existing root-owned data directory. No SQLite connection is
 # left open when this finishes. Checkpoint/integrity/copy/chown failures all abort.
-docker run --rm --name "$TASK-replace" --user 0 -v "$SCRATCH/data:/var/lib/bread-tracker" -v "$SCRATCH/restore:/restore:ro" \
+docker run --rm --name "$TASK-replace" --user 0 -v "$SCRATCH/data:/var/lib/bread-tracker" \
+  -v "$SCRATCH/restore:/restore:ro" \
   --entrypoint /usr/local/bin/entrypoint-exec "$IMG" /bin/sh -ec '
     test "$(sqlite3 /restore/restored.db "PRAGMA integrity_check;")" = ok
     sqlite3 /var/lib/bread-tracker/bread-tracker.db "PRAGMA wal_checkpoint(TRUNCATE);" > /tmp/checkpoint
@@ -176,16 +185,19 @@ docker run --rm --name "$TASK-replace" --user 0 -v "$SCRATCH/data:/var/lib/bread
 # Create a dummy secret readable to uid 10001 inside a root helper and test readability
 # under uid 10001 only. The dummy contents are never emitted.
 docker run --rm --name "$TASK-secret-prepare" --user 0 -v "$SCRATCH/data:/scratch" \
+  -v "$SCRATCH/data:/var/lib/bread-tracker" \
   --entrypoint /usr/local/bin/entrypoint-exec "$IMG" /bin/sh -ec '
     printf "dummy-not-a-secret\\n" > /scratch/dummy-secret
     chown 0:10001 /scratch/dummy-secret
     chmod 0440 /scratch/dummy-secret
   '
-docker run --rm --name "$TASK-secret-test" --user 10001:10001 -v "$SCRATCH/data:/scratch:ro" -v "$SCRATCH/data/dummy-secret:/run/secrets/fcm.json:ro" -v "$SCRATCH/data:/var/lib/bread-tracker" \
+docker run --rm --name "$TASK-secret-test" --user 10001:10001 -v "$SCRATCH/data:/scratch:ro" \
+  -v "$SCRATCH/data/dummy-secret:/run/secrets/fcm.json:ro" -v "$SCRATCH/data:/var/lib/bread-tracker" \
   --entrypoint /usr/local/bin/entrypoint-exec "$IMG" /bin/sh -ec 'test -r /run/secrets/fcm.json'
 
 # Test entrypoint does not prepend the server binary to utility/marker invocations.
 docker run --rm --name "$TASK-own" --user 0 -v "$SCRATCH/data:/data" \
+  -v "$SCRATCH/data:/var/lib/bread-tracker" \
   --entrypoint /usr/local/bin/entrypoint-exec "$IMG" /bin/sh -ec 'chown -R 10001:10001 /data'
 docker run --rm --name "$TASK-marker" --user 10001:10001 -v "$SCRATCH/data:/var/lib/bread-tracker" \
   -e BREADTRACKER_DATABASE_PATH=/var/lib/bread-tracker/bread-tracker.db \

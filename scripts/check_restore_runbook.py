@@ -47,20 +47,26 @@ for command in disposable_commands:
         fail("utility command overrides must use the image wrapper entrypoint")
     if "litestream/litestream" in command and "--entrypoint" in command:
         fail("Litestream invocation must use its own image entrypoint, not tracker wrapper")
+    if '"$IMG"' in command:
+        if "/var/lib/bread-tracker" not in command:
+            fail(f"tracker helper does not bind image VOLUME /var/lib/bread-tracker: {command}")
+        if command.count(":/var/lib/bread-tracker") != 1:
+            fail(f"tracker helper must bind the VOLUME destination exactly once: {command}")
+        if "--entrypoint" not in command or wrapper not in command:
+            if "--name \"$TASK-server\"" not in command:
+                fail(f"tracker utility helper must explicitly select the image wrapper: {command}")
 
 if "--entrypoint /usr/local/bin/entrypoint-exec" not in deploy:
     fail("runbook does not demonstrate explicit wrapper ENTRYPOINT")
 operational = deploy.split("## Disposable restore and existing-volume rehearsal", 1)[0]
-for command in re.findall(
+operational_commands = re.findall(
     r"(?m)^\s*docker\s+run\b[^\n]*(?:\\\n[^\n]*)*", operational
-):
+)
+for command in operational_commands:
     if "mark-restored" in command and f"--entrypoint {wrapper}" not in command:
         fail("operational mark-restored invocation must explicitly select the wrapper")
-    if "--entrypoint" in command and wrapper not in command:
+    if "--entrypoint" in command and wrapper not in command and "litestream/litestream" not in command:
         fail("operational helper invocation must explicitly select the wrapper")
-for command in commands:
-    if "--entrypoint" in command and wrapper not in command:
-        fail("Docker helper invocation overrides ENTRYPOINT with a non-wrapper path")
 for required in (
     "test -f /restore/not-present.db",
     "PRAGMA integrity_check",
@@ -95,20 +101,23 @@ if 'ss -ltn' not in disposable or '17291' not in disposable:
     fail("disposable server must check/use a non-production host port")
 if 'docker wait "$TASK-server"' not in disposable or 'docker stop "$TASK-server"' not in disposable:
     fail("server stop/wait cleanup must be in the same executable task-scoped script")
-cleanup = disposable.split("cleanup() {", 1)[1].split("}", 1)[0]
+cleanup = disposable.split("cleanup() {", 1)[1].split("\n}", 1)[0]
 if cleanup.find('docker stop "$TASK-server"') < 0 or cleanup.find('docker wait "$TASK-server"') < 0 or cleanup.find('rm -rf "$SCRATCH"') < 0:
     fail("interrupt cleanup must stop the task server before deleting its bind directory")
 if cleanup.find('docker wait "$TASK-server"') > cleanup.find('rm -rf "$SCRATCH"'):
     fail("cleanup deletes bound scratch data before stopping server")
 if 'grep -qx "0|0|0"' in deploy:
     fail("checkpoint must not assume WAL mode's fixed frame counts")
-if 'docker run --rm --name "$TASK-litestream"' not in operational or '--entrypoint' in re.search(r'docker run --rm --name "\$TASK-litestream"[^\n]*(?:\\\n[^\n]*)*', operational).group(0):
+litestream = re.search(r'docker run --rm --name "\$TASK-litestream"[^\n]*(?:\\\n[^\n]*)*', operational)
+if not litestream or '--entrypoint' in litestream.group(0):
     fail("Litestream restore must execute through its own image entrypoint")
 if "docker stop \"bread-tracker\"" in disposable or "docker compose" in disposable:
     fail("disposable block must not stop production or use Compose")
+if "--mount \"type=bind,src=$ROOT/migrations/0001_init.sql" not in disposable:
+    fail("fixture must bind only the needed migration file, not the source checkout")
 if "REPLACE_WITH_PRINTED_SUFFIX" in deploy or "another terminal define" in deploy:
     fail("runbook contains a health-stop handoff with undefined task state")
-if 'cleanup() {' not in disposable or 'docker stop "$TASK-server"' not in disposable.split('cleanup() {',1)[1].split('}',1)[0]:
+if 'cleanup() {' not in disposable or 'docker stop "$TASK-server"' not in cleanup:
     fail("exit/interrupt trap must stop task server before deleting bind-mounted data")
 if "ENTRYPOINT" not in disposable and f"--entrypoint {wrapper}" not in disposable:
     fail("disposable rehearsal does not cover image ENTRYPOINT behavior")
@@ -124,8 +133,18 @@ if 'cp /work/existing.db /restore/restored.db' not in disposable:
     fail("restored candidate must be prepared in a root helper, not host-chowned")
 if '--mount "type=bind,src=$ROOT/migrations/0001_init.sql' not in disposable:
     fail("do not bind-mount the complete source checkout into helper containers")
-if 'docker run --rm --name "$TASK-own" --user 0' not in disposable:
+for command in disposable_commands:
+    if '"$IMG"' in command and "/var/lib/bread-tracker" not in command:
+        fail(f"tracker helper must bind the declared VOLUME destination: {command}")
+    if '"$IMG"' in command and command.count(":/var/lib/bread-tracker") != 1:
+        fail(f"tracker helper must bind image VOLUME exactly once: {command}")
+own_cmd = re.search(r'docker run --rm --name "\$TASK-own"[^\n]*(?:\\\n[^\n]*)*', operational)
+if not own_cmd or 'chown -R 10001:10001 /data' not in operational:
     fail("root-owned volume data directory ownership transition is missing")
+own_at = operational.find('chown -R 10001:10001 /data')
+marker_at = operational.find('/usr/local/bin/bread-tracker-server mark-restored')
+if own_at < 0 or marker_at < 0 or own_at > marker_at:
+    fail("operational data directory ownership must happen before marker opens it")
 if 'PRAGMA journal_mode=WAL' not in disposable:
     fail("fixture must validate WAL checkpoint behavior")
 if 'cp /work/existing.db /restore/restored.db' not in disposable:

@@ -53,7 +53,9 @@ is paired yet, the server also prints a code at startup.
 ## Build the app
 
 ```sh
-source scripts/android-env.sh    # Flutter, JDK 17 and the Android SDK on PATH
+# Prerequisites: Flutter, JDK 17, and Android SDK command-line/platform tools.
+# Set JAVA_HOME, ANDROID_SDK_ROOT (or ANDROID_HOME), and FLUTTER_ROOT as needed.
+source scripts/android-env.sh    # adds available tool directories without replacing your configuration
 cd app
 flutter pub get
 flutter analyze

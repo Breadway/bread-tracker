@@ -118,7 +118,7 @@ class TodayScreen extends ConsumerWidget {
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    'Add your weekly chores in one tap, or create your own chores and habits in Settings.',
+                    'Add a few example chores in one tap, or create your own chores and habits in Settings.',
                     textAlign: TextAlign.center,
                     style: TextStyle(color: p.dim),
                   ),
@@ -132,7 +132,7 @@ class TodayScreen extends ConsumerWidget {
                         );
                       }
                     },
-                    child: const Text('Add starter chores'),
+                    child: const Text('Add example chores'),
                   ),
                 ],
               ),

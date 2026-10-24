@@ -1,18 +1,18 @@
-# Deploying bread-tracker on Hestia
+# Deploying bread-tracker
 
 ```sh
-rsync -a --delete --exclude target --exclude .git ./ hestia:~/bread-tracker/
-ssh hestia 'cd ~/bread-tracker && mkdir -p /var/backups/bread-tracker 2>/dev/null; \
+rsync -a --delete --exclude target --exclude .git ./ your-server:~/bread-tracker/
+ssh your-server 'cd ~/bread-tracker && mkdir -p /var/backups/bread-tracker 2>/dev/null; \
   docker compose -f packaging/compose.yaml --project-directory . up -d --build'
-curl -s http://127.0.0.1:7290/healthz            # on Hestia: ok
+curl -s http://127.0.0.1:7290/healthz            # on the server: ok
 docker exec bread-tracker bread-tracker-server pair   # one-time pairing code for the phone
 ```
 
-Run compose as the `breadway` user, not root.
+Run compose as an ordinary user, not root.
 
 ## Edge
 
-Hestia's own Caddy (LAN) and Aegis (public) both reverse-proxy `tracker.breadway.dev` to port 7290; the blocks live in the infra repo (`hestia/Caddyfile`, `aegis/Caddyfile`). Aegis reaches Hestia over Tailscale, so the container must bind an address Tailscale can reach: set `BREADTRACKER_BIND=0.0.0.0:7290` in `.env` (as breadboard does with 7280) or the Tailscale IP.
+Put a reverse proxy with TLS in front of the container and forward your public name to port 7290. The compose file publishes `${BREADTRACKER_BIND:-127.0.0.1:7290}`, so by default only the host itself can reach it. If the proxy runs on another machine, set `BREADTRACKER_BIND` in `.env` to an address that machine can reach, preferably a private interface such as a VPN address, rather than `0.0.0.0`, which also serves plain HTTP on every interface.
 
 Rate limiting is per client address. Behind a reverse proxy the server only sees the proxy's address unless it is told to trust it. Set `BREADTRACKER_TRUSTED_PROXIES` to the address or CIDR the proxy connects from (comma separated, for example `100.64.0.0/10` for Tailscale) so `X-Forwarded-For` is used. Leave it empty and all callers share one bucket, which still only counts failed attempts. Check from the container that the address Aegis connects from matches before relying on it, and make sure the proxy overwrites rather than appends client-supplied `X-Forwarded-For`.
 
@@ -20,10 +20,10 @@ The compose file passes `BREADTRACKER_TRUSTED_PROXIES` through from `.env`.
 
 ## Push (FCM)
 
-Put the Firebase service-account JSON on Hestia outside the repo (mode 600) and set in `.env`:
+Put the Firebase service-account JSON on the server outside the repo (mode 600) and set in `.env`:
 
 ```
-BREADTRACKER_FCM_KEY_FILE=/home/breadway/secrets/bread-tracker-fcm.json
+BREADTRACKER_FCM_KEY_FILE=/path/to/secrets/bread-tracker-fcm.json
 BREADTRACKER_FCM_SERVICE_ACCOUNT=/run/secrets/fcm.json
 ```
 

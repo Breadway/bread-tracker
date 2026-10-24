@@ -8,6 +8,7 @@ import '../state.dart';
 import '../theme.dart';
 import 'items.dart';
 import 'pair.dart';
+import 'server_settings.dart';
 import 'widgets.dart';
 
 class SettingsScreen extends ConsumerWidget {
@@ -125,9 +126,8 @@ class SettingsScreen extends ConsumerWidget {
           const Spacer8(),
           PanelButton(
             icon: Icons.playlist_add_rounded,
-            title: 'Add starter chores',
-            subtitle:
-                'The weekly household schedule, skipping any already added',
+            title: 'Add example chores',
+            subtitle: 'A few generic weekly chores, skipping any already added',
             onTap: () async =>
                 toast('Added ${await ctl.addStarterChores()} chores'),
           ),
@@ -166,6 +166,8 @@ class SettingsScreen extends ConsumerWidget {
               ),
             ),
           ),
+          if (paired) const SectionHeader('Reminders'),
+          if (paired) const ServerSettingsSection(),
           const SectionHeader('Notifications'),
           ValueListenableBuilder<PushStatus>(
             valueListenable: ref.watch(pushProvider).status,
@@ -199,7 +201,9 @@ class SettingsScreen extends ConsumerWidget {
                   toast('Enable notifications and register this phone first.');
                   return;
                 }
-                await Api(store.serverUrl, token: token).pushTest();
+                await ref
+                    .read(apiFactoryProvider)(store.serverUrl, token)
+                    .pushTest();
                 toast('Sent. It should arrive in a moment.');
               } on ApiException catch (e) {
                 toast(e.message);

@@ -35,7 +35,7 @@ final syncEngineProvider = Provider<SyncEngine>(
   ),
 );
 
-/// How the controller builds an [Api] for one-off calls such as sign out. Tests override it.
+/// How the app builds an [Api] for one-off calls (settings, sign out). Tests override it.
 final apiFactoryProvider = Provider<Api Function(String base, String token)>(
   (ref) =>
       (base, token) => Api(base, token: token),
@@ -123,8 +123,9 @@ final statsProvider = Provider<Stats>((ref) {
 
 const _defaultPoints = {'chore': 10, 'habit': 15, 'todo': 20};
 
-/// Starter chores from the household schedule. Ids are deterministic (uuid v5) so seeding
-/// on two devices cannot create duplicates.
+/// Generic example chores offered from the empty state and Settings. Ids are deterministic
+/// (uuid v5) so seeding on two devices cannot create duplicates. Weekdays is a bitmask,
+/// bit0 = Monday .. bit6 = Sunday.
 class StarterChore {
   const StarterChore(this.name, this.weekdays, this.time);
   final String name, time;
@@ -132,17 +133,12 @@ class StarterChore {
 }
 
 const starterChores = [
-  StarterChore('Recycling', 1, '17:15'),
-  StarterChore('Worm Food', 4, '16:00'),
-  StarterChore('Put washing in machine', 16, '15:30'),
-  StarterChore('Hang out washing', 16, '16:30'),
-  StarterChore('Clean bathroom', 16, '17:00'),
-  StarterChore('Room clean', 32, '09:30'),
-  StarterChore('Bring in washing', 32, '12:00'),
-  StarterChore('Fold washing', 32, '13:00'),
-  StarterChore('Put washing away', 32, '14:00'),
-  StarterChore('Wash or dry dishes, or cook dinner', 119, '18:30'),
-  StarterChore('Dishes or dinner (early, game night)', 8, '17:30'),
+  StarterChore('Take out the bins', 1, '18:00'),
+  StarterChore('Water the plants', 4, '17:00'),
+  StarterChore('Laundry', 16, '16:00'),
+  StarterChore('Clean the bathroom', 16, '17:00'),
+  StarterChore('Tidy your room', 32, '10:00'),
+  StarterChore('Dishes or cook dinner', 127, '18:30'),
 ];
 
 /// All user actions that change data go through here: write locally, reward, schedule a sync.
@@ -167,7 +163,13 @@ class AppController {
 
   Future<void> syncNow() async {
     final generation = _authGeneration;
-    final status = await ref.read(syncEngineProvider).sync();
+    SyncStatus status;
+    try {
+      status = await ref.read(syncEngineProvider).sync();
+    } catch (_) {
+      // Timer-driven sync errors are reported as offline, not unhandled async errors.
+      status = SyncStatus.offline;
+    }
     if (generation != _authGeneration || _signedOut) return;
     if (status == SyncStatus.unpaired) {
       ref.invalidate(pairedProvider);

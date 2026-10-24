@@ -101,9 +101,7 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("binding {addr}"))?;
     tracing::info!(%addr, "listening");
     axum::serve(listener, api::router(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .context("server error")
 }
@@ -112,4 +110,21 @@ fn fmt_ms(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms)
         .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
         .unwrap_or_else(|| "?".into())
+}
+
+/// Resolves on SIGINT (Ctrl-C) or SIGTERM (what `docker stop` and systemd send).
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = ?e, "cannot install SIGTERM handler, only Ctrl-C will stop the server");
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT received, shutting down"),
+        _ = term.recv() => tracing::info!("SIGTERM received, shutting down"),
+    }
 }

@@ -109,7 +109,7 @@ class _PairScreenState extends ConsumerState<PairScreen> {
             ),
             const SizedBox(height: 8),
             Text(
-              'Make a code on Hestia with: docker exec bread-tracker bread-tracker-server pair',
+              'Make a code on the server with: docker exec bread-tracker bread-tracker-server pair',
               style: TextStyle(color: p.dim, fontSize: 12),
             ),
             if (_error != null)

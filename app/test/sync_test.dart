@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:drift/drift.dart' show Value, driftRuntimeOptions;
 import 'package:drift/native.dart';
 
@@ -232,6 +234,54 @@ void main() {
     await db.close();
   });
 
+  test('default Api instances share one http client instead of opening one per call', () async {
+    final seen = <String>[];
+    final shared = MockClient((r) async {
+      seen.add('${r.method} ${r.url.path}');
+      return http.Response(
+        '{"cursor": 0, "items": [], "completions": [], "server_time": 0}',
+        200,
+      );
+    });
+    Api.sharedClient = shared;
+    addTearDown(() => Api.sharedClient = null);
+
+    // Two separately built Apis (different base/token) use the same client.
+    await Api('http://a', token: 't1').sync(0, [], []);
+    await Api('http://b', token: 't2').sync(0, [], []);
+    expect(seen, ['POST /sync', 'POST /sync']);
+
+    // A default SyncEngine builds an Api per pass; every pass still goes through it.
+    SharedPreferences.setMockInitialValues({});
+    final db = AppDb(NativeDatabase.memory());
+    final engine = SyncEngine(
+      db,
+      MemStore(await SharedPreferences.getInstance()),
+    );
+    for (var i = 0; i < 3; i++) {
+      expect(await engine.sync(), SyncStatus.idle);
+    }
+    expect(seen.length, 5);
+    await db.close();
+
+    // An injected client is used instead of the shared one.
+    var injectedCalls = 0;
+    final own = MockClient((r) async {
+      injectedCalls++;
+      return http.Response('{}', 200);
+    });
+    await Api('http://c', token: 't', client: own).sync(0, [], []);
+    expect(seen.length, 5);
+    expect(injectedCalls, 1);
+    own.close(); // Injected clients remain caller-owned.
+    await Api('http://a', token: 't1').sync(0, [], []);
+    expect(
+      seen.length,
+      6,
+      reason: 'closing injected client does not close shared client',
+    );
+  });
+
   test('non-JSON replies (HTML 502, captive portal 200) report offline, not a crash', () async {
     for (final (code, body) in [
       (502, '<html><body>Bad gateway</body></html>'),
@@ -303,6 +353,40 @@ void main() {
       );
     },
   );
+
+  test('a real TCP connection is reused across Api instances and rotated credentials', () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    server.autoCompress = false;
+    final ports = <int>[];
+    final tokens = <String?>[];
+    final subscription = server.listen((request) async {
+      ports.add(request.connectionInfo!.remotePort);
+      tokens.add(request.headers.value(HttpHeaders.authorizationHeader));
+      request.response
+        ..headers.contentType = ContentType.json
+        ..write('{"cursor":0,"items":[],"completions":[],"server_time":0}');
+      await request.response.close();
+    });
+    Api.sharedClient = null;
+    final shared = Api.sharedClient;
+    addTearDown(() async {
+      shared.close();
+      Api.sharedClient = null;
+      await subscription.cancel();
+      await server.close(force: true);
+    });
+
+    final base = 'http://${server.address.address}:${server.port}';
+    await Api(base, token: 'old-token').sync(0, [], []);
+    await Api(base, token: 'rotated-token').sync(0, [], []);
+    expect(ports, hasLength(2));
+    expect(
+      ports.toSet(),
+      hasLength(1),
+      reason: 'default Apis reuse the TCP socket',
+    );
+    expect(tokens, ['Bearer old-token', 'Bearer rotated-token']);
+  });
 
   test('an edit made while a sync is in flight stays dirty', () async {
     final server = FakeServer();

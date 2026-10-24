@@ -234,6 +234,185 @@ async fn sync_validates_rows() {
         .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
     }
+    let (_, unknown) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"completions": [comp("33333333-3333-4333-8333-333333333333", "2026-10-19", now, None)]}))).await;
+    assert_eq!(unknown["error"], "completion references an unknown item");
+    let (status, same_batch) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"items": [item("33333333-3333-4333-8333-333333333333", "chore", "New item", 127, None, now)], "completions": [comp("33333333-3333-4333-8333-333333333333", "2026-10-19", now, None)]}))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "same-request new items are valid references: {same_batch}"
+    );
+}
+
+#[tokio::test]
+async fn offline_completion_for_deleted_item_and_unrelated_change_remains_compatible() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [item(C1, "chore", "old", 127, None, now)]})),
+    )
+    .await;
+    call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"items": [{"id": C1, "kind": "chore", "name": "old", "weekdays": 127, "remind_time": null, "points": 10, "due_date": null, "sort": 0, "active": false, "updated_at": now + 1, "deleted_at": now + 1}]}))).await;
+    let (status, response) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({
+            "items": [item(H1, "habit", "unrelated", 127, None, now + 2)],
+            "completions": [comp(C1, "2026-10-19", now + 2, None)]
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "old offline completion must not strand other changes: {response}"
+    );
+    assert!(response["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["id"] == H1));
+}
+
+#[tokio::test]
+async fn tombstone_cleanup_is_disabled_until_acknowledgements_exist() {
+    let h = harness().await;
+    let p = store::prune(&h.state.db, store::now_ms() + 100 * 86_400_000)
+        .await
+        .unwrap();
+    assert_eq!(p.items, 0);
+    assert_eq!(p.completions, 0);
+}
+
+#[tokio::test]
+async fn prune_never_drops_tombstones_without_acknowledgement_protocol() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [item(C1, "chore", "old", 127, None, now)]})),
+    )
+    .await;
+    call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"items": [{"id": C1, "kind": "chore", "name": "old", "weekdays": 127, "remind_time": null, "points": 10, "due_date": null, "sort": 0, "active": false, "updated_at": now + 1, "deleted_at": now + 1}]}))).await;
+    let pruned = store::prune(&h.state.db, now + 100 * 86_400_000)
+        .await
+        .unwrap();
+    assert_eq!(pruned.items, 0);
+    let deleted: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE id=? AND deleted_at IS NOT NULL")
+            .bind(C1)
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(deleted, 1);
+}
+
+#[tokio::test]
+async fn scheduler_queries_use_indexes_and_keep_any_date_todo_completion() {
+    let h = harness().await;
+    let now = store::now_ms();
+    let tok = paired(&h).await;
+    call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"items": [item(C1, "todo", "Pay", 0, None, now)], "completions": [comp(C1, "2026-10-18", now, None)]}))).await;
+    let rows = store::reminder_completions(&h.state.db, "2026-10-19", "2026-10-18")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "any-day to-do completion must suppress due reminder"
+    );
+    let date_plan: Vec<(i64, i64, i64, String)> = sqlx::query_as("EXPLAIN QUERY PLAN SELECT item_id, date, completed_at, updated_at, deleted_at, seq FROM completions WHERE date IN ('2026-10-19', '2026-10-18')")
+        .fetch_all(&h.state.db).await.unwrap();
+    let todo_plan: Vec<(i64, i64, i64, String)> = sqlx::query_as("EXPLAIN QUERY PLAN SELECT item_id, date, completed_at, updated_at, deleted_at, seq FROM completions WHERE item_id IN (SELECT id FROM items WHERE kind = 'todo')")
+        .fetch_all(&h.state.db).await.unwrap();
+    assert!(
+        date_plan.iter().any(|(_, _, _, d)| d.contains("INDEX"))
+            && !date_plan
+                .iter()
+                .any(|(_, _, _, d)| d.contains("SCAN completions")),
+        "date lookup should avoid a full scan, got {date_plan:?}"
+    );
+    assert!(
+        todo_plan
+            .iter()
+            .any(|(_, _, _, d)| d.contains("items_kind_id"))
+            && todo_plan
+                .iter()
+                .any(|(_, _, _, d)| d.contains("SEARCH completions USING INDEX"))
+            && !todo_plan
+                .iter()
+                .any(|(_, _, _, d)| d.contains("SCAN items")),
+        "todo suppression should use indexes, got {todo_plan:?}"
+    );
+    let item_plan = store::reminder_items_query_plan(&h.state.db).await.unwrap();
+    assert!(
+        item_plan
+            .iter()
+            .any(|(_, _, _, d)| d.contains("items_reminder_candidates"))
+            && !item_plan
+                .iter()
+                .any(|(_, _, _, d)| d.contains("SCAN items")),
+        "reminder selection should use the partial index, got {item_plan:?}"
+    );
+    for _ in 0..100 {
+        let id = uuid::Uuid::new_v4().to_string();
+        call(
+            &h.app,
+            "POST",
+            "/sync",
+            Some(&tok),
+            Some(json!({"items": [item(&id, "todo", "historical", 1, None, now)]})),
+        )
+        .await;
+        call(
+            &h.app,
+            "POST",
+            "/sync",
+            Some(&tok),
+            Some(json!({"completions": [comp(&id, "2026-10-01", now, None)]})),
+        )
+        .await;
+    }
+    let queried = store::reminder_completions(&h.state.db, "2026-10-19", "2026-10-18")
+        .await
+        .unwrap();
+    assert_eq!(
+        queried.len(),
+        101,
+        "all-date to-do completions stay in semantics"
+    );
+    let live_plan: Vec<(i64, i64, i64, String)> = sqlx::query_as("EXPLAIN QUERY PLAN SELECT item_id, date, completed_at, updated_at, deleted_at, seq FROM completions WHERE date IN ('2026-10-19', '2026-10-18') UNION SELECT item_id, date, completed_at, updated_at, deleted_at, seq FROM completions WHERE item_id IN (SELECT id FROM items WHERE kind = 'todo')").fetch_all(&h.state.db).await.unwrap();
+    assert!(
+        live_plan
+            .iter()
+            .any(|(_, _, _, d)| d.contains("SEARCH completions USING INDEX"))
+            && live_plan
+                .iter()
+                .any(|(_, _, _, d)| d.contains("items_kind_id"))
+            && !live_plan
+                .iter()
+                .any(|(_, _, _, d)| d.contains("SCAN completions") || d.contains("SCAN items")),
+        "full completion plan on representative data must avoid table scans: {live_plan:?}"
+    );
+}
+
+#[tokio::test]
+async fn sync_rejects_completion_for_missing_item() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let (_, result) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"completions": [comp("33333333-3333-4333-8333-333333333333", "2026-10-19", store::now_ms(), None)]}))).await;
+    assert_eq!(result["error"], "completion references an unknown item");
 }
 
 #[tokio::test]
@@ -434,7 +613,7 @@ async fn scheduler_sends_once_skips_done_and_not_yet_due() {
         "POST",
         "/sync",
         Some(&tok),
-        Some(json!({"completions": [comp(H1, "2026-10-19", now, None)]})),
+        Some(json!({"items": [item(H1, "habit", "Read", 127, None, now)], "completions": [comp(H1, "2026-10-19", now, None)]})),
     )
     .await;
     assert_eq!(
@@ -903,4 +1082,162 @@ async fn half_set_quiet_window_is_rejected() {
     .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["quiet_start"], "");
+}
+
+#[tokio::test]
+async fn completion_dates_far_in_the_future_or_past_are_rejected() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    let far = (Utc::now() + Duration::days(30))
+        .format("%Y-%m-%d")
+        .to_string();
+    let tomorrow = (Utc::now() + Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    for bad in ["2999-01-01", far.as_str(), "1999-12-31"] {
+        let (s, _) = call(
+            &h.app,
+            "POST",
+            "/sync",
+            Some(&tok),
+            Some(json!({"items": [item(C1, "chore", "Reference", 127, None, now)], "completions": [comp(C1, bad, now, None)]})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    let (s, _) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [item(C1, "chore", "Reference", 127, None, now)], "completions": [comp(C1, &tomorrow, now, None)]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "a phone a day ahead is normal");
+}
+
+#[tokio::test]
+async fn completed_at_is_clamped_like_updated_at() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [item(C1, "chore", "Reference", 127, None, now)]})),
+    )
+    .await;
+    let future = now + 400 * 86_400_000;
+    let mut c = comp(C1, "2026-10-19", now, None);
+    c["completed_at"] = json!(future);
+    let (_, v) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"completions": [c]})),
+    )
+    .await;
+    let got = v["completions"][0]["completed_at"].as_i64().unwrap();
+    assert!(
+        got <= now + 86_400_000 + 5_000,
+        "completed_at {got} was not clamped"
+    );
+}
+
+#[tokio::test]
+async fn last_seen_is_written_at_most_once_per_interval() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let seen = |h: &Harness| {
+        let db = h.state.db.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT last_seen FROM devices")
+                .fetch_one(&db)
+                .await
+                .unwrap()
+        }
+    };
+    // Pretend the device was last seen two minutes ago: the next request refreshes it.
+    sqlx::query("UPDATE devices SET last_seen = ?")
+        .bind(store::now_ms() - 120_000)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    call(&h.app, "GET", "/settings", Some(&tok), None).await;
+    let first = seen(&h).await;
+    assert!(
+        first > store::now_ms() - 5_000,
+        "stale last_seen was refreshed"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    call(&h.app, "GET", "/settings", Some(&tok), None).await;
+    assert_eq!(
+        seen(&h).await,
+        first,
+        "a request inside the interval does not write"
+    );
+}
+
+#[tokio::test]
+async fn prune_removes_only_what_can_never_matter_again() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    let day = 86_400_000;
+    let old = now - 200 * day;
+    let recent = now - 10 * day;
+    const C2: &str = "33333333-3333-4333-8333-333333333333";
+    let mut gone = item(C1, "chore", "Old gone", 127, None, old);
+    gone["deleted_at"] = json!(old);
+    let mut fresh_gone = item(C2, "chore", "Recently gone", 127, None, recent);
+    fresh_gone["deleted_at"] = json!(recent);
+    call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"items": [item(C1, "chore", "Old gone", 127, None, old), item(C2, "chore", "Recently gone", 127, None, recent)]}))).await;
+    call(&h.app, "POST", "/sync", Some(&tok), Some(json!({
+        "items": [item(C1, "chore", "Old gone", 127, None, old), gone, fresh_gone, item(H1, "habit", "Kept", 127, None, now)],
+        "completions": [comp(C1, "2026-01-01", old, Some(old)), comp(C2, "2026-10-01", recent, Some(recent)), comp(H1, "2026-10-19", now, None)]
+    }))).await;
+    sqlx::query("INSERT INTO reminders_sent (item_id, date, sent_at) VALUES (?, '2020-01-01', 0), (?, ?, 0)")
+        .bind(H1).bind(H1).bind(Utc::now().format("%Y-%m-%d").to_string())
+        .execute(&h.state.db).await.unwrap();
+    sqlx::query(
+        "INSERT INTO pairing_codes (code_hash, expires_at) VALUES ('expired', ?), ('live', ?)",
+    )
+    .bind(now - 1000)
+    .bind(now + 600_000)
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+
+    let p = store::prune(&h.state.db, now).await.unwrap();
+    assert_eq!(
+        (p.reminders, p.pairing_codes, p.items, p.completions),
+        (1, 1, 0, 0),
+        "{p:?}"
+    );
+
+    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM items ORDER BY id")
+        .fetch_all(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        ids,
+        vec![C1.to_string(), H1.to_string(), C2.to_string()],
+        "tombstones remain available to every offline device"
+    );
+    let comps: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM completions")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(comps, 3);
+    let codes: Vec<String> = sqlx::query_scalar("SELECT code_hash FROM pairing_codes")
+        .fetch_all(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(codes, vec!["live".to_string()]);
+    let again = store::prune(&h.state.db, now).await.unwrap();
+    assert_eq!(again, store::Pruned::default(), "idempotent");
 }

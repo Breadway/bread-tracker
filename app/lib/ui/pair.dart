@@ -50,11 +50,13 @@ class _PairScreenState extends ConsumerState<PairScreen> {
     });
     try {
       final token = await Api(server).pair(_code.text.trim(), 'Android');
+      // Claim the new auth generation before any credential/cursor write awaits,
+      // so a pending sign-out cannot wipe data belonging to this pairing.
+      ref.read(controllerProvider).pairedAgain();
       final store = ref.read(storeProvider);
       await store.setServerUrl(server);
       await store.saveToken(token);
       await store.resetSync();
-      ref.read(controllerProvider).pairedAgain();
       ref.invalidate(pairedProvider);
       ref.read(controllerProvider).syncNow();
       ref.read(pushProvider).register(requestPermission: true);

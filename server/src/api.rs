@@ -97,8 +97,27 @@ async fn sync(
     for it in &req.items {
         it.validate().map_err(ApiError::BadRequest)?;
     }
+    let today = Utc::now().date_naive();
     for c in &req.completions {
-        c.validate().map_err(ApiError::BadRequest)?;
+        c.validate(today).map_err(ApiError::BadRequest)?;
+    }
+    let incoming: std::collections::HashSet<&str> =
+        req.items.iter().map(|i| i.id.as_str()).collect();
+    let mut referenced: Vec<String> = req.completions.iter().map(|c| c.item_id.clone()).collect();
+    referenced.extend(req.items.iter().map(|i| i.id.clone()));
+    let existing = store::item_ids(&st.db, &referenced).await?;
+    // A batch may carry a new item and its completion together. Validate references against
+    // the union before any write, so malformed rows cannot partially apply.
+    for c in &req.completions {
+        // Tombstoned references are legitimate from offline old clients: a sibling
+        // device may have deleted the item after this completion was recorded.
+        let referenced_by_live_or_deleted =
+            existing.contains(&c.item_id) || incoming.contains(c.item_id.as_str());
+        if !referenced_by_live_or_deleted {
+            return Err(ApiError::BadRequest(
+                "completion references an unknown item".into(),
+            ));
+        }
     }
     store::apply_push(&st.db, &req.items, &req.completions).await?;
     Ok(Json(store::pull(&st.db, req.since).await?))
@@ -250,7 +269,6 @@ async fn put_settings(
     if let Some(tz) = &p.timezone {
         Tz::from_str(tz).map_err(|_| ApiError::BadRequest("unknown timezone".into()))?;
     }
-
     if let Some(tz) = &p.timezone {
         sqlx::query("INSERT INTO settings (key, value) VALUES ('timezone', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
             .bind(tz).execute(&mut *tx).await?;

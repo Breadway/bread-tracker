@@ -83,7 +83,7 @@ pub async fn apply_push(
         )
         .bind(&c.item_id)
         .bind(&c.date)
-        .bind(c.completed_at)
+        .bind(c.completed_at.min(ceiling))
         .bind(updated)
         .bind(c.deleted_at)
         .bind(seq)
@@ -139,16 +139,94 @@ pub async fn all_completions(db: &Db) -> Result<Vec<Completion>, sqlx::Error> {
         .await
 }
 
-/// Completions the scheduler needs: everything dated `date`, plus every completion of a
-/// to-do (a to-do ticked on an earlier day is still done on its due date).
-pub async fn reminder_completions(db: &Db, date: &str) -> Result<Vec<Completion>, sqlx::Error> {
-    sqlx::query_as::<_, Completion>(&format!(
-        "SELECT {COMPLETION_COLS} FROM completions
-         WHERE date = ? OR item_id IN (SELECT id FROM items WHERE kind = 'todo')"
+/// Items the scheduler can remind about, instead of loading every row each tick.
+pub async fn reminder_items(db: &Db) -> Result<Vec<Item>, sqlx::Error> {
+    sqlx::query_as::<_, Item>(&format!(
+        "SELECT {ITEM_COLS} FROM items WHERE active = 1 AND deleted_at IS NULL AND remind_time IS NOT NULL"
     ))
-    .bind(date)
     .fetch_all(db)
     .await
+}
+
+/// Representative query plan for scheduler item selection. Kept as a testable statement
+/// because the partial index must match the scheduler predicate exactly.
+pub async fn reminder_items_query_plan(
+    db: &Db,
+) -> Result<Vec<(i64, i64, i64, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "EXPLAIN QUERY PLAN SELECT id FROM items WHERE active = 1 AND deleted_at IS NULL AND remind_time IS NOT NULL",
+    )
+    .fetch_all(db)
+    .await
+}
+
+pub async fn reminder_completions(
+    db: &Db,
+    date: &str,
+    yesterday: &str,
+) -> Result<Vec<Completion>, sqlx::Error> {
+    sqlx::query_as::<_, Completion>(&format!(
+        "SELECT {COMPLETION_COLS} FROM completions WHERE date IN (?, ?)
+         UNION
+         SELECT {COMPLETION_COLS} FROM completions
+         WHERE item_id IN (SELECT id FROM items WHERE kind = 'todo')"
+    ))
+    .bind(date)
+    .bind(yesterday)
+    .fetch_all(db)
+    .await
+}
+
+pub async fn item_ids(
+    db: &Db,
+    ids: &[String],
+) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(Default::default());
+    }
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let sql = format!("SELECT id FROM items WHERE id IN ({placeholders})");
+    let mut q = sqlx::query_scalar::<_, String>(&sql);
+    for id in ids {
+        q = q.bind(id);
+    }
+    Ok(q.fetch_all(db).await?.into_iter().collect())
+}
+
+/// How many rows a cleanup pass removed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Pruned {
+    pub reminders: u64,
+    pub items: u64,
+    pub completions: u64,
+    pub pairing_codes: u64,
+}
+
+/// Delete expired pairing and reminder bookkeeping. Tombstones stay until the protocol offers
+/// device cursor acknowledgements or a forced-full-resync contract.
+pub async fn prune(db: &Db, now: i64) -> Result<Pruned, sqlx::Error> {
+    let day_before_yesterday = (chrono::DateTime::from_timestamp_millis(now)
+        .unwrap_or_default()
+        .date_naive()
+        - chrono::Duration::days(2))
+    .format("%Y-%m-%d")
+    .to_string();
+    // reminders_sent.date is a local date in the user's zone, so keep a margin of days.
+    let reminders = sqlx::query("DELETE FROM reminders_sent WHERE date < ?")
+        .bind(day_before_yesterday)
+        .execute(db)
+        .await?
+        .rows_affected();
+    let pairing_codes = sqlx::query("DELETE FROM pairing_codes WHERE expires_at < ?")
+        .bind(now)
+        .execute(db)
+        .await?
+        .rows_affected();
+    Ok(Pruned {
+        reminders,
+        pairing_codes,
+        ..Pruned::default()
+    })
 }
 
 pub async fn get_setting(db: &Db, key: &str) -> Result<String, sqlx::Error> {

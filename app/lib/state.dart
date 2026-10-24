@@ -132,6 +132,10 @@ class StarterChore {
   final int weekdays;
 }
 
+class _AuthTransitionSuperseded implements Exception {
+  const _AuthTransitionSuperseded();
+}
+
 const starterChores = [
   StarterChore('Take out the bins', 1, '18:00'),
   StarterChore('Water the plants', 4, '17:00'),
@@ -188,12 +192,15 @@ class AppController {
   /// Returns false when the server could not be told, so the caller can say the token may
   /// still be valid until revoked from the server.
   Future<bool> signOut({bool wipeLocal = false}) async {
-    _authGeneration++;
+    final generation = ++_authGeneration;
+    final store = ref.read(storeProvider);
+    final token = await store.token;
+    if (generation != _authGeneration || await store.token != token) {
+      return false;
+    }
     _signedOut = true;
     _syncTimer?.cancel();
     ref.read(syncEngineProvider).invalidate();
-    final store = ref.read(storeProvider);
-    final token = await store.token;
     var revoked = true;
     if (token != null) {
       try {
@@ -204,13 +211,42 @@ class AppController {
         revoked = false;
       }
     }
-    await store.clearToken();
-    await store.resetSync();
-    if (wipeLocal) await _db.clearAll();
+    // DELETE can be slow. Pairing a replacement credential while it is in-flight
+    // transfers ownership to the new generation, so the old sign-out must not
+    // clear that credential, cursor, or the replacement device's local data.
+    if (generation != _authGeneration || !_signedOut) return revoked;
+    final cleanup = token == null
+        ? await store.runIfTokenless(() async {
+            await store.resetSync();
+            if (generation != _authGeneration || !_signedOut) return;
+            if (wipeLocal) await _wipeLocalIfCurrent(generation);
+          })
+        : await store.clearTokenAndRunIfCurrent(token, () async {
+            await store.resetSync();
+            if (generation != _authGeneration || !_signedOut) return;
+            if (wipeLocal) await _wipeLocalIfCurrent(generation);
+          });
+    if (!cleanup || generation != _authGeneration || !_signedOut) {
+      return revoked;
+    }
     ref.read(syncStatusProvider.notifier).set(SyncStatus.unpaired);
     ref.invalidate(pairedProvider);
     unawaited(ref.read(pushProvider).register());
     return revoked;
+  }
+
+  Future<void> _wipeLocalIfCurrent(int generation) async {
+    try {
+      await _db.transaction(() async {
+        await _db.delete(_db.completions).go();
+        await _db.delete(_db.items).go();
+        if (generation != _authGeneration || !_signedOut) {
+          throw const _AuthTransitionSuperseded();
+        }
+      });
+    } on _AuthTransitionSuperseded {
+      return;
+    }
   }
 
   void pairedAgain() {

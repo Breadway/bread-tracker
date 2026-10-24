@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:drift/drift.dart' show Value;
 import 'package:drift/native.dart';
@@ -16,12 +17,56 @@ import 'package:tracker/state.dart';
 class MemStore extends Store {
   MemStore(super.prefs);
   String? _t = 'tok';
+  Completer<void>? resetStarted;
+  Completer<void>? releaseReset;
   @override
   Future<String?> get token async => _t;
   @override
   Future<void> saveToken(String t) async => _t = t;
   @override
+  Future<bool> clearTokenAndRunIfCurrent(
+    String expected,
+    Future<void> Function() action,
+  ) async {
+    if (_t != expected) return false;
+    await clearToken();
+    await action();
+    return true;
+  }
+
+  @override
   Future<void> clearToken() async => _t = null;
+
+  @override
+  Future<bool> runIfTokenless(Future<void> Function() action) async {
+    if (_t != null) return false;
+    await action();
+    return true;
+  }
+
+  @override
+  Future<void> resetSync() async {
+    if (resetStarted != null && !resetStarted!.isCompleted) {
+      resetStarted!.complete();
+    }
+    if (releaseReset != null) await releaseReset!.future;
+    await super.resetSync();
+  }
+
+  @override
+  Future<bool> runIfTokenCurrent(
+    String expected,
+    Future<void> Function() action,
+  ) async {
+    if (_t != expected) return false;
+    if (resetStarted != null && !resetStarted!.isCompleted) {
+      resetStarted!.complete();
+    }
+    if (releaseReset != null) await releaseReset!.future;
+    if (_t != expected) return false;
+    await action();
+    return true;
+  }
 }
 
 const id1 = '11111111-1111-4111-8111-111111111111';
@@ -57,6 +102,36 @@ Future<(ProviderContainer, MemStore, AppDb)> setup(MockClient client) async {
 }
 
 void main() {
+  test('existing file-backed database reopens with retained item and completion history', () async {
+    final dir = await Directory.systemTemp.createTemp('track10-db-reopen-');
+    addTearDown(() => dir.delete(recursive: true));
+    final path = '${dir.path}/tracker.sqlite';
+    final first = AppDb(NativeDatabase(File(path)));
+    await first.upsertItem(
+      ItemsCompanion.insert(
+        id: id1,
+        kind: 'chore',
+        name: 'legacy install item',
+        points: 10,
+        updatedAt: 7,
+        dirty: const Value(true),
+      ),
+    );
+    await first.setCompletion(id1, '2026-10-19', true, 8);
+    await first.close();
+
+    final reopened = AppDb(NativeDatabase(File(path)));
+    expect(
+      (await reopened.select(reopened.items).getSingle()).name,
+      'legacy install item',
+    );
+    expect(
+      (await reopened.select(reopened.completions).getSingle()).completedAt,
+      8,
+    );
+    await reopened.close();
+  });
+
   test('sign out revokes on the server, forgets the token and cursor, keeps data by default', () async {
     final calls = <String>[];
     final (c, store, db) = await setup(
@@ -261,6 +336,101 @@ void main() {
       expect(await store.token, 'new-token');
       expect(store.cursor, 0);
       expect((await db.select(db.items).getSingle()).dirty, isTrue);
+    },
+  );
+
+  test(
+    'delayed successful revoke cannot clear replacement token or wipe its data',
+    () async {
+      final enteredDelete = Completer<void>();
+      final releaseDelete = Completer<void>();
+      final client = MockClient((r) async {
+        if (r.method == 'DELETE') {
+          enteredDelete.complete();
+          await releaseDelete.future;
+        }
+        return http.Response('{"ok":true}', 200);
+      });
+      final (container, store, db) = await setup(client);
+      final signingOut = container
+          .read(controllerProvider)
+          .signOut(wipeLocal: true);
+      await enteredDelete.future;
+
+      final replacementWrite = store.saveToken('replacement');
+      container.read(controllerProvider).pairedAgain();
+      await replacementWrite;
+      await db.upsertItem(
+        ItemsCompanion.insert(
+          id: '22222222-2222-4222-8222-222222222222',
+          kind: 'habit',
+          name: 'new device data',
+          points: 15,
+          updatedAt: 3,
+          dirty: const Value(true),
+        ),
+      );
+      releaseDelete.complete();
+
+      expect(await signingOut, isTrue);
+      expect(await store.token, 'replacement');
+      expect(
+        (await db.select(db.items).get()).map((r) => r.name),
+        containsAll(['Dishes', 'new device data']),
+      );
+      expect(store.cursor, 12);
+    },
+  );
+
+  test(
+    'overlapping sign-outs allow only newest generation to mutate local state',
+    () async {
+      final enteredFirstDelete = Completer<void>();
+      final releaseFirstDelete = Completer<void>();
+      var deleteCount = 0;
+      final (container, store, db) = await setup(
+        MockClient((request) async {
+          if (request.method == 'DELETE' && ++deleteCount == 1) {
+            enteredFirstDelete.complete();
+            await releaseFirstDelete.future;
+          }
+          return http.Response('{"ok":true}', 200);
+        }),
+      );
+      final controller = container.read(controllerProvider);
+      final first = controller.signOut(wipeLocal: true);
+      await enteredFirstDelete.future;
+      final second = controller.signOut();
+      expect(await second, isTrue);
+      releaseFirstDelete.complete();
+      expect(await first, isTrue);
+      expect(await store.token, isNull);
+      expect(await db.select(db.items).get(), hasLength(1));
+    },
+  );
+
+  test(
+    'replacement at database wipe boundary retains rows and cursor',
+    () async {
+      final (container, store, db) = await setup(
+        MockClient((_) async => http.Response('{"ok":true}', 200)),
+      );
+      store.resetStarted = Completer<void>();
+      store.releaseReset = Completer<void>();
+      final signingOut = container
+          .read(controllerProvider)
+          .signOut(wipeLocal: true);
+      await store.resetStarted!.future;
+      final replacementWrite = store.saveToken('replacement');
+      container.read(controllerProvider).pairedAgain();
+      store.releaseReset!.complete();
+
+      expect(await signingOut, isTrue);
+      await replacementWrite;
+      expect(await store.token, 'replacement');
+      expect(store.cursor, 0);
+      expect(await db.select(db.items).get(), hasLength(1));
+      expect(await db.select(db.completions).get(), hasLength(1));
     },
   );
 }

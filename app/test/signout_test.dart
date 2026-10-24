@@ -25,12 +25,19 @@ class MemStore extends Store {
   Future<void> saveToken(String t) async => _t = t;
 
   @override
-  Future<bool> clearTokenAndRunIfCurrent(
+  Future<bool> clearTokenIfCurrent(String expected) async {
+    if (_t != expected) return false;
+    _t = null;
+    return true;
+  }
+
+  @override
+  Future<bool> clearTokenIfCurrentAndRun(
     String expected,
     Future<void> Function() action,
   ) async {
     if (_t != expected) return false;
-    await clearToken();
+    await clearTokenIfCurrent(expected);
     await action();
     return true;
   }

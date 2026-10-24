@@ -17,7 +17,18 @@ class Store {
   Future<void> clearToken() =>
       _serializeCredentialMutation(() => _secure.delete(key: 'token'));
 
-  Future<bool> clearTokenAndRunIfCurrent(
+  Future<bool> clearTokenIfCurrent(String expected) async {
+    var cleared = false;
+    await _serializeCredentialMutation(() async {
+      if (await _secure.read(key: 'token') != expected) return;
+      await _secure.delete(key: 'token');
+      cleared = true;
+    });
+    return cleared;
+  }
+
+  /// Deletes only [expected], then keeps cleanup ahead of any re-pair write.
+  Future<bool> clearTokenIfCurrentAndRun(
     String expected,
     Future<void> Function() action,
   ) async {

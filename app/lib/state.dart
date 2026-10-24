@@ -221,7 +221,7 @@ class AppController {
             if (generation != _authGeneration || !_signedOut) return;
             if (wipeLocal) await _wipeLocalIfCurrent(generation);
           })
-        : await store.clearTokenAndRunIfCurrent(token, () async {
+        : await store.clearTokenIfCurrentAndRun(token, () async {
             await store.resetSync();
             if (generation != _authGeneration || !_signedOut) return;
             if (wipeLocal) await _wipeLocalIfCurrent(generation);

@@ -258,6 +258,27 @@ async fn settings_round_trip_and_validation() {
     let tok = paired(&h).await;
     let (_, v) = call(&h.app, "GET", "/settings", Some(&tok), None).await;
     assert_eq!(v["timezone"], "Australia/Perth");
+    assert_eq!(v["utc_offset_minutes"], 480, "Perth has no DST");
+    let (s, v) = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"timezone": "Asia/Kolkata"})),
+    )
+    .await;
+    assert_eq!(
+        (s, v["utc_offset_minutes"].as_i64()),
+        (StatusCode::OK, Some(330))
+    );
+    call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"timezone": "Australia/Perth"})),
+    )
+    .await;
     let (s, v) = call(
         &h.app,
         "PUT",
@@ -278,6 +299,78 @@ async fn settings_round_trip_and_validation() {
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"quiet_start": "22:00", "quiet_end": "not-a-time"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (_, after) = call(&h.app, "GET", "/settings", Some(&tok), None).await;
+    assert_eq!(
+        after["quiet_start"], "22:00",
+        "invalid patch must not partially mutate settings"
+    );
+    assert_eq!(after["quiet_end"], "07:00");
+    let concurrent = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"timezone":"Australia/Sydney","reminders_enabled":false})),
+    );
+    let concurrent2 = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"quiet_start":"21:00","quiet_end":"06:00"})),
+    );
+    let (a, b) = tokio::join!(concurrent, concurrent2);
+    assert_eq!(a.0, StatusCode::OK);
+    assert_eq!(b.0, StatusCode::OK);
+    let (_, final_settings) = call(&h.app, "GET", "/settings", Some(&tok), None).await;
+    assert_eq!(final_settings["timezone"], "Australia/Sydney");
+    assert_eq!(final_settings["quiet_start"], "21:00");
+    assert_eq!(final_settings["quiet_end"], "06:00");
+    assert_eq!(final_settings["reminders_enabled"], false);
+}
+
+#[tokio::test]
+async fn concurrent_settings_patches_preserve_both_fields() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let app = h.app.clone();
+    let token = tok.clone();
+    let first = tokio::spawn(async move {
+        call(
+            &app,
+            "PUT",
+            "/settings",
+            Some(&token),
+            Some(json!({"timezone": "Australia/Sydney"})),
+        )
+        .await
+    });
+    let app = h.app.clone();
+    let token = tok.clone();
+    let second = tokio::spawn(async move {
+        call(
+            &app,
+            "PUT",
+            "/settings",
+            Some(&token),
+            Some(json!({"reminders_enabled": false})),
+        )
+        .await
+    });
+    assert_eq!(first.await.unwrap().0, StatusCode::OK);
+    assert_eq!(second.await.unwrap().0, StatusCode::OK);
+    let (_, settings) = call(&h.app, "GET", "/settings", Some(&tok), None).await;
+    assert_eq!(settings["timezone"], "Australia/Sydney");
+    assert_eq!(settings["reminders_enabled"], false);
 }
 
 // Monday 2026-10-19, 17:15 Perth = 09:15 UTC.
@@ -471,4 +564,254 @@ async fn push_test_route_needs_a_registered_token() {
     let (s, v) = call(&h.app, "POST", "/push/test", Some(&tok), None).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(h.mock.sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn todo_ticked_on_an_earlier_day_gets_no_reminder() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    let mut todo = item(C1, "todo", "Pay rent", 127, Some("17:15"), now);
+    todo["due_date"] = json!("2026-10-19");
+    let mut other = item(H1, "todo", "Book dentist", 127, Some("17:15"), now);
+    other["due_date"] = json!("2026-10-19");
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({
+            "items": [todo, other],
+            // C1 was ticked yesterday, ahead of its due date.
+            "completions": [comp(C1, "2026-10-18", now, None)]
+        })),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&tok),
+        Some(json!({"fcm_token": "fcm-token-1"})),
+    )
+    .await;
+
+    assert_eq!(push::tick(&h.state, perth(17, 16)).await.unwrap(), 1);
+    let titles: Vec<String> = h
+        .mock
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| m.title.clone())
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["Book dentist"],
+        "only the untouched to-do is reminded"
+    );
+}
+
+#[tokio::test]
+async fn un_ticked_todo_completion_does_not_suppress_the_reminder() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    let mut todo = item(C1, "todo", "Pay rent", 127, Some("17:15"), now);
+    todo["due_date"] = json!("2026-10-19");
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({
+            "items": [todo],
+            "completions": [comp(C1, "2026-10-18", now, Some(now))]
+        })),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&tok),
+        Some(json!({"fcm_token": "fcm-token-1"})),
+    )
+    .await;
+    assert_eq!(push::tick(&h.state, perth(17, 16)).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn quiet_hours_longer_than_grace_defer_the_reminder_to_when_they_end() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    // 22:30 chore every day; quiet hours 22:00-07:00 (9h, longer than the 6h grace).
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [item(C1, "chore", "Night", 127, Some("22:30"), now)]})),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&tok),
+        Some(json!({"fcm_token": "fcm-token-1"})),
+    )
+    .await;
+    let (s, _) = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"quiet_start": "22:00", "quiet_end": "07:00"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    assert_eq!(
+        push::tick(&h.state, perth(22, 31)).await.unwrap(),
+        0,
+        "quiet"
+    );
+    let next = |h: u32, m: u32| perth(h, m) + Duration::days(1);
+    assert_eq!(
+        push::tick(&h.state, next(4, 31)).await.unwrap(),
+        0,
+        "still quiet, past the old grace cutoff"
+    );
+    assert_eq!(push::tick(&h.state, next(6, 59)).await.unwrap(), 0);
+    assert_eq!(
+        push::tick(&h.state, next(7, 1)).await.unwrap(),
+        1,
+        "released when quiet hours end"
+    );
+    {
+        let sent = h.mock.sent.lock().unwrap();
+        assert_eq!(
+            sent[0].data["date"], "2026-10-19",
+            "keeps the date it was scheduled for"
+        );
+    }
+    assert_eq!(
+        push::tick(&h.state, next(7, 2)).await.unwrap(),
+        0,
+        "only once"
+    );
+}
+
+#[tokio::test]
+async fn held_reminder_still_expires_after_grace_from_the_end_of_quiet_hours() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [item(C1, "chore", "Night", 127, Some("22:30"), now)]})),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&tok),
+        Some(json!({"fcm_token": "fcm-token-1"})),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"quiet_start": "22:00", "quiet_end": "07:00"})),
+    )
+    .await;
+    // Server was down until 14:00 the next day: the held reminder is stale, not sent that late.
+    assert_eq!(
+        push::tick(&h.state, perth(14, 0) + Duration::days(1))
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn ordinary_missed_reminder_is_not_carried_past_midnight() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [item(C1, "chore", "Late", 127, Some("23:00"), now)]})),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&tok),
+        Some(json!({"fcm_token": "fcm-token-1"})),
+    )
+    .await;
+    assert_eq!(
+        push::tick(&h.state, perth(0, 30) + Duration::days(1))
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn half_set_quiet_window_is_rejected() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let (s, _) = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"quiet_start": "22:00"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (_, v) = call(&h.app, "GET", "/settings", Some(&tok), None).await;
+    assert_eq!(v["quiet_start"], "", "nothing was stored");
+    let (s, _) = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"quiet_start": "22:00", "quiet_end": "07:00"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"quiet_end": ""})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "clearing only one end");
+    let (s, v) = call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&tok),
+        Some(json!({"quiet_start": "", "quiet_end": ""})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["quiet_start"], "");
 }

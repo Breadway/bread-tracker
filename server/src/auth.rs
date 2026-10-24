@@ -19,6 +19,7 @@ use crate::AppState;
 
 const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const CODE_TTL_MS: i64 = 15 * 60 * 1000;
+const LAST_SEEN_INTERVAL_MS: i64 = 60 * 1000;
 
 #[derive(Clone, Debug)]
 pub struct DeviceId(pub String);
@@ -142,16 +143,22 @@ pub async fn require_auth(
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(ApiError::Unauthorized)?
         .to_string();
-    let id: Option<String> = sqlx::query_scalar("SELECT id FROM devices WHERE token_hash = ?")
-        .bind(hash(&token))
-        .fetch_optional(&st.db)
-        .await?;
-    let id = id.ok_or(ApiError::Unauthorized)?;
-    sqlx::query("UPDATE devices SET last_seen = ? WHERE id = ?")
-        .bind(now_ms())
-        .bind(&id)
-        .execute(&st.db)
-        .await?;
+    let row: Option<(String, i64)> =
+        sqlx::query_as("SELECT id, last_seen FROM devices WHERE token_hash = ?")
+            .bind(hash(&token))
+            .fetch_optional(&st.db)
+            .await?;
+    let (id, last_seen) = row.ok_or(ApiError::Unauthorized)?;
+    // last_seen is informational, so write it at most once per interval, not per request.
+    let now = now_ms();
+    if now - last_seen >= LAST_SEEN_INTERVAL_MS {
+        sqlx::query("UPDATE devices SET last_seen = ? WHERE id = ? AND last_seen < ?")
+            .bind(now)
+            .bind(&id)
+            .bind(now - LAST_SEEN_INTERVAL_MS)
+            .execute(&st.db)
+            .await?;
+    }
     req.extensions_mut().insert(DeviceId(id));
     Ok(next.run(req).await)
 }

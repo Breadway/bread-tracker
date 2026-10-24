@@ -346,9 +346,8 @@ pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize
         .format("%Y-%m-%d")
         .to_string();
 
-    let items = store::all_items(&st.db).await?;
-    let mut completions = store::reminder_completions(&st.db, &date).await?;
-    completions.extend(store::reminder_completions(&st.db, &yesterday).await?);
+    let items = store::reminder_items(&st.db).await?;
+    let completions = store::reminder_completions(&st.db, &date, &yesterday).await?;
     let sent: HashSet<(String, String)> = sqlx::query_as::<_, (String, String)>(
         "SELECT item_id, date FROM reminders_sent WHERE date IN (?, ?)",
     )
@@ -420,14 +419,26 @@ pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize
     Ok(count)
 }
 
+/// Ticks between cleanup passes (30 s each, so about an hour).
+const PRUNE_EVERY_TICKS: u64 = 120;
+
 pub fn spawn_scheduler(st: AppState) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
+        let mut n: u64 = 0;
         loop {
             interval.tick().await;
             if let Err(e) = tick(&st, Utc::now()).await {
                 tracing::error!(error = ?e, "reminder tick failed");
             }
+            if n.is_multiple_of(PRUNE_EVERY_TICKS) {
+                match store::prune(&st.db, now_ms()).await {
+                    Ok(p) if p != store::Pruned::default() => tracing::info!(?p, "pruned old rows"),
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(error = ?e, "cleanup failed"),
+                }
+            }
+            n = n.wrapping_add(1);
         }
     });
 }

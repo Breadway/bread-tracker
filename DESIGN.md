@@ -1,7 +1,7 @@
 # Bread Tracker design
 
 Separate from the Nextcloud Chores calendar and the Gotify cron reminders. Server and
-database live on Hestia; the Android app (Flutter) is offline-first and syncs to it.
+database live on a server you host; the Android app (Flutter) is offline-first and syncs to it.
 
 ## Rules (shared by server `server/src/xp.rs` and the app; vectors in `spec/xp_vectors.json`)
 
@@ -27,7 +27,7 @@ Single user. `bread-tracker-server pair` prints a one-time code (valid 15 minute
 
 ## Reminders
 
-A scheduler ticks every 30 s in the configured timezone (default Australia/Perth). An item is due once its local `remind_time` has passed (chores and habits on their weekdays, to-dos on their due date) and stays eligible for 6 hours (`BREADTRACKER_REMINDER_GRACE_MINS`) so a restart does not blast old reminders. It is skipped when already completed today (a to-do counts as done if it was completed on any day) or already sent (`reminders_sent`). Nothing is sent during quiet hours; a reminder whose time falls inside the quiet window is held and released when the window ends, and then has its full grace window from that moment (including the next morning for a window that wraps midnight). Quiet hours need both a start and an end: `PUT /settings` rejects setting only one. Nothing is marked sent when no device has an FCM token, so a reminder can still go out after a device registers. Dead tokens reported by FCM (UNREGISTERED) are cleared.
+A scheduler ticks every 30 s in the configured timezone (default Australia/Perth). The server uses one timezone for "today", reminder times and quiet hours; the app stamps completions with the phone's own calendar date, so the two only agree when the phone is in the server's zone (the intended single-timezone assumption). The app's Settings has a Reminders section that reads and writes `GET/PUT /settings` (reminders on/off, quiet hours, timezone) and shows a warning when the server's current UTC offset (`utc_offset_minutes` in the settings response) differs from the phone's. It does not change the server zone on its own. An item is due once its local `remind_time` has passed (chores and habits on their weekdays, to-dos on their due date) and stays eligible for 6 hours (`BREADTRACKER_REMINDER_GRACE_MINS`) so a restart does not blast old reminders. It is skipped when already completed today (a to-do counts as done if it was completed on any day), already sent (`reminders_sent`), or inside quiet hours. A reminder whose time falls inside the quiet window is held and released when the window ends, and then has its full grace window from that moment (including the next morning for a window that wraps midnight). Quiet hours need both a start and an end: `PUT /settings` rejects setting only one. Nothing is marked sent when no device has an FCM token, so a reminder can still go out after a device registers. Dead tokens reported by FCM (UNREGISTERED) are cleared.
 
 Messages are FCM HTTP v1 with notification + data (`item_id`, `date`, `kind`), Android channel `reminders`, high priority. The app's "Mark done" action uses the data to write the completion.
 

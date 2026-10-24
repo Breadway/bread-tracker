@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import 'package:drift/drift.dart' show Value;
 
+import 'data/api.dart';
 import 'data/database.dart';
 import 'data/store.dart';
 import 'data/sync.dart';
@@ -27,6 +28,10 @@ final dbProvider = Provider<AppDb>((ref) {
 });
 final syncEngineProvider = Provider<SyncEngine>(
   (ref) => SyncEngine(ref.watch(dbProvider), ref.watch(storeProvider)),
+);
+/// How the app builds an [Api] for one-off calls (settings, sign out). Tests override it.
+final apiFactoryProvider = Provider<Api Function(String base, String token)>(
+  (ref) => (base, token) => Api(base, token: token),
 );
 final sfxProvider = Provider<Sfx>((ref) => NoSfx());
 final pushProvider = Provider<PushService>((ref) => NoPushService());
@@ -111,8 +116,9 @@ final statsProvider = Provider<Stats>((ref) {
 
 const _defaultPoints = {'chore': 10, 'habit': 15, 'todo': 20};
 
-/// Starter chores from the household schedule. Ids are deterministic (uuid v5) so seeding
-/// on two devices cannot create duplicates.
+/// Generic example chores offered from the empty state and Settings. Ids are deterministic
+/// (uuid v5) so seeding on two devices cannot create duplicates. Weekdays is a bitmask,
+/// bit0 = Monday .. bit6 = Sunday.
 class StarterChore {
   const StarterChore(this.name, this.weekdays, this.time);
   final String name, time;
@@ -120,17 +126,12 @@ class StarterChore {
 }
 
 const starterChores = [
-  StarterChore('Recycling', 1, '17:15'),
-  StarterChore('Worm Food', 4, '16:00'),
-  StarterChore('Put washing in machine', 16, '15:30'),
-  StarterChore('Hang out washing', 16, '16:30'),
-  StarterChore('Clean bathroom', 16, '17:00'),
-  StarterChore('Room clean', 32, '09:30'),
-  StarterChore('Bring in washing', 32, '12:00'),
-  StarterChore('Fold washing', 32, '13:00'),
-  StarterChore('Put washing away', 32, '14:00'),
-  StarterChore('Wash or dry dishes, or cook dinner', 119, '18:30'),
-  StarterChore('Dishes or dinner (early, game night)', 8, '17:30'),
+  StarterChore('Take out the bins', 1, '18:00'),
+  StarterChore('Water the plants', 4, '17:00'),
+  StarterChore('Laundry', 16, '16:00'),
+  StarterChore('Clean the bathroom', 16, '17:00'),
+  StarterChore('Tidy your room', 32, '10:00'),
+  StarterChore('Dishes or cook dinner', 127, '18:30'),
 ];
 
 /// All user actions that change data go through here: write locally, reward, schedule a sync.
@@ -151,7 +152,13 @@ class AppController {
   }
 
   Future<void> syncNow() async {
-    final status = await ref.read(syncEngineProvider).sync();
+    SyncStatus status;
+    try {
+      status = await ref.read(syncEngineProvider).sync();
+    } catch (_) {
+      // A sync failure must never escape as an unhandled async error from a timer.
+      status = SyncStatus.offline;
+    }
     if (status != SyncStatus.syncing) {
       ref.read(syncStatusProvider.notifier).set(status);
     }

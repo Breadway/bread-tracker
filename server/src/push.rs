@@ -432,7 +432,7 @@ pub fn spawn_scheduler(st: AppState) {
                 tracing::error!(error = ?e, "reminder tick failed");
             }
             if n.is_multiple_of(PRUNE_EVERY_TICKS) {
-                match store::prune(&st.db, now_ms(), st.config.tombstone_days).await {
+                match store::prune(&st.db, now_ms()).await {
                     Ok(p) if p != store::Pruned::default() => tracing::info!(?p, "pruned old rows"),
                     Ok(_) => {}
                     Err(e) => tracing::error!(error = ?e, "cleanup failed"),

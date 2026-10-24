@@ -204,7 +204,7 @@ pub struct Pruned {
 
 /// Delete expired pairing and reminder bookkeeping. Tombstones stay until the protocol offers
 /// device cursor acknowledgements or a forced-full-resync contract.
-pub async fn prune(db: &Db, now: i64, _tombstone_days: i64) -> Result<Pruned, sqlx::Error> {
+pub async fn prune(db: &Db, now: i64) -> Result<Pruned, sqlx::Error> {
     let day_before_yesterday = (chrono::DateTime::from_timestamp_millis(now)
         .unwrap_or_default()
         .date_naive()

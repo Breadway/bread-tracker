@@ -245,9 +245,46 @@ async fn sync_validates_rows() {
 }
 
 #[tokio::test]
+async fn offline_completion_for_deleted_item_and_unrelated_change_remains_compatible() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [item(C1, "chore", "old", 127, None, now)]})),
+    )
+    .await;
+    call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"items": [{"id": C1, "kind": "chore", "name": "old", "weekdays": 127, "remind_time": null, "points": 10, "due_date": null, "sort": 0, "active": false, "updated_at": now + 1, "deleted_at": now + 1}]}))).await;
+    let (status, response) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({
+            "items": [item(H1, "habit", "unrelated", 127, None, now + 2)],
+            "completions": [comp(C1, "2026-10-19", now + 2, None)]
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "old offline completion must not strand other changes: {response}"
+    );
+    assert!(response["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["id"] == H1));
+}
+
+#[tokio::test]
 async fn tombstone_cleanup_is_disabled_until_acknowledgements_exist() {
     let h = harness().await;
-    let p = store::prune(&h.state.db, store::now_ms() + 100 * 86_400_000, 1)
+    let p = store::prune(&h.state.db, store::now_ms() + 100 * 86_400_000)
         .await
         .unwrap();
     assert_eq!(p.items, 0);
@@ -268,7 +305,7 @@ async fn prune_never_drops_tombstones_without_acknowledgement_protocol() {
     )
     .await;
     call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"items": [{"id": C1, "kind": "chore", "name": "old", "weekdays": 127, "remind_time": null, "points": 10, "due_date": null, "sort": 0, "active": false, "updated_at": now + 1, "deleted_at": now + 1}]}))).await;
-    let pruned = store::prune(&h.state.db, now + 100 * 86_400_000, 1)
+    let pruned = store::prune(&h.state.db, now + 100 * 86_400_000)
         .await
         .unwrap();
     assert_eq!(pruned.items, 0);
@@ -282,7 +319,7 @@ async fn prune_never_drops_tombstones_without_acknowledgement_protocol() {
 }
 
 #[tokio::test]
-async fn scheduler_completion_query_uses_indexes_and_keeps_any_date_todo_completion() {
+async fn scheduler_queries_use_indexes_and_keep_any_date_todo_completion() {
     let h = harness().await;
     let now = store::now_ms();
     let tok = paired(&h).await;
@@ -295,11 +332,78 @@ async fn scheduler_completion_query_uses_indexes_and_keeps_any_date_todo_complet
         1,
         "any-day to-do completion must suppress due reminder"
     );
-    let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as("EXPLAIN QUERY PLAN SELECT item_id, date, completed_at, updated_at, deleted_at, seq FROM completions WHERE date IN ('2026-10-19', '2026-10-18') UNION SELECT item_id, date, completed_at, updated_at, deleted_at, seq FROM completions WHERE item_id IN (SELECT id FROM items WHERE kind = 'todo')")
+    let date_plan: Vec<(i64, i64, i64, String)> = sqlx::query_as("EXPLAIN QUERY PLAN SELECT item_id, date, completed_at, updated_at, deleted_at, seq FROM completions WHERE date IN ('2026-10-19', '2026-10-18')")
+        .fetch_all(&h.state.db).await.unwrap();
+    let todo_plan: Vec<(i64, i64, i64, String)> = sqlx::query_as("EXPLAIN QUERY PLAN SELECT item_id, date, completed_at, updated_at, deleted_at, seq FROM completions WHERE item_id IN (SELECT id FROM items WHERE kind = 'todo')")
         .fetch_all(&h.state.db).await.unwrap();
     assert!(
-        plan.iter().any(|(_, _, _, d)| d.contains("INDEX")),
-        "expected indexed access, got {plan:?}"
+        date_plan.iter().any(|(_, _, _, d)| d.contains("INDEX"))
+            && !date_plan
+                .iter()
+                .any(|(_, _, _, d)| d.contains("SCAN completions")),
+        "date lookup should avoid a full scan, got {date_plan:?}"
+    );
+    assert!(
+        todo_plan
+            .iter()
+            .any(|(_, _, _, d)| d.contains("items_kind_id"))
+            && todo_plan
+                .iter()
+                .any(|(_, _, _, d)| d.contains("SEARCH completions USING INDEX"))
+            && !todo_plan
+                .iter()
+                .any(|(_, _, _, d)| d.contains("SCAN items")),
+        "todo suppression should use indexes, got {todo_plan:?}"
+    );
+    let item_plan = store::reminder_items_query_plan(&h.state.db).await.unwrap();
+    assert!(
+        item_plan
+            .iter()
+            .any(|(_, _, _, d)| d.contains("items_reminder_candidates"))
+            && !item_plan
+                .iter()
+                .any(|(_, _, _, d)| d.contains("SCAN items")),
+        "reminder selection should use the partial index, got {item_plan:?}"
+    );
+    for _ in 0..100 {
+        let id = uuid::Uuid::new_v4().to_string();
+        call(
+            &h.app,
+            "POST",
+            "/sync",
+            Some(&tok),
+            Some(json!({"items": [item(&id, "todo", "historical", 1, None, now)]})),
+        )
+        .await;
+        call(
+            &h.app,
+            "POST",
+            "/sync",
+            Some(&tok),
+            Some(json!({"completions": [comp(&id, "2026-10-01", now, None)]})),
+        )
+        .await;
+    }
+    let queried = store::reminder_completions(&h.state.db, "2026-10-19", "2026-10-18")
+        .await
+        .unwrap();
+    assert_eq!(
+        queried.len(),
+        101,
+        "all-date to-do completions stay in semantics"
+    );
+    let live_plan: Vec<(i64, i64, i64, String)> = sqlx::query_as("EXPLAIN QUERY PLAN SELECT item_id, date, completed_at, updated_at, deleted_at, seq FROM completions WHERE date IN ('2026-10-19', '2026-10-18') UNION SELECT item_id, date, completed_at, updated_at, deleted_at, seq FROM completions WHERE item_id IN (SELECT id FROM items WHERE kind = 'todo')").fetch_all(&h.state.db).await.unwrap();
+    assert!(
+        live_plan
+            .iter()
+            .any(|(_, _, _, d)| d.contains("SEARCH completions USING INDEX"))
+            && live_plan
+                .iter()
+                .any(|(_, _, _, d)| d.contains("items_kind_id"))
+            && !live_plan
+                .iter()
+                .any(|(_, _, _, d)| d.contains("SCAN completions") || d.contains("SCAN items")),
+        "full completion plan on representative data must avoid table scans: {live_plan:?}"
     );
 }
 
@@ -1019,7 +1123,7 @@ async fn prune_removes_only_what_can_never_matter_again() {
     .await
     .unwrap();
 
-    let p = store::prune(&h.state.db, now, 180).await.unwrap();
+    let p = store::prune(&h.state.db, now).await.unwrap();
     assert_eq!(
         (p.reminders, p.pairing_codes, p.items, p.completions),
         (1, 1, 0, 0),
@@ -1045,6 +1149,6 @@ async fn prune_removes_only_what_can_never_matter_again() {
         .await
         .unwrap();
     assert_eq!(codes, vec!["live".to_string()]);
-    let again = store::prune(&h.state.db, now, 180).await.unwrap();
+    let again = store::prune(&h.state.db, now).await.unwrap();
     assert_eq!(again, store::Pruned::default(), "idempotent");
 }

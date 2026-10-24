@@ -47,7 +47,7 @@ class Store {
   Future<bool> runIfTokenless(Future<void> Function() action) async {
     var ran = false;
     await _serializeCredentialMutation(() async {
-      if (await token != null) return;
+      if (await _secure.read(key: 'token') != null) return;
       await action();
       ran = true;
     });

@@ -23,6 +23,7 @@ class MemStore extends Store {
   Future<String?> get token async => _t;
   @override
   Future<void> saveToken(String t) async => _t = t;
+
   @override
   Future<bool> clearTokenAndRunIfCurrent(
     String expected,

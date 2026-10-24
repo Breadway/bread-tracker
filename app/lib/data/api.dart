@@ -47,9 +47,24 @@ class ServerSettings {
 }
 
 /// Thin client for the Bread Tracker server.
+///
+/// An `Api` is cheap and short lived (the base URL and token can change), so it never owns
+/// a connection pool. All instances share one process-wide [http.Client] unless a client is
+/// passed in, which keeps a single set of keep-alive sockets instead of leaking an idle
+/// `HttpClient` per sync.
 class Api {
   Api(this.base, {this.token, http.Client? client})
-    : _c = client ?? http.Client();
+    : _c = client ?? sharedClient;
+
+  static http.Client? _shared;
+
+  /// The client used when none is injected. Created on first use and never closed: it
+  /// lives as long as the app process.
+  static http.Client get sharedClient => _shared ??= http.Client();
+
+  /// Replace (or with null, reset) the shared client. For tests.
+  static set sharedClient(http.Client? c) => _shared = c;
+
   final String base;
   final String? token;
   final http.Client _c;

@@ -2165,3 +2165,80 @@ async fn every_protected_route_rejects_an_invalid_bearer() {
         assert_eq!(s, StatusCode::UNAUTHORIZED, "{m} {path}");
     }
 }
+
+#[tokio::test]
+async fn a_late_unregistered_answer_clears_only_the_token_fcm_rejected() {
+    // The scheduler sends to "old-token"; while that send is in flight the device registers
+    // "new-token". FCM then answers UNREGISTERED for the old one. The newer token must survive.
+    use async_trait::async_trait;
+    use bread_tracker_server::push::{Message, PushSender, SendOutcome};
+
+    struct Racing {
+        db: sqlx::SqlitePool,
+    }
+    #[async_trait]
+    impl PushSender for Racing {
+        fn enabled(&self) -> bool {
+            true
+        }
+        async fn send(&self, msg: &Message) -> anyhow::Result<SendOutcome> {
+            // the device re-registers while this send is "in flight"
+            sqlx::query("UPDATE devices SET fcm_token = 'new-token' WHERE user_id = 1")
+                .execute(&self.db)
+                .await?;
+            assert_eq!(msg.token, "old-token");
+            Ok(SendOutcome::Unregistered)
+        }
+    }
+
+    let db = db::connect_memory().await.unwrap();
+    let st = AppState::new(
+        db.clone(),
+        Config::from_env(),
+        Arc::new(Racing { db: db.clone() }),
+    );
+    let app = api::router(st.clone());
+    let code = auth::create_pairing_code(&db).await.unwrap();
+    let (_, v) = call(
+        &app,
+        "POST",
+        "/pair",
+        None,
+        Some(json!({"code": code, "device_name": "p"})),
+    )
+    .await;
+    let tok = v["token"].as_str().unwrap().to_string();
+    let now = store::now_ms();
+    call(
+        &app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [item(C1, "chore", "Dishes", 127, Some("17:15"), now)]})),
+    )
+    .await;
+    call(
+        &app,
+        "PUT",
+        "/device",
+        Some(&tok),
+        Some(json!({"fcm_token": "old-token"})),
+    )
+    .await;
+
+    assert_eq!(
+        push::tick(&st, perth(17, 16)).await.unwrap(),
+        0,
+        "nothing delivered"
+    );
+    let held: Option<String> =
+        sqlx::query_scalar("SELECT fcm_token FROM devices WHERE user_id = 1")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(
+        held.as_deref(),
+        Some("new-token"),
+        "the newer token survived the stale answer"
+    );
+}

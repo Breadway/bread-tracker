@@ -148,6 +148,9 @@ async fn set_device(
     let mut tx = st.db.begin_with("BEGIN IMMEDIATE").await?;
     // The device authenticated a moment ago; it may have signed out or been revoked since.
     // Recheck it still exists and still belongs to this user before touching anyone else.
+    // This early check is defence in depth: the `assigned != 1` check below also refuses and rolls
+    // the transaction back, so removing it is not observable (an equivalent mutation). It stops the
+    // takeover before any row is changed.
     let caller: Option<i64> =
         sqlx::query_scalar("SELECT 1 FROM devices WHERE id = ? AND user_id = ?")
             .bind(&id)

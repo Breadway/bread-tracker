@@ -71,7 +71,7 @@ released. See "Users and migrations" in DESIGN.md.
 
 Everything below uses only what this repository ships: the pinned Litestream image (it has
 `sh`, `cp`, `tar`) and `python3` on the host with its standard `sqlite3` module, driven by
-`scripts/db-evidence.py` (read-only, standard library only; the server image has no SQLite
+`scripts/db-evidence.py` and `scripts/backup-gate.sh` (standard library only; the server image has no SQLite
 command line). Run it as the ordinary deploy user, from the checkout, with the
 default compose project name. Plan a short maintenance window: the app is unavailable between
 step 2 and step 4 and phones retry on their own.
@@ -103,37 +103,44 @@ step 2 and step 4 and phones retry on their own.
    ```
 
    Do not start the containers again until step 4. Verify the copy itself. It must open,
-   pass `integrity_check` and `foreign_key_check`, and record only migrations this release
-   supports (`1`, `2`, `3`, `5`, `6`):
+   pass `integrity_check` and `foreign_key_check`, have a valid migration ledger (every
+   migration recorded once and successful, with the checksum of the shipped file), and record
+   only migrations this release supports (`1`, `2`, `3`, `5`, `6`):
 
    ```sh
    python3 scripts/db-evidence.py check "$COPY/bread-tracker.db" --ledger-subset 1,2,3,5,6
    ```
 
-   It prints the evidence (row counts, `meta.seq`, migration versions, a digest of every row)
-   and ends with `CHECK PASSED`. Anything else, including a recorded migration this release
+   It prints the evidence (row counts, `meta.seq`, the migration ledger, a digest of every
+   row) and ends with `CHECK PASSED`. The checker works on a private copy of the database file
+   and of its `-wal` and `-shm` files, so the files it is pointed at, sidecars included, stay
+   byte-identical. Anything else, including a recorded migration this release
    does not ship such as `0004`, is a stop: leave the copy as it is, go to "If the gate or
    the upgrade fails" below, and do not deploy.
 
 3. **Mandatory backup gate: the Litestream replica must restore and match the frozen copy.**
    The original requirement for this upgrade is a Litestream-checked backup before deploying.
-   Restore the replica into a scratch file and compare it with the frozen copy:
+   `scripts/backup-gate.sh` restores the replica into a scratch file and compares it with the
+   frozen copy. Its exit status is the gate: `0` and `BACKUP GATE PASSED` only if the restore
+   and the comparison both succeed, otherwise `BACKUP GATE FAILED: do not deploy` and a
+   non-zero status:
 
    ```sh
    BACKUP_DIR=$(realpath "${BREADTRACKER_BACKUP_DIR:-./backups}")
-   WORK=$(mktemp -d)
-   if docker run --rm --user "$(id -u):$(id -g)" -v "$BACKUP_DIR":/b:ro -v "$WORK":/o \
-        litestream/litestream:0.3.13 restore -o /o/replica.db file:///b/litestream \
-      && python3 scripts/db-evidence.py compare "$COPY/bread-tracker.db" "$WORK/replica.db"
-   then echo "BACKUP GATE PASSED"; else echo "BACKUP GATE FAILED: do not deploy"; fi
+   scripts/backup-gate.sh "$COPY/bread-tracker.db" "$BACKUP_DIR"
    ```
 
-   Proceed to step 4 only if this prints `BACKUP GATE PASSED`. The gate fails closed: a
-   missing or empty replica directory, a restore error, an unreadable or empty restored file,
-   a failed integrity or foreign key check, a different migration ledger, and any difference
-   in `meta.seq`, row counts or row contents (a stale replica) all stop it. Nothing about file
-   times is used. If it fails, do not deploy and do not delete or edit `$COPY`: it stays the
-   authoritative recovery point while you repair replication (see below).
+   Proceed to step 4 only if this exits `0` and prints `BACKUP GATE PASSED`. If you run these
+   blocks from one script, run it with `set -e` or chain the deploy behind the gate
+   (`scripts/backup-gate.sh ... && docker compose ... up -d --build`), so a failed gate can
+   never reach the deploy command. The gate fails closed: a missing or empty replica
+   directory, a restore error, an unreadable or empty restored file, a failed integrity or
+   foreign key check, an invalid or different migration ledger (a missing ledger, a failed or
+   duplicated migration, a checksum that differs from the frozen copy or from the shipped
+   migration file), and any difference in `meta.seq`, row counts or row contents (a stale
+   replica) all stop it. Nothing about file times is used. If it fails, do not deploy and do
+   not delete or edit `$COPY`: it stays the authoritative recovery point while you repair
+   replication (see below).
 
 4. **Name the first user and deploy.** Only after `BACKUP GATE PASSED`. Set
    `BREADTRACKER_ADMIN_NAME` in `.env` (for example `Riley`), then build and start the new

@@ -24,6 +24,9 @@ const I3: &str = "33333333-3333-4333-8333-333333333333";
 /// and must never change.
 const SHA_0001: &str = "43b80a728988ff17392c658746718dfd9cb3fe020834569cd8488bb59db8bc64358b893275b6dac6d392dc85f24c176c";
 const SHA_0003: &str = "30ac24599e921d7a167a83c6df30d88b388258eb10bf3ac4625d50920d42c8873d75a661b6bb93bafd262a0581f048e0";
+/// 0002 and 0005 are published (PR43 e4195dd and 6f9986e) and may be recorded on real databases.
+const SHA_0002: &str = "f74d93be96b8fda33d2425e9baa9155aa485e71ccb6b556ba28dbeb0a8140e1409fbffa18b14d02ea00b1af8df73ff94";
+const SHA_0005: &str = "a54fae5719b8b335d52b072f5a82fe3eeed050e18e715e5f8143fd82b9b02c0359c31ae5555567a9a4aaff3cd1c008d3";
 const SHA_0004: &str = "229011bcf178a2afa3eb4277c56a4866e4cc51a292418b12ea336d0b1ae0975b17ae0a53abf71a4511abcb67ed7aa60e";
 
 /// The 0004 file as PR31 publishes it, copied byte for byte so the combined tree can be tested
@@ -295,7 +298,9 @@ fn assert_ledger(rows: &[(i64, String, bool)], expected: &[i64], with_0004: bool
     );
     let sum = |v: i64| rows.iter().find(|r| r.0 == v).map(|r| r.1.as_str());
     assert_eq!(sum(1), Some(SHA_0001), "0001 must be byte-identical");
+    assert_eq!(sum(2), Some(SHA_0002), "0002 must be byte-identical");
     assert_eq!(sum(3), Some(SHA_0003), "0003 must be byte-identical");
+    assert_eq!(sum(5), Some(SHA_0005), "0005 must be byte-identical");
     if with_0004 {
         assert_eq!(sum(4), Some(SHA_0004), "0004 must be byte-identical");
     }
@@ -314,12 +319,14 @@ fn published_migration_files_keep_their_checksums() {
         )
     };
     assert_eq!(sum(1), SHA_0001);
+    assert_eq!(sum(2), SHA_0002);
     assert_eq!(sum(3), SHA_0003);
     assert_eq!(sum(4), SHA_0004);
+    assert_eq!(sum(5), SHA_0005);
     assert_eq!(checksum_of(SQL_0004), SHA_0004);
     // Versions are unique and strictly increasing; nothing collides with 0004.
     let versions: Vec<i64> = m.migrations.iter().map(|x| x.version).collect();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
 }
 
 #[tokio::test]
@@ -331,7 +338,7 @@ async fn upgrade_from_0001_only() {
     let pool = db::connect_with_migrator(&url(&path), None, &embedded())
         .await
         .unwrap();
-    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 5], false);
+    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 5, 6], false);
     assert_upgraded_and_intact(&pool).await;
 }
 
@@ -360,7 +367,7 @@ async fn upgrade_from_0001_and_0003_restores_the_hygiene_indexes_0002_dropped() 
         assert!(!lost.contains(&idx.to_string()), "{idx} should be gone");
     }
     // ...and running the repair afterwards restores them (what an operator's upgrade does).
-    migrator(&[1, 2, 3, 5], false).run(&pool).await.unwrap();
+    migrator(&[1, 2, 3, 5, 6], false).run(&pool).await.unwrap();
     assert!(index_names(&pool)
         .await
         .contains(&"items_kind_id".to_string()));
@@ -369,7 +376,7 @@ async fn upgrade_from_0001_and_0003_restores_the_hygiene_indexes_0002_dropped() 
     let pool = db::connect_with_migrator(&url(&path), None, &embedded())
         .await
         .unwrap();
-    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 5], false);
+    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 5, 6], false);
     assert_upgraded_and_intact(&pool).await;
 }
 
@@ -382,7 +389,7 @@ async fn upgrade_from_0001_0003_and_0004() {
     let pool = db::connect_with_migrator(&url(&path), None, &combined())
         .await
         .unwrap();
-    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 4, 5], true);
+    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 4, 5, 6], true);
     assert_upgraded_and_intact(&pool).await;
     // 0004's table was not touched by the rebuild.
     assert_eq!(
@@ -399,7 +406,7 @@ async fn upgrade_from_0001_and_0004_without_0003() {
     let pool = db::connect_with_migrator(&url(&path), None, &combined())
         .await
         .unwrap();
-    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 4, 5], true);
+    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 4, 5, 6], true);
     assert_upgraded_and_intact(&pool).await;
 }
 
@@ -412,7 +419,7 @@ async fn upgrade_from_the_published_pr43_head_0001_and_0002() {
     let pool = db::connect_with_migrator(&url(&path), None, &embedded())
         .await
         .unwrap();
-    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 5], false);
+    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 5, 6], false);
     assert_upgraded_and_intact(&pool).await;
 }
 
@@ -425,7 +432,7 @@ async fn upgrade_from_0001_0002_0003_in_that_order() {
     let pool = db::connect_with_migrator(&url(&path), None, &embedded())
         .await
         .unwrap();
-    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 5], false);
+    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 5, 6], false);
     assert_upgraded_and_intact(&pool).await;
 }
 
@@ -436,7 +443,7 @@ async fn fresh_database_gets_the_whole_set_in_version_order() {
     let pool = db::connect_with_migrator(&url(&path), None, &combined())
         .await
         .unwrap();
-    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 4, 5], true);
+    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 4, 5, 6], true);
     let names = index_names(&pool).await;
     for idx in HYGIENE_INDEXES {
         assert!(names.contains(&idx.to_string()), "{idx}");
@@ -602,7 +609,7 @@ async fn a_failed_0002_rolls_back_completely_and_a_retry_succeeds() {
     let pool = db::connect_with_migrator(&url(&path), None, &combined())
         .await
         .unwrap();
-    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 4, 5], true);
+    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 4, 5, 6], true);
     assert_upgraded_and_intact(&pool).await;
 }
 
@@ -640,7 +647,7 @@ async fn a_failed_0005_keeps_the_0002_result_and_a_retry_completes_the_repair() 
     let pool = db::connect_with_migrator(&url(&path), None, &embedded())
         .await
         .unwrap();
-    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 5], false);
+    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 5, 6], false);
     assert_upgraded_and_intact(&pool).await;
 }
 
@@ -689,4 +696,80 @@ async fn items_belong_to_their_user_and_removing_one_user_keeps_the_rest() {
         .unwrap();
     assert_eq!(scalar(&pool, "SELECT COUNT(*) FROM items").await, 3);
     let _ = I3;
+}
+
+/// Run exactly what PR43 head 6f9986e shipped (0001, 0002, 0003, 0005) on `path`, so the
+/// database is in the state of a deployment that already upgraded with that release.
+async fn upgrade_like_6f9986e(path: &Path, with_0004: bool) {
+    let pool = open(path).await;
+    migrator(&[1, 2, 3, 5], with_0004).run(&pool).await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn a_database_already_upgraded_by_6f9986e_receives_only_the_new_0006() {
+    for (name, then, with_0004) in [
+        ("a", vec![], false),
+        ("b", vec![3], false),
+        ("c", vec![3], true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{name}.db"));
+        deployed(&path, &then, with_0004).await;
+        upgrade_like_6f9986e(&path, with_0004).await;
+        let pool = open(&path).await;
+        let before = ledger(&pool).await;
+        assert_eq!(
+            before.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![1, 2, 3, 5]
+                .into_iter()
+                .chain(if with_0004 { Some(4) } else { None })
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        pool.close().await;
+
+        let m = if with_0004 { combined() } else { embedded() };
+        let pool = db::connect_with_migrator(&url(&path), None, &m)
+            .await
+            .unwrap();
+        let after = ledger(&pool).await;
+        // Everything recorded before is untouched (same versions, same checksums); only 0006 is new.
+        assert_eq!(after.len(), before.len() + 1, "{name}");
+        for row in &before {
+            assert!(after.contains(row), "{name}: {row:?} changed");
+        }
+        assert_eq!(after.last().unwrap().0, 6);
+        assert_upgraded_and_intact(&pool).await;
+    }
+}
+
+#[tokio::test]
+async fn a_failed_0006_keeps_everything_before_it_and_a_retry_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fail6.db");
+    deployed(&path, &[3], false).await;
+    upgrade_like_6f9986e(&path, false).await;
+
+    let err = db::connect_with_migrator(&url(&path), None, &failing_at(embedded(), 6)).await;
+    assert!(err.is_err());
+    let pool = open(&path).await;
+    assert_eq!(
+        ledger(&pool).await.iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![1, 2, 3, 5]
+    );
+    // 0006 changed nothing: the 0005 rename trigger is still the one in place.
+    assert_eq!(
+        scalar(&pool, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'users_name_key_rename'").await,
+        1
+    );
+    assert_eq!(scalar(&pool, "SELECT COUNT(*) FROM items").await, 3);
+    pool.close().await;
+
+    let pool = db::connect_with_migrator(&url(&path), None, &embedded())
+        .await
+        .unwrap();
+    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 5, 6], false);
+    assert_upgraded_and_intact(&pool).await;
 }

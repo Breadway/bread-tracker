@@ -39,7 +39,7 @@ pub async fn connect_with_migrator(
         .await?;
 
     migrator.run(&pool).await?;
-    crate::users::backfill_name_keys(&pool).await?;
+    crate::users::reconcile_name_keys(&pool).await?;
     if let Some(name) = admin_name {
         crate::users::apply_admin_name(&pool, name).await?;
     }

@@ -80,18 +80,29 @@ pub async fn create(db: &Db, name: &str, is_admin: bool) -> Result<i64, NameErro
 
 /// Rename a user. The name counts as chosen from then on, so the admin placeholder logic
 /// never touches it again.
+///
+/// The key is cleared and set again inside one transaction. The database refuses a non-ASCII
+/// rename that leaves the key as it was (a plain SQL rename would leave it stale), and a
+/// case-only change such as `Älex` to `älex` has the same key before and after, so the
+/// application path makes the change of key explicit instead of weakening that guard.
 pub async fn rename(db: &Db, id: i64, name: &str) -> Result<bool, NameError> {
     if !valid_name(name) {
         return Err(NameError::Invalid);
     }
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    sqlx::query("UPDATE users SET name_key = NULL WHERE id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     let res =
         sqlx::query("UPDATE users SET name = ?, name_key = ?, name_confirmed = 1 WHERE id = ?")
             .bind(name)
             .bind(name_key(name))
             .bind(id)
-            .execute(db)
+            .execute(&mut *tx)
             .await
             .map_err(map_unique)?;
+    tx.commit().await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -133,42 +144,82 @@ pub async fn apply_admin_name(db: &Db, name: &str) -> anyhow::Result<bool> {
     Ok(res.rows_affected() > 0)
 }
 
-/// Fill `name_key` for users that do not have one yet: the non-ASCII names that existed when
-/// migration 0005 ran (SQLite cannot case fold them). Runs at every start and is a no-op when
-/// nothing is missing. All rows are updated in one transaction. If two users would share a key
-/// (for example `Älex` and `älex` created by code that predates the key) nothing is changed
-/// and startup fails naming both, because choosing which user keeps the name is the
-/// operator's decision. The remedy is to rename one of them while the server is stopped, with
-/// `UPDATE users SET name = '<new name>', name_key = NULL WHERE id = <id>`; the key is filled
-/// again at the next start.
-pub async fn backfill_name_keys(db: &Db) -> anyhow::Result<usize> {
+/// What [`reconcile_name_keys`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Reconciled {
+    /// Users that had no key (written without one, or the operator cleared it).
+    pub filled: usize,
+    /// Users whose stored key no longer matched their name (renamed with plain SQL).
+    pub corrected: usize,
+}
+
+/// Check every user's `name_key` against their name and repair what is wrong, in one
+/// `BEGIN IMMEDIATE` transaction. Runs at every start, before the listener and the scheduler.
+///
+/// SQLite cannot case fold Unicode, so a key can be missing (a non-ASCII name written without
+/// one) or stale (a raw `UPDATE users SET name = ...` that changed the name but not the key).
+/// This recomputes the key of every user from their current name. If a user's recomputed key is
+/// already the key of another user, nothing is changed and startup fails naming both users:
+/// which of them keeps the name is the operator's decision, never an automatic overwrite. The
+/// remedy is to rename one while the server is stopped, with
+/// `UPDATE users SET name = '<new name>', name_key = NULL WHERE id = <id>`; the key is
+/// recomputed at the next start.
+///
+/// Keys are applied in two passes inside the transaction (cleared first, then set), so users
+/// that merely swap keys do not trip the unique index halfway through.
+pub async fn reconcile_name_keys(db: &Db) -> anyhow::Result<Reconciled> {
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
-    let missing: Vec<(i64, String)> =
-        sqlx::query_as("SELECT id, name FROM users WHERE name_key IS NULL ORDER BY id")
+    let rows: Vec<(i64, String, Option<String>)> =
+        sqlx::query_as("SELECT id, name, name_key FROM users ORDER BY id")
             .fetch_all(&mut *tx)
             .await?;
-    for (id, name) in &missing {
+
+    let mut wanted: std::collections::HashMap<String, (i64, &str)> =
+        std::collections::HashMap::new();
+    for (id, name, _) in &rows {
         let key = name_key(name);
-        let owner: Option<(i64, String)> =
-            sqlx::query_as("SELECT id, name FROM users WHERE name_key = ? AND id != ?")
-                .bind(&key)
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if let Some((other_id, other_name)) = owner {
+        if let Some((other_id, other_name)) = wanted.insert(key, (*id, name.as_str())) {
             anyhow::bail!(
                 "users {other_id} ({other_name:?}) and {id} ({name:?}) have the same name ignoring case; \
-                 rename one (UPDATE users SET name = '<new name>', name_key = NULL WHERE id = {id}) while the server is stopped, then start again"
+                 rename one (UPDATE users SET name = '<new name>', name_key = NULL WHERE id = {id}) \
+                 while the server is stopped, then start again"
             );
         }
+    }
+
+    let mut out = Reconciled::default();
+    let changed: Vec<(i64, String)> = rows
+        .iter()
+        .filter_map(|(id, name, stored)| {
+            let key = name_key(name);
+            match stored {
+                Some(s) if *s == key => None,
+                Some(_) => {
+                    out.corrected += 1;
+                    Some((*id, key))
+                }
+                None => {
+                    out.filled += 1;
+                    Some((*id, key))
+                }
+            }
+        })
+        .collect();
+    for (id, _) in &changed {
+        sqlx::query("UPDATE users SET name_key = NULL WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    for (id, key) in &changed {
         sqlx::query("UPDATE users SET name_key = ? WHERE id = ?")
-            .bind(&key)
+            .bind(key)
             .bind(id)
             .execute(&mut *tx)
             .await?;
     }
     tx.commit().await?;
-    Ok(missing.len())
+    Ok(out)
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]

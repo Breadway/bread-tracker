@@ -469,3 +469,357 @@ async fn a_second_users_device_and_data_are_not_served_before_scoping_exists() {
     let resp = app.oneshot(get("sam-token")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ---- TRACK-89: the background scheduler is single owner (no cross-owner delivery) ----
+
+mod scheduler_boundary {
+    use super::*;
+    use bread_tracker_server::push;
+    use chrono::{TimeZone, Utc};
+
+    async fn two_owners_two_devices(pool: &SqlitePool) -> i64 {
+        let sam = users::create(pool, "Sam", false).await.unwrap();
+        for (uid, item, title) in [
+            (1_i64, "admin-item", "ADMIN PRIVATE"),
+            (sam, "sam-item", "SAM PRIVATE"),
+        ] {
+            sqlx::query("INSERT INTO items (user_id, id, kind, name, points, weekdays, remind_time, updated_at, seq) VALUES (?, ?, 'chore', ?, 10, 127, '18:30', 1, 1)")
+                .bind(uid).bind(item).bind(title).execute(pool).await.unwrap();
+            sqlx::query("INSERT INTO devices (id, user_id, name, token_hash, fcm_token, created_at, last_seen) VALUES (?, ?, 'phone', ?, ?, 1, 1)")
+                .bind(format!("dev{uid}")).bind(uid).bind(format!("hash{uid}")).bind(format!("fcm{uid}"))
+                .execute(pool).await.unwrap();
+        }
+        sam
+    }
+
+    fn state(pool: &SqlitePool) -> (AppState, Arc<push::MockSender>) {
+        let mock = Arc::new(push::MockSender::default());
+        let st = AppState::new(pool.clone(), Config::from_env(), mock.clone());
+        (st, mock)
+    }
+
+    /// 18:30 Perth is 10:30 UTC.
+    fn at_1830() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 25, 10, 30, 0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn two_owners_two_devices_produce_exactly_one_private_delivery() {
+        let pool = db::connect_memory().await.unwrap();
+        two_owners_two_devices(&pool).await;
+        let (st, mock) = state(&pool);
+        let n = push::tick(&st, at_1830()).await.unwrap();
+        let sent = mock.sent.lock().unwrap().clone();
+        assert_eq!(n, 1);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].title, "ADMIN PRIVATE");
+        assert_eq!(sent[0].token, "fcm1", "only the owner's device");
+        let all = format!("{sent:?}");
+        assert!(!all.contains("SAM PRIVATE") && !all.contains("sam-item") && !all.contains("fcm2"));
+        // The marker is the owner's alone.
+        let markers: Vec<(i64, String)> =
+            sqlx::query_as("SELECT user_id, item_id FROM reminders_sent")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(markers, vec![(1, "admin-item".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_second_owner_with_a_device_alone_gets_no_background_work() {
+        // New user, no admin device: nothing is sent to anyone and nothing is marked.
+        let pool = db::connect_memory().await.unwrap();
+        two_owners_two_devices(&pool).await;
+        sqlx::query("DELETE FROM devices WHERE user_id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (st, mock) = state(&pool);
+        assert_eq!(push::tick(&st, at_1830()).await.unwrap(), 0);
+        assert!(mock.sent.lock().unwrap().is_empty());
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM reminders_sent").await, 0);
+    }
+
+    #[tokio::test]
+    async fn another_owners_completion_does_not_suppress_the_admin_reminder() {
+        let pool = db::connect_memory().await.unwrap();
+        let sam = users::create(&pool, "Sam", false).await.unwrap();
+        sqlx::query("INSERT INTO items (user_id, id, kind, name, points, weekdays, remind_time, updated_at, seq) VALUES (1, 'shared', 'chore', 'ADMIN PRIVATE', 10, 127, '18:30', 1, 1)")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO devices (id, user_id, name, token_hash, fcm_token, created_at, last_seen) VALUES ('d1', 1, 'phone', 'h1', 'fcm1', 1, 1)")
+            .execute(&pool).await.unwrap();
+        // Sam holds the same item id and has completed it today.
+        sqlx::query("INSERT INTO completions (user_id, item_id, date, completed_at, updated_at, seq) VALUES (?, 'shared', '2026-10-25', 1, 1, 2)")
+            .bind(sam).execute(&pool).await.unwrap();
+        assert!(bread_tracker_server::store::reminder_completions(
+            &pool,
+            "2026-10-25",
+            "2026-10-24"
+        )
+        .await
+        .unwrap()
+        .is_empty());
+        let (st, mock) = state(&pool);
+        assert_eq!(push::tick(&st, at_1830()).await.unwrap(), 1);
+        assert_eq!(mock.sent.lock().unwrap()[0].title, "ADMIN PRIVATE");
+    }
+
+    #[tokio::test]
+    async fn another_owners_todo_and_sent_marker_stay_out_of_the_admin_view() {
+        let pool = db::connect_memory().await.unwrap();
+        let sam = users::create(&pool, "Sam", false).await.unwrap();
+        for uid in [1_i64, sam] {
+            sqlx::query("INSERT INTO items (user_id, id, kind, name, points, weekdays, remind_time, due_date, updated_at, seq) VALUES (?, 'todo-1', 'todo', 'Pay', 10, 0, '09:00', '2026-10-25', 1, 1)")
+                .bind(uid).execute(&pool).await.unwrap();
+        }
+        sqlx::query("INSERT INTO completions (user_id, item_id, date, completed_at, updated_at, seq) VALUES (?, 'todo-1', '2026-10-01', 1, 1, 2)")
+            .bind(sam).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO reminders_sent (user_id, item_id, date, sent_at) VALUES (?, 'todo-1', '2026-10-25', 1)")
+            .bind(sam).execute(&pool).await.unwrap();
+        assert!(bread_tracker_server::store::reminder_completions(
+            &pool,
+            "2026-10-25",
+            "2026-10-24"
+        )
+        .await
+        .unwrap()
+        .is_empty());
+        assert!(
+            bread_tracker_server::store::sent_reminders(&pool, "2026-10-25", "2026-10-24")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let devs = bread_tracker_server::store::reminder_devices(&pool)
+            .await
+            .unwrap();
+        assert!(
+            devs.is_empty(),
+            "no admin device, and Sam's is never a destination"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_item_selection_still_uses_the_restored_partial_index() {
+        let pool = db::connect_memory().await.unwrap();
+        let plan = bread_tracker_server::store::reminder_items_query_plan(&pool)
+            .await
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|r| r.3.contains("items_reminder_candidates")),
+            "{plan:?}"
+        );
+        assert!(!plan.iter().any(|r| r.3.contains("SCAN items")), "{plan:?}");
+    }
+}
+
+// ---- TRACK-90: raw SQL cannot leave a stale name key, and startup validates every key ----
+
+async fn key_of(pool: &SqlitePool, id: i64) -> Option<String> {
+    sqlx::query_scalar("SELECT name_key FROM users WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_raw_rename_to_a_unicode_name_is_refused_instead_of_leaving_a_stale_key() {
+    let pool = db::connect_memory().await.unwrap();
+    let sam = users::create(&pool, "Sam", false).await.unwrap();
+    let r = sqlx::query("UPDATE users SET name = 'Älex' WHERE id = ?")
+        .bind(sam)
+        .execute(&pool)
+        .await;
+    assert!(r.is_err(), "silent stale key");
+    let name: String = sqlx::query_scalar("SELECT name FROM users WHERE id = ?")
+        .bind(sam)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        (name.as_str(), key_of(&pool, sam).await.as_deref()),
+        ("Sam", Some("sam")),
+        "rolled back"
+    );
+    // Raw rename to ASCII keeps the key in step; users::rename handles Unicode.
+    sqlx::query("UPDATE users SET name = 'Sammy' WHERE id = ?")
+        .bind(sam)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(key_of(&pool, sam).await.as_deref(), Some("sammy"));
+    users::rename(&pool, sam, "Älex").await.unwrap();
+    assert_eq!(
+        users::find_by_name(&pool, "äLEX")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        sam
+    );
+    // A raw rename of a Unicode name to another Unicode name is refused too.
+    assert!(sqlx::query("UPDATE users SET name = 'Élan' WHERE id = ?")
+        .bind(sam)
+        .execute(&pool)
+        .await
+        .is_err());
+    // The supported raw path: name and cleared key together, recomputed at the next start.
+    sqlx::query("UPDATE users SET name = 'Élan', name_key = NULL WHERE id = ?")
+        .bind(sam)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn startup_corrects_a_stale_key_and_the_correction_is_findable() {
+    let dir = tempfile::tempdir().unwrap();
+    let u = url(&dir, "stale.db");
+    let pool = db::connect_with_admin(&u, None).await.unwrap();
+    let sam = users::create(&pool, "Sam", false).await.unwrap();
+    // Bypass the guard on purpose (drop the trigger), as an old 0005-only database or a manual
+    // edit could: new name, old key.
+    sqlx::query("DROP TRIGGER users_name_key_rename_unicode")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET name = 'Älex' WHERE id = ?")
+        .bind(sam)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        key_of(&pool, sam).await.as_deref(),
+        Some("sam"),
+        "stale on purpose"
+    );
+    pool.close().await;
+
+    let pool = db::connect_with_admin(&u, None).await.unwrap();
+    assert_eq!(key_of(&pool, sam).await, Some(users::name_key("Älex")));
+    assert_eq!(
+        users::find_by_name(&pool, "älex")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        sam
+    );
+    assert!(matches!(
+        users::create(&pool, "ÄLEX", false).await,
+        Err(users::NameError::Taken)
+    ));
+    // The old key is free again.
+    users::create(&pool, "sam", false).await.unwrap();
+}
+
+#[tokio::test]
+async fn startup_with_caseless_duplicates_and_a_stale_key_fails_closed_and_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let u = url(&dir, "dup.db");
+    let pool = db::connect_with_admin(&u, None).await.unwrap();
+    let a = users::create(&pool, "Alex", false).await.unwrap();
+    let b = users::create(&pool, "Sam", false).await.unwrap();
+    sqlx::query("UPDATE users SET name = 'Älex', name_key = ? WHERE id = ?")
+        .bind(users::name_key("Älex"))
+        .bind(a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Sam is renamed to a caseless duplicate of Älex while the key stays 'sam' (guard bypassed).
+    sqlx::query("DROP TRIGGER users_name_key_rename_unicode")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET name = 'älex' WHERE id = ?")
+        .bind(b)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let before: Vec<(i64, String, Option<String>)> =
+        sqlx::query_as("SELECT id, name, name_key FROM users ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    pool.close().await;
+
+    // The identical failure on every start; the data is never "fixed" by overwriting a user.
+    for _ in 0..2 {
+        let err = db::connect_with_admin(&u, None)
+            .await
+            .expect_err("must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Älex") && msg.contains("älex") && msg.contains("same name"),
+            "{msg}"
+        );
+    }
+    let raw = SqlitePoolOptions::new()
+        .connect_with(SqliteConnectOptions::from_str(&u).unwrap())
+        .await
+        .unwrap();
+    let after: Vec<(i64, String, Option<String>)> =
+        sqlx::query_as("SELECT id, name, name_key FROM users ORDER BY id")
+            .fetch_all(&raw)
+            .await
+            .unwrap();
+    assert_eq!(before, after, "rolled back: no key or name was touched");
+
+    // The documented operator remedy works, and the next start recomputes and succeeds.
+    sqlx::query("UPDATE users SET name = 'Sam', name_key = NULL WHERE id = ?")
+        .bind(b)
+        .execute(&raw)
+        .await
+        .unwrap();
+    raw.close().await;
+    let pool = db::connect_with_admin(&u, None).await.unwrap();
+    assert_eq!(key_of(&pool, b).await.as_deref(), Some("sam"));
+    assert_eq!(key_of(&pool, a).await, Some(users::name_key("Älex")));
+}
+
+#[tokio::test]
+async fn startup_collision_refuses_before_a_listener_is_ever_bound() {
+    // The server binary opens the database before binding or starting the scheduler, so a
+    // refusal here is a refusal to serve. Prove it with the real binary on a real file.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bin.db");
+    let u = format!("sqlite://{}", db_path.display());
+    let pool = db::connect_with_admin(&u, None).await.unwrap();
+    let a = users::create(&pool, "Alex", false).await.unwrap();
+    let b = users::create(&pool, "Sam", false).await.unwrap();
+    sqlx::query("DROP TRIGGER users_name_key_rename_unicode")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET name = 'Älex' WHERE id = ?")
+        .bind(b)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET name = 'älex' WHERE id = ?")
+        .bind(a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_bread-tracker-server"))
+        .env("BREADTRACKER_DATABASE_PATH", &db_path)
+        .env("BREADTRACKER_LISTEN", format!("127.0.0.1:{port}"))
+        .output()
+        .await
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("same name ignoring case"), "{stderr}");
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
+        "nothing is listening"
+    );
+}

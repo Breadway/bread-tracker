@@ -78,6 +78,16 @@ class MemStore extends Store {
   Future<void> saveToken(String t) async => _t = t;
   @override
   Future<void> clearToken() async => _t = null;
+  @override
+  Future<bool> clearTokenIfCurrentForGeneration(
+    String expected,
+    int expectedGeneration, {
+    String? expectedServer,
+  }) async {
+    if (_t != expected) return false;
+    _t = null;
+    return true;
+  }
 }
 
 const id1 = '11111111-1111-4111-8111-111111111111';

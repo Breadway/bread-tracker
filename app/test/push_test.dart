@@ -14,6 +14,17 @@ class MemoryStore extends Store {
   @override
   Future<void> clearToken() async => credential = null;
   @override
+  Future<bool> clearTokenIfCurrentForGeneration(
+    String expected,
+    int expectedGeneration, {
+    String? expectedServer,
+  }) async {
+    if (credential != expected) return false;
+    credential = null;
+    return true;
+  }
+
+  @override
   Future<void> saveToken(String token) async => credential = token;
 }
 

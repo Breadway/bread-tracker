@@ -22,12 +22,11 @@ Future<void> main() async {
     store,
     onAuthLost: () => container.invalidate(pairedProvider),
   );
-  container = ProviderContainer(
-    overrides: [
-      prefsProvider.overrideWithValue(prefs),
-      sfxProvider.overrideWithValue(sfx),
-      pushProvider.overrideWithValue(push),
-    ],
+  container = createAppContainer(
+    prefs: prefs,
+    store: store,
+    sfx: sfx,
+    push: push,
   );
   runApp(
     UncontrolledProviderScope(container: container, child: const TrackerApp()),

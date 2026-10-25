@@ -57,6 +57,7 @@ class _PairScreenState extends ConsumerState<PairScreen> {
       await store.setServerUrl(server);
       await store.saveToken(token);
       await store.resetSync();
+      ref.read(controllerProvider).pairingPersisted();
       ref.invalidate(pairedProvider);
       ref.read(controllerProvider).syncNow();
       ref.read(pushProvider).register(requestPermission: true);

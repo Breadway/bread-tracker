@@ -24,6 +24,7 @@ class SyncEngine {
   void invalidate() {
     _generation++;
     _invalidated = true;
+    _again = false;
   }
 
   void revalidate() {
@@ -34,6 +35,7 @@ class SyncEngine {
   /// Push dirty rows, pull everything newer than the cursor. Safe to call often;
   /// overlapping calls collapse into one follow-up pass.
   Future<SyncStatus> sync() async {
+    if (_invalidated) return SyncStatus.unpaired;
     if (_running) {
       _again = true;
       return SyncStatus.syncing;
@@ -48,17 +50,23 @@ class SyncEngine {
       return status;
     } finally {
       _running = false;
+      if (_invalidated) _again = false;
     }
   }
 
   Future<SyncStatus> _once() async {
-    final token = await store.token;
+    if (_invalidated) return SyncStatus.unpaired;
+    final storeGeneration = store.authGeneration;
+    final token = await store.readTokenForGeneration(storeGeneration);
+    if (_invalidated || store.authGeneration != storeGeneration) {
+      return SyncStatus.unpaired;
+    }
     if (token == null) return SyncStatus.unpaired;
     if (_token != null && _token != token) _generation++;
     _token = token;
-    if (_invalidated) _invalidated = false;
     final generation = _generation;
-    final api = _apiFactory(store.serverUrl, token);
+    final server = store.serverUrl;
+    final api = _apiFactory(server, token);
 
     final dirtyItems = await (db.select(
       db.items,
@@ -79,8 +87,11 @@ class SyncEngine {
       // retrying a dead credential forever; local data is kept for the next pairing.
       if (generation == _generation &&
           !_invalidated &&
-          await store.token == token) {
-        await store.clearToken();
+          await store.clearTokenIfCurrentForGeneration(
+            token,
+            storeGeneration,
+            expectedServer: server,
+          )) {
         _invalidated = true;
         _generation++;
         return SyncStatus.unpaired;
@@ -90,12 +101,22 @@ class SyncEngine {
       return SyncStatus.offline;
     }
 
-    if (generation != _generation || _invalidated) return SyncStatus.unpaired;
+    if (generation != _generation ||
+        _invalidated ||
+        store.authGeneration != storeGeneration ||
+        store.serverUrl != server) {
+      return SyncStatus.unpaired;
+    }
     final cursor = res['cursor'] as int;
     await db.transaction(() async {
       // Re-check inside the same database write transaction used for applying the
       // response. Sign-out performs its local wipe in a database transaction too.
-      if (generation != _generation || _invalidated) return;
+      if (generation != _generation ||
+          _invalidated ||
+          store.authGeneration != storeGeneration ||
+          store.serverUrl != server) {
+        return;
+      }
       // Rows unchanged since we pushed them are now clean.
       for (final i in dirtyItems) {
         await (db.update(db.items)..where(
@@ -139,8 +160,22 @@ class SyncEngine {
         await db.into(db.completions).insertOnConflictUpdate(_compCompanion(j));
       }
     });
-    if (generation != _generation || _invalidated) return SyncStatus.unpaired;
-    await store.setCursor(cursor);
+    if (generation != _generation ||
+        _invalidated ||
+        store.authGeneration != storeGeneration ||
+        store.serverUrl != server) {
+      return SyncStatus.unpaired;
+    }
+    await store.setCursorIfGeneration(
+      cursor,
+      storeGeneration,
+      expectedServer: server,
+    );
+    if (generation != _generation ||
+        _invalidated ||
+        store.authGeneration != storeGeneration) {
+      return SyncStatus.unpaired;
+    }
     return SyncStatus.idle;
   }
 

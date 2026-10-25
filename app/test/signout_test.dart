@@ -39,6 +39,21 @@ class GatedPreferencesStore extends InMemorySharedPreferencesStore {
   }
 }
 
+class FailCursorRemovalStore extends InMemorySharedPreferencesStore {
+  // ignore: use_super_parameters
+  FailCursorRemovalStore(Map<String, Object> data) : super.withData(data);
+  bool failCursorRemoval = false;
+
+  @override
+  Future<bool> remove(String key) async {
+    if (key == 'flutter.cursor' && failCursorRemoval) {
+      failCursorRemoval = false;
+      throw StateError('injected cursor removal failure');
+    }
+    return super.remove(key);
+  }
+}
+
 Future<(ProviderContainer, Store, AppDb)> setup(MockClient client) async {
   SharedPreferences.setMockInitialValues({});
   final prefs = await SharedPreferences.getInstance();
@@ -447,8 +462,9 @@ void main() {
     expect(tokenWriteFinished, isFalse);
     releaseReset.complete();
     expect(await signingOut, isTrue);
-    expect(tokenWriteFinished, isFalse);
     await replacementWrite;
+    expect(tokenWriteFinished, isTrue);
+    expect(writeFinished, isTrue);
     expect(await store.token, 'replacement');
     expect(store.cursor, 0);
     expect(container.read(syncStatusProvider), isNot(SyncStatus.unpaired));
@@ -489,4 +505,48 @@ void main() {
       expect(await db.select(db.completions).get(), hasLength(1));
     },
   );
+
+  test('cursor removal failure preserves retained rows and cursor', () async {
+    final platform = FailCursorRemovalStore({'flutter.cursor': 12});
+    SharedPreferencesStorePlatform.instance = platform;
+    final prefs = await SharedPreferences.getInstance();
+    FlutterSecureStoragePlatform.instance = TestFlutterSecureStoragePlatform({
+      'token': 'tok',
+    });
+    final store = Store(prefs);
+    final db = AppDb(NativeDatabase.memory());
+    await db.upsertItem(
+      ItemsCompanion.insert(
+        id: id1,
+        kind: 'chore',
+        name: 'retained',
+        points: 10,
+        updatedAt: 1,
+      ),
+    );
+    final container = ProviderContainer(
+      overrides: [
+        prefsProvider.overrideWithValue(prefs),
+        storeProvider.overrideWithValue(store),
+        dbProvider.overrideWithValue(db),
+        apiFactoryProvider.overrideWithValue(
+          (base, token) => Api(
+            base,
+            token: token,
+            client: MockClient((_) async => http.Response('{"ok":true}', 200)),
+          ),
+        ),
+      ],
+    );
+    addTearDown(container.dispose);
+    addTearDown(db.close);
+    platform.failCursorRemoval = true;
+    await expectLater(
+      container.read(controllerProvider).signOut(wipeLocal: true),
+      throwsStateError,
+    );
+    expect(await db.select(db.items).get(), hasLength(1));
+    expect(store.cursor, 0);
+    expect(await store.token, isNull);
+  });
 }

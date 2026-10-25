@@ -147,16 +147,24 @@ class _PairScreenState extends ConsumerState<PairScreen> {
     final store = ref.read(storeProvider);
     final controllerGeneration = controller.currentAuthGeneration;
     final appServerBeforeAttempt = store.serverUrl;
-    final retryingIssuedToken =
+    final matchingPendingResult =
         _issuedTokenForRetry != null &&
         _issuedServerForRetry == attemptServer &&
         _issuedCodeForRetry == attemptCode;
+    final cachedOwnership = _retryOwnership;
+    final retryingIssuedToken =
+        matchingPendingResult &&
+        cachedOwnership != null &&
+        store.ownsPairing(cachedOwnership);
     var codeWasRedeemed = false;
     String? issuedToken;
     PairingOwnership? attemptOwnership;
     PairingOwnership? cleanupOwnership;
     var persistenceStarted = false;
     try {
+      if (matchingPendingResult && !retryingIssuedToken) {
+        _invalidatePendingPairingResult();
+      }
       String? token = retryingIssuedToken ? _issuedTokenForRetry : null;
       if (!retryingIssuedToken) {
         token ??= await Api(attemptServer).pair(attemptCode, 'Android');

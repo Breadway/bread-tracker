@@ -71,12 +71,6 @@ class _PairScreenState extends ConsumerState<PairScreen> {
         );
         return;
       }
-      if (controller.isWipeRecoveryPending) {
-        setState(
-          () => _error = 'The retained database is readable, but local credential cleanup did not complete. Retry recovery.',
-        );
-        return;
-      }
       setState(
         () => _error = 'Retained data is verified and kept. Tap Pair to finish using the already-issued pairing result.',
       );

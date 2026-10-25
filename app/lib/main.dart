@@ -1,4 +1,3 @@
-import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -7,7 +6,6 @@ import 'app.dart';
 import 'data/store.dart';
 import 'fx/sfx.dart';
 import 'push.dart';
-import 'reminders.dart';
 import 'state.dart';
 
 Future<void> main() async {
@@ -19,9 +17,6 @@ Future<void> main() async {
     ..haptics = store.haptics;
   await sfx.init();
   final push = FcmPushService(store);
-  // Data-only reminders (server BREADTRACKER_PUSH_MODE=data) are turned into notifications
-  // with a Mark done action by this top-level handler, in a background isolate.
-  FirebaseMessaging.onBackgroundMessage(reminderBackgroundMessage);
   runApp(
     ProviderScope(
       overrides: [

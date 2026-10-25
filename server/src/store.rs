@@ -4,6 +4,7 @@ use sqlx::SqliteConnection;
 
 use crate::db::Db;
 use crate::model::{Completion, Item, SyncResponse};
+use crate::users::ADMIN_ID;
 
 const DAY_MS: i64 = 86_400_000;
 
@@ -17,206 +18,211 @@ async fn next_seq(conn: &mut SqliteConnection) -> Result<i64, sqlx::Error> {
         .await
 }
 
-/// Storage for one user. Every query on a user-owned table (items, completions,
-/// reminders_sent) lives here and binds `user_id`, and the id is private, so a handler cannot
-/// run such a query without naming whose data it is. Build one per request from the
-/// authenticated caller, never from request input.
-#[derive(Clone)]
-pub struct UserDb {
-    db: Db,
-    user_id: i64,
-}
+/// Apply client rows. A row only wins when its `updated_at` is newer than the stored one.
+/// Future timestamps are clamped to a day ahead so a bad phone clock cannot freeze a row.
+pub async fn apply_push(
+    db: &Db,
+    items: &[Item],
+    completions: &[Completion],
+) -> Result<(), sqlx::Error> {
+    let ceiling = now_ms() + DAY_MS;
+    let mut tx = db.begin().await?;
 
-impl UserDb {
-    pub fn new(db: &Db, user_id: i64) -> Self {
-        Self { db: db.clone(), user_id }
-    }
-
-    pub fn user_id(&self) -> i64 {
-        self.user_id
-    }
-
-    /// Apply client rows. A row only wins when its `updated_at` is newer than the stored one.
-    /// Future timestamps are clamped to a day ahead so a bad phone clock cannot freeze a row.
-    /// An id that another user also holds is a different row: keys are (user_id, id).
-    pub async fn apply_push(&self, items: &[Item], completions: &[Completion]) -> Result<(), sqlx::Error> {
-        let ceiling = now_ms() + DAY_MS;
-        let mut tx = self.db.begin().await?;
-
-        for it in items {
-            let updated = it.updated_at.min(ceiling);
-            let existing: Option<i64> = sqlx::query_scalar("SELECT updated_at FROM items WHERE user_id = ? AND id = ?")
-                .bind(self.user_id)
+    for it in items {
+        let updated = it.updated_at.min(ceiling);
+        let existing: Option<i64> =
+            sqlx::query_scalar("SELECT updated_at FROM items WHERE user_id = ? AND id = ?")
+                .bind(ADMIN_ID)
                 .bind(&it.id)
                 .fetch_optional(&mut *tx)
                 .await?;
-            if existing.is_some_and(|e| e >= updated) {
-                continue;
-            }
-            let seq = next_seq(&mut tx).await?;
-            sqlx::query(
-                "INSERT INTO items (user_id, id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, seq)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(user_id, id) DO UPDATE SET
-                   kind = excluded.kind, name = excluded.name, weekdays = excluded.weekdays,
-                   remind_time = excluded.remind_time, points = excluded.points, due_date = excluded.due_date,
-                   sort = excluded.sort, active = excluded.active, updated_at = excluded.updated_at,
-                   deleted_at = excluded.deleted_at, seq = excluded.seq",
-            )
-            .bind(self.user_id)
-            .bind(&it.id)
-            .bind(&it.kind)
-            .bind(it.name.trim())
-            .bind(it.weekdays)
-            .bind(&it.remind_time)
-            .bind(it.points)
-            .bind(&it.due_date)
-            .bind(it.sort)
-            .bind(it.active)
-            .bind(updated)
-            .bind(it.deleted_at)
-            .bind(seq)
-            .execute(&mut *tx)
-            .await?;
+        if existing.is_some_and(|e| e >= updated) {
+            continue;
         }
-
-        for c in completions {
-            let updated = c.updated_at.min(ceiling);
-            let existing: Option<i64> =
-                sqlx::query_scalar("SELECT updated_at FROM completions WHERE user_id = ? AND item_id = ? AND date = ?")
-                    .bind(self.user_id)
-                    .bind(&c.item_id)
-                    .bind(&c.date)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-            if existing.is_some_and(|e| e >= updated) {
-                continue;
-            }
-            let seq = next_seq(&mut tx).await?;
-            sqlx::query(
-                "INSERT INTO completions (user_id, item_id, date, completed_at, updated_at, deleted_at, seq)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(user_id, item_id, date) DO UPDATE SET
-                   completed_at = excluded.completed_at, updated_at = excluded.updated_at,
-                   deleted_at = excluded.deleted_at, seq = excluded.seq",
-            )
-            .bind(self.user_id)
-            .bind(&c.item_id)
-            .bind(&c.date)
-            .bind(c.completed_at.min(ceiling))
-            .bind(updated)
-            .bind(c.deleted_at)
-            .bind(seq)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        tx.commit().await
-    }
-
-    /// This user's rows changed after `since`, read from one snapshot together with the new
-    /// cursor. The cursor is the global change counter, so it also advances when other users
-    /// write; their rows are never returned, the gaps are harmless.
-    pub async fn pull(&self, since: i64) -> Result<SyncResponse, sqlx::Error> {
-        let mut tx = self.db.begin().await?;
-        let cursor: i64 = sqlx::query_scalar("SELECT val FROM meta WHERE key = 'seq'")
-            .fetch_one(&mut *tx)
-            .await?;
-        // A cursor ahead of the database means it was restored from an older copy. Serve
-        // everything; the client also notices cursor < its own and starts over.
-        let since = if since > cursor { 0 } else { since };
-        let epoch: i64 = sqlx::query_scalar("SELECT val FROM meta WHERE key = 'epoch'")
-            .fetch_optional(&mut *tx)
-            .await?
-            .unwrap_or(0);
-        let items = sqlx::query_as::<_, Item>(&format!(
-            "SELECT {ITEM_COLS} FROM items WHERE user_id = ? AND seq > ? AND seq <= ? ORDER BY seq"
-        ))
-        .bind(self.user_id)
-        .bind(since)
-        .bind(cursor)
-        .fetch_all(&mut *tx)
-        .await?;
-        let completions = sqlx::query_as::<_, Completion>(&format!(
-            "SELECT {COMPLETION_COLS} FROM completions WHERE user_id = ? AND seq > ? AND seq <= ? ORDER BY seq"
-        ))
-        .bind(self.user_id)
-        .bind(since)
-        .bind(cursor)
-        .fetch_all(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(SyncResponse { epoch: epoch.to_string(), cursor, items, completions, server_time: now_ms() })
-    }
-
-    pub async fn all_items(&self) -> Result<Vec<Item>, sqlx::Error> {
-        sqlx::query_as::<_, Item>(&format!("SELECT {ITEM_COLS} FROM items WHERE user_id = ?"))
-            .bind(self.user_id)
-            .fetch_all(&self.db)
-            .await
-    }
-
-    pub async fn all_completions(&self) -> Result<Vec<Completion>, sqlx::Error> {
-        sqlx::query_as::<_, Completion>(&format!("SELECT {COMPLETION_COLS} FROM completions WHERE user_id = ?"))
-            .bind(self.user_id)
-            .fetch_all(&self.db)
-            .await
-    }
-
-    /// Completions the scheduler needs: everything dated `date`, plus every completion of a
-    /// to-do (a to-do ticked on an earlier day is still done on its due date).
-    pub async fn reminder_completions(&self, date: &str) -> Result<Vec<Completion>, sqlx::Error> {
-        sqlx::query_as::<_, Completion>(&format!(
-            "SELECT {COMPLETION_COLS} FROM completions
-             WHERE user_id = ? AND (date = ? OR item_id IN (SELECT id FROM items WHERE user_id = ? AND kind = 'todo'))"
-        ))
-        .bind(self.user_id)
-        .bind(date)
-        .bind(self.user_id)
-        .fetch_all(&self.db)
-        .await
-    }
-
-    /// Items the scheduler can remind about, instead of loading every row each tick.
-    pub async fn reminder_items(&self) -> Result<Vec<Item>, sqlx::Error> {
-        sqlx::query_as::<_, Item>(&format!(
-            "SELECT {ITEM_COLS} FROM items
-             WHERE user_id = ? AND active = 1 AND deleted_at IS NULL AND remind_time IS NOT NULL"
-        ))
-        .bind(self.user_id)
-        .fetch_all(&self.db)
-        .await
-    }
-
-    /// (item_id, date) of reminders already sent on either of two dates.
-    pub async fn sent_reminders(&self, d1: &str, d2: &str) -> Result<std::collections::HashSet<(String, String)>, sqlx::Error> {
-        Ok(sqlx::query_as::<_, (String, String)>(
-            "SELECT item_id, date FROM reminders_sent WHERE user_id = ? AND date IN (?, ?)",
+        let seq = next_seq(&mut tx).await?;
+        sqlx::query(
+            "INSERT INTO items (user_id, id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, seq)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(user_id, id) DO UPDATE SET
+               kind = excluded.kind, name = excluded.name, weekdays = excluded.weekdays,
+               remind_time = excluded.remind_time, points = excluded.points, due_date = excluded.due_date,
+               sort = excluded.sort, active = excluded.active, updated_at = excluded.updated_at,
+               deleted_at = excluded.deleted_at, seq = excluded.seq",
         )
-        .bind(self.user_id)
-        .bind(d1)
-        .bind(d2)
-        .fetch_all(&self.db)
-        .await?
-        .into_iter()
-        .collect())
+        .bind(ADMIN_ID)
+        .bind(&it.id)
+        .bind(&it.kind)
+        .bind(it.name.trim())
+        .bind(it.weekdays)
+        .bind(&it.remind_time)
+        .bind(it.points)
+        .bind(&it.due_date)
+        .bind(it.sort)
+        .bind(it.active)
+        .bind(updated)
+        .bind(it.deleted_at)
+        .bind(seq)
+        .execute(&mut *tx)
+        .await?;
     }
 
-    pub async fn mark_reminder_sent(&self, item_id: &str, date: &str) -> Result<(), sqlx::Error> {
-        sqlx::query("INSERT OR IGNORE INTO reminders_sent (user_id, item_id, date, sent_at) VALUES (?, ?, ?, ?)")
-            .bind(self.user_id)
-            .bind(item_id)
-            .bind(date)
-            .bind(now_ms())
-            .execute(&self.db)
-            .await?;
-        Ok(())
+    for c in completions {
+        let updated = c.updated_at.min(ceiling);
+        let existing: Option<i64> = sqlx::query_scalar(
+            "SELECT updated_at FROM completions WHERE user_id = ? AND item_id = ? AND date = ?",
+        )
+        .bind(ADMIN_ID)
+        .bind(&c.item_id)
+        .bind(&c.date)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if existing.is_some_and(|e| e >= updated) {
+            continue;
+        }
+        let seq = next_seq(&mut tx).await?;
+        sqlx::query(
+            "INSERT INTO completions (user_id, item_id, date, completed_at, updated_at, deleted_at, seq)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(user_id, item_id, date) DO UPDATE SET
+               completed_at = excluded.completed_at, updated_at = excluded.updated_at,
+               deleted_at = excluded.deleted_at, seq = excluded.seq",
+        )
+        .bind(ADMIN_ID)
+        .bind(&c.item_id)
+        .bind(&c.date)
+        .bind(c.completed_at.min(ceiling))
+        .bind(updated)
+        .bind(c.deleted_at)
+        .bind(seq)
+        .execute(&mut *tx)
+        .await?;
     }
+
+    tx.commit().await
 }
 
 const ITEM_COLS: &str =
     "id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, seq";
 const COMPLETION_COLS: &str = "item_id, date, completed_at, updated_at, deleted_at, seq";
+
+fn pull_sql(table: &str, cols: &str) -> String {
+    format!("SELECT {cols} FROM {table} WHERE user_id = ? AND seq > ? AND seq <= ? ORDER BY seq")
+}
+
+/// Rows of the first user changed after `since`, read from one snapshot together with the new
+/// cursor. Both reads search the `(user_id, seq)` index; see [`pull_query_plans`].
+pub async fn pull(db: &Db, since: i64) -> Result<SyncResponse, sqlx::Error> {
+    let mut tx = db.begin().await?;
+    let cursor: i64 = sqlx::query_scalar("SELECT val FROM meta WHERE key = 'seq'")
+        .fetch_one(&mut *tx)
+        .await?;
+    let items = sqlx::query_as::<_, Item>(&pull_sql("items", ITEM_COLS))
+        .bind(ADMIN_ID)
+        .bind(since)
+        .bind(cursor)
+        .fetch_all(&mut *tx)
+        .await?;
+    let completions = sqlx::query_as::<_, Completion>(&pull_sql("completions", COMPLETION_COLS))
+        .bind(ADMIN_ID)
+        .bind(since)
+        .bind(cursor)
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(SyncResponse {
+        cursor,
+        items,
+        completions,
+        server_time: now_ms(),
+    })
+}
+
+/// Query plans of the two statements `pull` runs, so a test can prove they use the per-user
+/// sequence indexes instead of scanning and sorting every user's rows.
+pub async fn pull_query_plans(db: &Db) -> Result<Vec<String>, sqlx::Error> {
+    let mut plans = Vec::new();
+    for (table, cols) in [("items", ITEM_COLS), ("completions", COMPLETION_COLS)] {
+        let rows: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(&format!("EXPLAIN QUERY PLAN {}", pull_sql(table, cols)))
+                .bind(ADMIN_ID)
+                .bind(0_i64)
+                .bind(i64::MAX)
+                .fetch_all(db)
+                .await?;
+        plans.extend(rows.into_iter().map(|r| r.3));
+    }
+    Ok(plans)
+}
+
+pub async fn all_items(db: &Db) -> Result<Vec<Item>, sqlx::Error> {
+    sqlx::query_as::<_, Item>(&format!("SELECT {ITEM_COLS} FROM items WHERE user_id = ?"))
+        .bind(ADMIN_ID)
+        .fetch_all(db)
+        .await
+}
+
+pub async fn all_completions(db: &Db) -> Result<Vec<Completion>, sqlx::Error> {
+    sqlx::query_as::<_, Completion>(&format!(
+        "SELECT {COMPLETION_COLS} FROM completions WHERE user_id = ?"
+    ))
+    .bind(ADMIN_ID)
+    .fetch_all(db)
+    .await
+}
+
+/// Items the scheduler can remind about, instead of loading every row each tick.
+pub async fn reminder_items(db: &Db) -> Result<Vec<Item>, sqlx::Error> {
+    sqlx::query_as::<_, Item>(&format!(
+        "SELECT {ITEM_COLS} FROM items WHERE active = 1 AND deleted_at IS NULL AND remind_time IS NOT NULL"
+    ))
+    .fetch_all(db)
+    .await
+}
+
+/// Representative query plan for scheduler item selection. Kept as a testable statement
+/// because the partial index must match the scheduler predicate exactly.
+pub async fn reminder_items_query_plan(
+    db: &Db,
+) -> Result<Vec<(i64, i64, i64, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "EXPLAIN QUERY PLAN SELECT id FROM items WHERE active = 1 AND deleted_at IS NULL AND remind_time IS NOT NULL",
+    )
+    .fetch_all(db)
+    .await
+}
+
+pub async fn reminder_completions(
+    db: &Db,
+    date: &str,
+    yesterday: &str,
+) -> Result<Vec<Completion>, sqlx::Error> {
+    sqlx::query_as::<_, Completion>(&format!(
+        "SELECT {COMPLETION_COLS} FROM completions WHERE date IN (?, ?)
+         UNION
+         SELECT {COMPLETION_COLS} FROM completions
+         WHERE item_id IN (SELECT id FROM items WHERE kind = 'todo')"
+    ))
+    .bind(date)
+    .bind(yesterday)
+    .fetch_all(db)
+    .await
+}
+
+pub async fn item_ids(
+    db: &Db,
+    ids: &[String],
+) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(Default::default());
+    }
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let sql = format!("SELECT id FROM items WHERE user_id = ? AND id IN ({placeholders})");
+    let mut q = sqlx::query_scalar::<_, String>(&sql).bind(ADMIN_ID);
+    for id in ids {
+        q = q.bind(id);
+    }
+    Ok(q.fetch_all(db).await?.into_iter().collect())
+}
 
 /// How many rows a cleanup pass removed.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -227,40 +233,31 @@ pub struct Pruned {
     pub pairing_codes: u64,
 }
 
-/// Delete data that can never matter again: reminder bookkeeping older than two days,
-/// expired pairing codes, and tombstones older than `tombstone_days`. A tombstone only has
-/// to survive until every device has synced once after the delete, so the retention is long;
-/// a device that stays offline longer than that would keep a row that was deleted elsewhere.
-#[allow(clippy::field_reassign_with_default)]
-pub async fn prune(db: &Db, now: i64, tombstone_days: i64) -> Result<Pruned, sqlx::Error> {
-    let cutoff = now - tombstone_days * DAY_MS;
-    let day_before_yesterday = (chrono::DateTime::from_timestamp_millis(now).unwrap_or_default().date_naive()
+/// Delete expired pairing and reminder bookkeeping. Tombstones stay until the protocol offers
+/// device cursor acknowledgements or a forced-full-resync contract.
+pub async fn prune(db: &Db, now: i64) -> Result<Pruned, sqlx::Error> {
+    let day_before_yesterday = (chrono::DateTime::from_timestamp_millis(now)
+        .unwrap_or_default()
+        .date_naive()
         - chrono::Duration::days(2))
     .format("%Y-%m-%d")
     .to_string();
-    let mut p = Pruned::default();
     // reminders_sent.date is a local date in the user's zone, so keep a margin of days.
-    p.reminders = sqlx::query("DELETE FROM reminders_sent WHERE date < ?")
+    let reminders = sqlx::query("DELETE FROM reminders_sent WHERE date < ?")
         .bind(day_before_yesterday)
         .execute(db)
         .await?
         .rows_affected();
-    p.pairing_codes = sqlx::query("DELETE FROM pairing_codes WHERE expires_at < ?")
+    let pairing_codes = sqlx::query("DELETE FROM pairing_codes WHERE expires_at < ?")
         .bind(now)
         .execute(db)
         .await?
         .rows_affected();
-    p.completions = sqlx::query("DELETE FROM completions WHERE deleted_at IS NOT NULL AND deleted_at < ?")
-        .bind(cutoff)
-        .execute(db)
-        .await?
-        .rows_affected();
-    p.items = sqlx::query("DELETE FROM items WHERE deleted_at IS NOT NULL AND deleted_at < ?")
-        .bind(cutoff)
-        .execute(db)
-        .await?
-        .rows_affected();
-    Ok(p)
+    Ok(Pruned {
+        reminders,
+        pairing_codes,
+        ..Pruned::default()
+    })
 }
 
 pub async fn get_setting(db: &Db, key: &str) -> Result<String, sqlx::Error> {

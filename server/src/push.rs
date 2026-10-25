@@ -8,13 +8,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use async_trait::async_trait;
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use chrono::{
+    DateTime, Datelike, Duration as ChronoDuration, NaiveDateTime, NaiveTime, TimeZone, Utc,
+};
 use chrono_tz::Tz;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{Completion, Item};
-use crate::store::{self, now_ms, UserDb};
+use crate::store::{self, now_ms};
 use crate::AppState;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,59 +98,7 @@ struct JwtClaims<'a> {
     exp: i64,
 }
 
-/// How reminders are delivered.
-/// `Notification`: FCM carries a notification block, so Android shows it itself even when the
-/// app is not running (no action buttons possible). `Data`: data only; the app builds the
-/// notification in a background handler so it can offer a Mark done action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PushMode {
-    #[default]
-    Notification,
-    Data,
-}
-
-impl PushMode {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "notification" => Some(Self::Notification),
-            "data" => Some(Self::Data),
-            _ => None,
-        }
-    }
-}
-
-pub const CHANNEL_ID: &str = "reminders";
-
-/// The FCM HTTP v1 request body for one message.
-pub fn fcm_payload(msg: &Message, mode: PushMode) -> serde_json::Value {
-    match mode {
-        PushMode::Notification => serde_json::json!({
-            "message": {
-                "token": msg.token,
-                "notification": { "title": msg.title, "body": msg.body },
-                "data": msg.data,
-                "android": { "priority": "HIGH", "notification": { "channel_id": CHANNEL_ID } }
-            }
-        }),
-        PushMode::Data => {
-            // Data values must be strings. The app turns this into a notification itself.
-            let mut data = msg.data.clone();
-            data.insert("title".into(), msg.title.clone());
-            data.insert("body".into(), msg.body.clone());
-            data.insert("channel_id".into(), CHANNEL_ID.into());
-            serde_json::json!({
-                "message": {
-                    "token": msg.token,
-                    "data": data,
-                    "android": { "priority": "HIGH" }
-                }
-            })
-        }
-    }
-}
-
 pub struct Fcm {
-    mode: PushMode,
     client: reqwest::Client,
     project_id: String,
     client_email: String,
@@ -158,13 +108,17 @@ pub struct Fcm {
 }
 
 impl Fcm {
-    pub fn from_file(path: &Path, mode: PushMode) -> anyhow::Result<Self> {
-        let raw = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let sa: ServiceAccount = serde_json::from_str(&raw).context("parsing service account json")?;
+    pub fn from_file(path: &Path) -> anyhow::Result<Self> {
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let sa: ServiceAccount =
+            serde_json::from_str(&raw).context("parsing service account json")?;
         Ok(Self {
-            mode,
-            client: reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?,
-            key: EncodingKey::from_rsa_pem(sa.private_key.as_bytes()).context("service account private key")?,
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(20))
+                .build()?,
+            key: EncodingKey::from_rsa_pem(sa.private_key.as_bytes())
+                .context("service account private key")?,
             project_id: sa.project_id,
             client_email: sa.client_email,
             token_uri: sa.token_uri,
@@ -188,7 +142,9 @@ impl Fcm {
             exp: now + 3600,
         };
         let jwt = jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &self.key)?;
-        let body = format!("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion={jwt}");
+        let body = format!(
+            "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion={jwt}"
+        );
         let resp = self
             .client
             .post(&self.token_uri)
@@ -219,9 +175,25 @@ impl PushSender for Fcm {
 
     async fn send(&self, msg: &Message) -> anyhow::Result<SendOutcome> {
         let access = self.access_token().await?;
-        let payload = fcm_payload(msg, self.mode);
-        let url = format!("https://fcm.googleapis.com/v1/projects/{}/messages:send", self.project_id);
-        let resp = self.client.post(url).bearer_auth(access).json(&payload).send().await?;
+        let payload = serde_json::json!({
+            "message": {
+                "token": msg.token,
+                "notification": { "title": msg.title, "body": msg.body },
+                "data": msg.data,
+                "android": { "priority": "HIGH", "notification": { "channel_id": "reminders" } }
+            }
+        });
+        let url = format!(
+            "https://fcm.googleapis.com/v1/projects/{}/messages:send",
+            self.project_id
+        );
+        let resp = self
+            .client
+            .post(url)
+            .bearer_auth(access)
+            .json(&payload)
+            .send()
+            .await?;
         let status = resp.status();
         if status.is_success() {
             return Ok(SendOutcome::Sent);
@@ -287,18 +259,27 @@ pub fn due_reminders(
     let today = local.date();
     // Chores and habits are done per day. A to-do is done once, on whichever day it was
     // ticked (the app records the tick date, which can be before the due date).
-    let todo_ids: HashSet<&str> = items.iter().filter(|i| i.kind == "todo").map(|i| i.id.as_str()).collect();
-
+    let todo_ids: HashSet<&str> = items
+        .iter()
+        .filter(|i| i.kind == "todo")
+        .map(|i| i.id.as_str())
+        .collect();
     let mut out = Vec::new();
     for day in [today - ChronoDuration::days(1), today] {
         let date = day.format("%Y-%m-%d").to_string();
         let done: HashSet<&str> = completions
             .iter()
-            .filter(|c| c.deleted_at.is_none() && (c.date == date || todo_ids.contains(c.item_id.as_str())))
+            .filter(|c| {
+                c.deleted_at.is_none() && (c.date == date || todo_ids.contains(c.item_id.as_str()))
+            })
             .map(|c| c.item_id.as_str())
             .collect();
         for it in items.iter().filter(|i| i.active && i.deleted_at.is_none()) {
-            let Some(rt) = it.remind_time.as_deref().and_then(|t| NaiveTime::parse_from_str(t, "%H:%M").ok()) else {
+            let Some(rt) = it
+                .remind_time
+                .as_deref()
+                .and_then(|t| NaiveTime::parse_from_str(t, "%H:%M").ok())
+            else {
                 continue;
             };
             let applies = match it.kind.as_str() {
@@ -306,7 +287,10 @@ pub fn due_reminders(
                 "todo" => it.due_date.as_deref() == Some(date.as_str()),
                 _ => false,
             };
-            if !applies || done.contains(it.id.as_str()) || sent.contains(&(it.id.clone(), date.clone())) {
+            if !applies
+                || done.contains(it.id.as_str())
+                || sent.contains(&(it.id.clone(), date.clone()))
+            {
                 continue;
             }
             let at = day.and_time(rt);
@@ -320,7 +304,12 @@ pub fn due_reminders(
             if late < 0 || late > grace_mins {
                 continue;
             }
-            out.push(Due { item_id: it.id.clone(), name: it.name.clone(), kind: it.kind.clone(), date: date.clone() });
+            out.push(Due {
+                item_id: it.id.clone(),
+                name: it.name.clone(),
+                kind: it.kind.clone(),
+                date: date.clone(),
+            });
         }
     }
     out
@@ -340,56 +329,49 @@ fn parse_quiet(start: &str, end: &str) -> Option<(NaiveTime, NaiveTime)> {
     Some((s, e))
 }
 
-/// One scheduler pass over every user. Returns the number of reminders sent.
-///
-/// Settings (timezone, quiet hours, on/off) are still the single global set here; making them
-/// per user is a separate change. Everything else is per user: a user's reminders are built
-/// from their own items and completions and sent only to their own devices, and a failure for
-/// one user is logged and does not stop the others.
+/// One scheduler pass. Returns the number of reminders sent.
 pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize> {
     if !st.push.enabled() || store::get_setting(&st.db, "reminders_enabled").await? != "1" {
         return Ok(0);
     }
-    let tz = Tz::from_str(&store::get_setting(&st.db, "timezone").await?).unwrap_or(chrono_tz::Australia::Perth);
+    let tz = Tz::from_str(&store::get_setting(&st.db, "timezone").await?)
+        .unwrap_or(chrono_tz::Australia::Perth);
     let quiet = parse_quiet(
         &store::get_setting(&st.db, "quiet_start").await?,
         &store::get_setting(&st.db, "quiet_end").await?,
     );
     let now = tz.from_utc_datetime(&now_utc.naive_utc());
-
-    let users: Vec<i64> = sqlx::query_scalar("SELECT id FROM users ORDER BY id").fetch_all(&st.db).await?;
-    let mut count = 0;
-    for uid in users {
-        match tick_user(st, UserDb::new(&st.db, uid), now, quiet).await {
-            Ok(n) => count += n,
-            Err(e) => tracing::error!(user = uid, error = ?e, "reminder tick failed for user"),
-        }
-    }
-    Ok(count)
-}
-
-async fn tick_user(
-    st: &AppState,
-    user: UserDb,
-    now: DateTime<Tz>,
-    quiet: Option<(NaiveTime, NaiveTime)>,
-) -> anyhow::Result<usize> {
     let date = now.format("%Y-%m-%d").to_string();
-    let yesterday = (now.date_naive() - ChronoDuration::days(1)).format("%Y-%m-%d").to_string();
+    let yesterday = (now.date_naive() - ChronoDuration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
 
-    let items = user.reminder_items().await?;
-    let mut completions = user.reminder_completions(&date).await?;
-    completions.extend(user.reminder_completions(&yesterday).await?);
-    let sent = user.sent_reminders(&date, &yesterday).await?;
+    let items = store::reminder_items(&st.db).await?;
+    let completions = store::reminder_completions(&st.db, &date, &yesterday).await?;
+    let sent: HashSet<(String, String)> = sqlx::query_as::<_, (String, String)>(
+        "SELECT item_id, date FROM reminders_sent WHERE date IN (?, ?)",
+    )
+    .bind(&date)
+    .bind(&yesterday)
+    .fetch_all(&st.db)
+    .await?
+    .into_iter()
+    .collect();
 
-    let due = due_reminders(now, &items, &completions, &sent, st.config.reminder_grace_mins, quiet);
+    let due = due_reminders(
+        now,
+        &items,
+        &completions,
+        &sent,
+        st.config.reminder_grace_mins,
+        quiet,
+    );
     if due.is_empty() {
         return Ok(0);
     }
     let devices: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, fcm_token FROM devices WHERE user_id = ? AND fcm_token IS NOT NULL AND fcm_token != ''",
+        "SELECT id, fcm_token FROM devices WHERE fcm_token IS NOT NULL AND fcm_token != ''",
     )
-    .bind(user.user_id())
     .fetch_all(&st.db)
     .await?;
     if devices.is_empty() {
@@ -413,18 +395,25 @@ async fn tick_user(
             match st.push.send(&msg).await {
                 Ok(SendOutcome::Sent) => delivered = true,
                 Ok(SendOutcome::Unregistered) => {
-                    tracing::info!(user = user.user_id(), device = %device_id, "fcm token unregistered, clearing");
-                    sqlx::query("UPDATE devices SET fcm_token = NULL WHERE id = ? AND user_id = ?")
+                    tracing::info!(device = %device_id, "fcm token unregistered, clearing");
+                    sqlx::query("UPDATE devices SET fcm_token = NULL WHERE id = ?")
                         .bind(device_id)
-                        .bind(user.user_id())
                         .execute(&st.db)
                         .await?;
                 }
-                Err(e) => tracing::warn!(user = user.user_id(), error = ?e, item = %d.item_id, "reminder send failed"),
+                Err(e) => tracing::warn!(error = ?e, item = %d.item_id, "reminder send failed"),
             }
         }
         if delivered {
-            user.mark_reminder_sent(&d.item_id, &d.date).await?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO reminders_sent (user_id, item_id, date, sent_at) VALUES (?, ?, ?, ?)",
+            )
+            .bind(crate::users::ADMIN_ID)
+            .bind(&d.item_id)
+            .bind(&d.date)
+            .bind(now_ms())
+            .execute(&st.db)
+            .await?;
             count += 1;
         }
     }
@@ -444,7 +433,7 @@ pub fn spawn_scheduler(st: AppState) {
                 tracing::error!(error = ?e, "reminder tick failed");
             }
             if n.is_multiple_of(PRUNE_EVERY_TICKS) {
-                match store::prune(&st.db, now_ms(), st.config.tombstone_days).await {
+                match store::prune(&st.db, now_ms()).await {
                     Ok(p) if p != store::Pruned::default() => tracing::info!(?p, "pruned old rows"),
                     Ok(_) => {}
                     Err(e) => tracing::error!(error = ?e, "cleanup failed"),
@@ -453,51 +442,4 @@ pub fn spawn_scheduler(st: AppState) {
             n = n.wrapping_add(1);
         }
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn msg() -> Message {
-        Message {
-            token: "tok".into(),
-            title: "Recycling".into(),
-            body: "Chore due now".into(),
-            data: HashMap::from([
-                ("item_id".to_string(), "i1".to_string()),
-                ("date".to_string(), "2026-10-19".to_string()),
-                ("kind".to_string(), "chore".to_string()),
-            ]),
-        }
-    }
-
-    #[test]
-    fn notification_mode_keeps_the_existing_payload() {
-        let v = fcm_payload(&msg(), PushMode::Notification);
-        assert_eq!(v["message"]["notification"]["title"], "Recycling");
-        assert_eq!(v["message"]["notification"]["body"], "Chore due now");
-        assert_eq!(v["message"]["data"]["item_id"], "i1");
-        assert_eq!(v["message"]["android"]["priority"], "HIGH");
-        assert_eq!(v["message"]["android"]["notification"]["channel_id"], "reminders");
-    }
-
-    #[test]
-    fn data_mode_has_no_notification_block_and_carries_the_text_as_data() {
-        let v = fcm_payload(&msg(), PushMode::Data);
-        assert!(v["message"].get("notification").is_none(), "a notification block would make Android show it itself");
-        let d = &v["message"]["data"];
-        assert_eq!((d["title"].as_str(), d["body"].as_str()), (Some("Recycling"), Some("Chore due now")));
-        assert_eq!((d["item_id"].as_str(), d["date"].as_str(), d["kind"].as_str()), (Some("i1"), Some("2026-10-19"), Some("chore")));
-        assert_eq!(v["message"]["android"]["priority"], "HIGH", "high priority so it wakes the app");
-        assert!(d.as_object().unwrap().values().all(|x| x.is_string()), "FCM data values must be strings");
-    }
-
-    #[test]
-    fn push_mode_parsing() {
-        assert_eq!(PushMode::parse("DATA"), Some(PushMode::Data));
-        assert_eq!(PushMode::parse(" notification "), Some(PushMode::Notification));
-        assert_eq!(PushMode::parse("both"), None);
-        assert_eq!(PushMode::default(), PushMode::Notification);
-    }
 }

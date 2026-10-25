@@ -1,0 +1,691 @@
+//! Real SQLx ledger behavior for the multi-user schema, on populated file databases.
+//!
+//! The default branch has applied 0001 (init) and 0003 (hygiene indexes). The durable pairing
+//! limiter (PR31) reserves 0004. This branch adds 0002 (users, which rebuilds five tables) and
+//! the additive forward repair 0005. SQLx applies any version it has not recorded, so the
+//! ledgers a deployment can be in are all upgraded by the same migration set; these tests
+//! build each ledger for real, fill it with data, upgrade it, and check what survived.
+
+use std::borrow::Cow;
+use std::path::Path;
+use std::str::FromStr;
+
+use bread_tracker_server::db;
+use sha2::{Digest, Sha384};
+use sqlx::migrate::{Migration, MigrationType, Migrator};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::SqlitePool;
+
+const I1: &str = "11111111-1111-4111-8111-111111111111";
+const I2: &str = "22222222-2222-4222-8222-222222222222";
+const I3: &str = "33333333-3333-4333-8333-333333333333";
+
+/// Published checksums (SHA-384 of the file). These migrations are applied on real databases
+/// and must never change.
+const SHA_0001: &str = "43b80a728988ff17392c658746718dfd9cb3fe020834569cd8488bb59db8bc64358b893275b6dac6d392dc85f24c176c";
+const SHA_0003: &str = "30ac24599e921d7a167a83c6df30d88b388258eb10bf3ac4625d50920d42c8873d75a661b6bb93bafd262a0581f048e0";
+const SHA_0004: &str = "229011bcf178a2afa3eb4277c56a4866e4cc51a292418b12ea336d0b1ae0975b17ae0a53abf71a4511abcb67ed7aa60e";
+
+/// The 0004 file as PR31 publishes it, copied byte for byte so the combined tree can be tested
+/// before PR31 is integrated.
+const SQL_0004: &str = include_str!("fixtures/0004_pair_rate_limits.sql");
+
+/// The four indexes migration 0003 creates.
+const HYGIENE_INDEXES: [&str; 4] = [
+    "items_kind_id",
+    "items_reminder_candidates",
+    "completions_date_item",
+    "completions_live_date",
+];
+
+/// Added by 0005: keeps the scheduler's lookup by item id indexed under the per-user key.
+const REPAIR_INDEX: &str = "completions_item_date";
+
+fn embedded() -> Migrator {
+    sqlx::migrate!("../migrations")
+}
+
+/// The embedded set restricted to `versions`, plus PR31's 0004 when asked for.
+fn migrator(versions: &[i64], with_0004: bool) -> Migrator {
+    let mut m = embedded();
+    let mut list: Vec<Migration> = m
+        .migrations
+        .iter()
+        .filter(|x| versions.contains(&x.version))
+        .cloned()
+        .collect();
+    if with_0004 {
+        list.push(Migration::new(
+            4,
+            Cow::Borrowed("pair rate limits"),
+            MigrationType::Simple,
+            Cow::Borrowed(SQL_0004),
+            false,
+        ));
+    }
+    list.sort_by_key(|x| x.version);
+    m.migrations = Cow::Owned(list);
+    m
+}
+
+/// Every migration this branch ships, plus PR31's 0004: the tree after both are integrated.
+fn combined() -> Migrator {
+    let all: Vec<i64> = embedded().migrations.iter().map(|m| m.version).collect();
+    migrator(&all, true)
+}
+
+async fn open(path: &Path) -> SqlitePool {
+    let opts = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+        .unwrap()
+        .create_if_missing(true)
+        .foreign_keys(true);
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .unwrap()
+}
+
+fn url(path: &Path) -> String {
+    format!("sqlite://{}", path.display())
+}
+
+/// Fill a 0001 database the way a live single-user server would.
+async fn populate_0001(pool: &SqlitePool) {
+    let q = |sql: &'static str| sqlx::query(sql);
+    q("INSERT INTO items (id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, seq)
+       VALUES ('11111111-1111-4111-8111-111111111111', 'chore', 'Dishes', 127, '18:30', 10, NULL, 0, 1, 1000, NULL, 1),
+              ('22222222-2222-4222-8222-222222222222', 'habit', 'Read', 127, NULL, 15, NULL, 1, 1, 1000, 5000, 3),
+              ('33333333-3333-4333-8333-333333333333', 'todo', 'Rent', 0, '09:00', 20, '2026-10-30', 2, 1, 1000, NULL, 6)")
+        .execute(pool).await.unwrap();
+    q(
+        "INSERT INTO completions (item_id, date, completed_at, updated_at, deleted_at, seq)
+       VALUES ('11111111-1111-4111-8111-111111111111', '2026-10-19', 2000, 2000, NULL, 2),
+              ('11111111-1111-4111-8111-111111111111', '2026-10-20', 3000, 3000, 4000, 4),
+              ('22222222-2222-4222-8222-222222222222', '2026-10-19', 2000, 2000, NULL, 5)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    q("UPDATE meta SET val = 6 WHERE key = 'seq'")
+        .execute(pool)
+        .await
+        .unwrap();
+    q("INSERT INTO devices (id, name, token_hash, fcm_token, created_at, last_seen) VALUES ('dev-1', 'Pixel', 'tok-1', 'fcm-1', 777, 888), ('dev-2', 'Tablet', 'tok-2', NULL, 900, 900)")
+        .execute(pool).await.unwrap();
+    q("INSERT INTO pairing_codes (code_hash, expires_at) VALUES ('code-hash', 99999999999999)")
+        .execute(pool)
+        .await
+        .unwrap();
+    q("INSERT INTO reminders_sent (item_id, date, sent_at) VALUES ('11111111-1111-4111-8111-111111111111', '2026-10-20', 5)")
+        .execute(pool).await.unwrap();
+    q("UPDATE settings SET value = 'Europe/Berlin' WHERE key = 'timezone'")
+        .execute(pool)
+        .await
+        .unwrap();
+    q("UPDATE settings SET value = '22:00' WHERE key = 'quiet_start'")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// Build a populated ledger: 0001 with data, then the later versions in `then` (already
+/// deployed by an earlier release), exactly as SQLx would have recorded them.
+async fn deployed(path: &Path, then: &[i64], with_0004: bool) {
+    let pool = open(path).await;
+    migrator(&[1], false).run(&pool).await.unwrap();
+    populate_0001(&pool).await;
+    if !then.is_empty() || with_0004 {
+        let mut versions = vec![1];
+        versions.extend_from_slice(then);
+        migrator(&versions, with_0004).run(&pool).await.unwrap();
+    }
+    pool.close().await;
+}
+
+async fn scalar(pool: &SqlitePool, sql: &str) -> i64 {
+    sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+}
+
+async fn index_names(pool: &SqlitePool) -> Vec<String> {
+    sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+async fn ledger(pool: &SqlitePool) -> Vec<(i64, String, bool)> {
+    sqlx::query_as::<_, (i64, Vec<u8>, bool)>(
+        "SELECT version, checksum, success FROM _sqlx_migrations ORDER BY version",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|(v, c, s)| (v, hex::encode(c), s))
+    .collect()
+}
+
+fn checksum_of(sql: &str) -> String {
+    hex::encode(Sha384::digest(sql.as_bytes()))
+}
+
+/// Everything the upgrade must preserve, whichever ledger it started from.
+async fn assert_upgraded_and_intact(pool: &SqlitePool) {
+    // Row counts unchanged and every row owned by the admin.
+    assert_eq!(scalar(pool, "SELECT COUNT(*) FROM items").await, 3);
+    assert_eq!(scalar(pool, "SELECT COUNT(*) FROM completions").await, 3);
+    assert_eq!(scalar(pool, "SELECT COUNT(*) FROM devices").await, 2);
+    assert_eq!(scalar(pool, "SELECT COUNT(*) FROM pairing_codes").await, 1);
+    assert_eq!(scalar(pool, "SELECT COUNT(*) FROM reminders_sent").await, 1);
+    assert_eq!(scalar(pool, "SELECT COUNT(*) FROM users").await, 1);
+    for table in [
+        "items",
+        "completions",
+        "devices",
+        "pairing_codes",
+        "reminders_sent",
+    ] {
+        assert_eq!(
+            scalar(
+                pool,
+                &format!("SELECT COUNT(*) FROM {table} WHERE user_id = 1")
+            )
+            .await,
+            scalar(pool, &format!("SELECT COUNT(*) FROM {table}")).await,
+            "{table}"
+        );
+    }
+    // Values, tombstones, sequence numbers, tokens, global settings.
+    let item: (String, i64, Option<i64>, i64) =
+        sqlx::query_as("SELECT name, points, deleted_at, seq FROM items WHERE id = ?")
+            .bind(I2)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(item, ("Read".to_string(), 15, Some(5000), 3));
+    let dev: (String, Option<String>, i64, i64) = sqlx::query_as(
+        "SELECT name, fcm_token, created_at, last_seen FROM devices WHERE token_hash = 'tok-1'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(dev, ("Pixel".into(), Some("fcm-1".into()), 777, 888));
+    assert_eq!(
+        scalar(pool, "SELECT val FROM meta WHERE key = 'seq'").await,
+        6
+    );
+    let tz: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'timezone'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(tz, "Europe/Berlin");
+    let quiet: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'quiet_start'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(quiet, "22:00");
+
+    // The hygiene indexes from 0003 exist, whatever order 0002 and 0003 ran in.
+    let names = index_names(pool).await;
+    for idx in HYGIENE_INDEXES {
+        assert!(names.contains(&idx.to_string()), "{idx} missing: {names:?}");
+    }
+    for idx in [
+        "items_user_seq",
+        "completions_user_seq",
+        "users_name_key",
+        REPAIR_INDEX,
+    ] {
+        assert!(names.contains(&idx.to_string()), "{idx} missing: {names:?}");
+    }
+    // The old global sync indexes went with the old tables and are not resurrected.
+    assert!(!names.contains(&"items_seq".to_string()));
+
+    // The per-user schema is really there.
+    assert_eq!(
+        scalar(
+            pool,
+            "SELECT COUNT(*) FROM pragma_table_info('items') WHERE name = 'user_id'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            pool,
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('items') WHERE \"table\" = 'users' AND on_delete = 'CASCADE'"
+        )
+        .await,
+        1
+    );
+
+    let violations: Vec<(String, i64, String, i64)> = sqlx::query_as("PRAGMA foreign_key_check")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    assert!(violations.is_empty(), "{violations:?}");
+    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(integrity, "ok");
+
+    // The scheduler's selection still uses the 0003 partial index after the rebuild.
+    let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+        "EXPLAIN QUERY PLAN SELECT id FROM items WHERE active = 1 AND deleted_at IS NULL AND remind_time IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert!(
+        plan.iter()
+            .any(|r| r.3.contains("items_reminder_candidates")),
+        "{plan:?}"
+    );
+}
+
+/// Applied migrations must keep their published checksums.
+fn assert_ledger(rows: &[(i64, String, bool)], expected: &[i64], with_0004: bool) {
+    let versions: Vec<i64> = rows.iter().map(|r| r.0).collect();
+    assert_eq!(versions, expected, "{rows:?}");
+    assert!(
+        rows.iter().all(|r| r.2),
+        "a recorded migration failed: {rows:?}"
+    );
+    let sum = |v: i64| rows.iter().find(|r| r.0 == v).map(|r| r.1.as_str());
+    assert_eq!(sum(1), Some(SHA_0001), "0001 must be byte-identical");
+    assert_eq!(sum(3), Some(SHA_0003), "0003 must be byte-identical");
+    if with_0004 {
+        assert_eq!(sum(4), Some(SHA_0004), "0004 must be byte-identical");
+    }
+}
+
+#[test]
+fn published_migration_files_keep_their_checksums() {
+    let m = combined();
+    let sum = |v: i64| {
+        hex::encode(
+            &m.migrations
+                .iter()
+                .find(|x| x.version == v)
+                .unwrap()
+                .checksum[..],
+        )
+    };
+    assert_eq!(sum(1), SHA_0001);
+    assert_eq!(sum(3), SHA_0003);
+    assert_eq!(sum(4), SHA_0004);
+    assert_eq!(checksum_of(SQL_0004), SHA_0004);
+    // Versions are unique and strictly increasing; nothing collides with 0004.
+    let versions: Vec<i64> = m.migrations.iter().map(|x| x.version).collect();
+    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
+}
+
+#[tokio::test]
+async fn upgrade_from_0001_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.db");
+    deployed(&path, &[], false).await;
+
+    let pool = db::connect_with_migrator(&url(&path), None, &embedded())
+        .await
+        .unwrap();
+    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 5], false);
+    assert_upgraded_and_intact(&pool).await;
+}
+
+#[tokio::test]
+async fn upgrade_from_0001_and_0003_restores_the_hygiene_indexes_0002_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("b.db");
+    deployed(&path, &[3], false).await;
+
+    // Precondition, on the real file: 0003 is applied and its indexes exist.
+    let pool = open(&path).await;
+    let before = index_names(&pool).await;
+    for idx in HYGIENE_INDEXES {
+        assert!(before.contains(&idx.to_string()), "{idx}");
+    }
+    pool.close().await;
+
+    // The unrepaired late 0002 (this branch without 0005) drops them, and SQLx will never
+    // rerun the recorded 0003. This documents the defect the forward repair exists for.
+    let broken = dir.path().join("b-unrepaired.db");
+    std::fs::copy(&path, &broken).unwrap();
+    let pool = open(&broken).await;
+    migrator(&[1, 2, 3], false).run(&pool).await.unwrap();
+    let lost = index_names(&pool).await;
+    for idx in ["items_kind_id", "completions_date_item"] {
+        assert!(!lost.contains(&idx.to_string()), "{idx} should be gone");
+    }
+    // ...and running the repair afterwards restores them (what an operator's upgrade does).
+    migrator(&[1, 2, 3, 5], false).run(&pool).await.unwrap();
+    assert!(index_names(&pool)
+        .await
+        .contains(&"items_kind_id".to_string()));
+    pool.close().await;
+
+    let pool = db::connect_with_migrator(&url(&path), None, &embedded())
+        .await
+        .unwrap();
+    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 5], false);
+    assert_upgraded_and_intact(&pool).await;
+}
+
+#[tokio::test]
+async fn upgrade_from_0001_0003_and_0004() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.db");
+    deployed(&path, &[3], true).await;
+
+    let pool = db::connect_with_migrator(&url(&path), None, &combined())
+        .await
+        .unwrap();
+    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 4, 5], true);
+    assert_upgraded_and_intact(&pool).await;
+    // 0004's table was not touched by the rebuild.
+    assert_eq!(
+        scalar(&pool, "SELECT COUNT(*) FROM pair_rate_limits").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn upgrade_from_0001_and_0004_without_0003() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c2.db");
+    deployed(&path, &[], true).await;
+    let pool = db::connect_with_migrator(&url(&path), None, &combined())
+        .await
+        .unwrap();
+    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 4, 5], true);
+    assert_upgraded_and_intact(&pool).await;
+}
+
+#[tokio::test]
+async fn upgrade_from_the_published_pr43_head_0001_and_0002() {
+    // A deployment that ran PR43 at e4195dd (0002 only) gets 0003 and 0005 on the next start.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("d.db");
+    deployed(&path, &[2], false).await;
+    let pool = db::connect_with_migrator(&url(&path), None, &embedded())
+        .await
+        .unwrap();
+    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 5], false);
+    assert_upgraded_and_intact(&pool).await;
+}
+
+#[tokio::test]
+async fn upgrade_from_0001_0002_0003_in_that_order() {
+    // 0002 then 0003 is the order a fresh install takes. No index was ever lost.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("e.db");
+    deployed(&path, &[2, 3], false).await;
+    let pool = db::connect_with_migrator(&url(&path), None, &embedded())
+        .await
+        .unwrap();
+    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 5], false);
+    assert_upgraded_and_intact(&pool).await;
+}
+
+#[tokio::test]
+async fn fresh_database_gets_the_whole_set_in_version_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fresh.db");
+    let pool = db::connect_with_migrator(&url(&path), None, &combined())
+        .await
+        .unwrap();
+    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 4, 5], true);
+    let names = index_names(&pool).await;
+    for idx in HYGIENE_INDEXES {
+        assert!(names.contains(&idx.to_string()), "{idx}");
+    }
+    assert_eq!(scalar(&pool, "SELECT COUNT(*) FROM users").await, 1);
+}
+
+#[tokio::test]
+async fn a_second_start_is_a_no_op_on_every_ledger() {
+    for (name, then, with_0004) in [
+        ("a", vec![], false),
+        ("b", vec![3], false),
+        ("c", vec![3], true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{name}.db"));
+        deployed(&path, &then, with_0004).await;
+        let m = if with_0004 { combined() } else { embedded() };
+        let pool = db::connect_with_migrator(&url(&path), Some("Riley"), &m)
+            .await
+            .unwrap();
+        let first = ledger(&pool).await;
+        let users: (i64, String) = sqlx::query_as("SELECT id, name FROM users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let pool = db::connect_with_migrator(&url(&path), Some("Riley"), &m)
+            .await
+            .unwrap();
+        assert_eq!(ledger(&pool).await, first, "{name}");
+        let again: (i64, String) = sqlx::query_as("SELECT id, name FROM users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(users, again, "{name}");
+        assert_upgraded_and_intact(&pool).await;
+    }
+}
+
+#[tokio::test]
+async fn this_branch_alone_refuses_a_database_that_already_ran_0004() {
+    // PR43 without PR31's migration cannot adopt a database that recorded 0004: SQLx reports
+    // the missing version and the server refuses to start instead of guessing. This is why
+    // the stack must integrate the limiter's 0004 before (or with) this branch.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("needs0004.db");
+    deployed(&path, &[3], true).await;
+    let err = db::connect_with_migrator(&url(&path), None, &embedded())
+        .await
+        .expect_err("must refuse")
+        .to_string();
+    assert!(err.contains("4"), "{err}");
+    // Nothing was changed by the refusal: still the 0001+0003+0004 ledger with legacy tables.
+    let pool = open(&path).await;
+    assert_eq!(
+        scalar(
+            &pool,
+            "SELECT COUNT(*) FROM pragma_table_info('items') WHERE name = 'user_id'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar(&pool, "SELECT COUNT(*) FROM _sqlx_migrations").await,
+        3
+    );
+    assert_eq!(scalar(&pool, "SELECT COUNT(*) FROM items").await, 3);
+}
+
+#[tokio::test]
+async fn an_edited_published_migration_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("edited.db");
+    deployed(&path, &[3], false).await;
+    let mut m = embedded();
+    let mut list = m.migrations.to_vec();
+    for x in &mut list {
+        if x.version == 3 {
+            *x = Migration::new(
+                3,
+                x.description.clone(),
+                MigrationType::Simple,
+                Cow::Owned(format!("{}\n-- edited", x.sql)),
+                false,
+            );
+        }
+    }
+    m.migrations = Cow::Owned(list);
+    let err = db::connect_with_migrator(&url(&path), None, &m)
+        .await
+        .expect_err("must refuse")
+        .to_string();
+    assert!(err.contains("3"), "{err}");
+}
+
+/// A migrator whose version `v` carries an extra failing statement, to prove rollback.
+fn failing_at(mut m: Migrator, v: i64) -> Migrator {
+    let list: Vec<Migration> = m
+        .migrations
+        .iter()
+        .map(|x| {
+            if x.version == v {
+                Migration::new(
+                    x.version,
+                    x.description.clone(),
+                    MigrationType::Simple,
+                    Cow::Owned(format!(
+                        "{}\nSELECT * FROM table_that_does_not_exist;",
+                        x.sql
+                    )),
+                    false,
+                )
+            } else {
+                x.clone()
+            }
+        })
+        .collect();
+    m.migrations = Cow::Owned(list);
+    m
+}
+
+#[tokio::test]
+async fn a_failed_0002_rolls_back_completely_and_a_retry_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fail2.db");
+    deployed(&path, &[3], true).await;
+
+    let err = db::connect_with_migrator(&url(&path), None, &failing_at(combined(), 2)).await;
+    assert!(err.is_err());
+
+    // The file is exactly the 0001+0003+0004 database it was: legacy tables, all data, indexes.
+    let pool = open(&path).await;
+    assert_eq!(
+        ledger(&pool).await.iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![1, 3, 4]
+    );
+    assert_eq!(scalar(&pool, "SELECT COUNT(*) FROM items").await, 3);
+    assert_eq!(scalar(&pool, "SELECT COUNT(*) FROM completions").await, 3);
+    assert_eq!(scalar(&pool, "SELECT COUNT(*) FROM devices").await, 2);
+    assert_eq!(
+        scalar(
+            &pool,
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('users', 'items_new', 'completions_new', 'devices_new')"
+        )
+        .await,
+        0
+    );
+    let names = index_names(&pool).await;
+    for idx in HYGIENE_INDEXES {
+        assert!(names.contains(&idx.to_string()), "{idx}");
+    }
+    assert_eq!(
+        scalar(
+            &pool,
+            "SELECT COUNT(*) FROM pragma_table_info('devices') WHERE name = 'user_id'"
+        )
+        .await,
+        0
+    );
+    pool.close().await;
+
+    let pool = db::connect_with_migrator(&url(&path), None, &combined())
+        .await
+        .unwrap();
+    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 4, 5], true);
+    assert_upgraded_and_intact(&pool).await;
+}
+
+#[tokio::test]
+async fn a_failed_0005_keeps_the_0002_result_and_a_retry_completes_the_repair() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fail5.db");
+    deployed(&path, &[3], false).await;
+
+    let err = db::connect_with_migrator(&url(&path), None, &failing_at(embedded(), 5)).await;
+    assert!(err.is_err());
+
+    // 0002 committed in its own transaction. 0005 left nothing behind: no name_key column,
+    // no partial index, nothing recorded.
+    let pool = open(&path).await;
+    assert_eq!(
+        ledger(&pool).await.iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        scalar(
+            &pool,
+            "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name IN ('name_key', 'name_confirmed')"
+        )
+        .await,
+        0
+    );
+    assert_eq!(scalar(&pool, "SELECT COUNT(*) FROM items").await, 3);
+    assert_eq!(
+        scalar(&pool, "SELECT COUNT(*) FROM items WHERE user_id = 1").await,
+        3
+    );
+    pool.close().await;
+
+    let pool = db::connect_with_migrator(&url(&path), None, &embedded())
+        .await
+        .unwrap();
+    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 5], false);
+    assert_upgraded_and_intact(&pool).await;
+}
+
+#[tokio::test]
+async fn sync_pull_searches_the_per_user_sequence_indexes() {
+    let pool = db::connect_memory().await.unwrap();
+    let plans = bread_tracker_server::store::pull_query_plans(&pool)
+        .await
+        .unwrap();
+    let joined = plans.join(" | ");
+    assert!(joined.contains("items_user_seq"), "{joined}");
+    assert!(joined.contains("completions_user_seq"), "{joined}");
+    assert!(!joined.contains("SCAN"), "{joined}");
+    assert!(!joined.contains("TEMP B-TREE"), "{joined}");
+}
+
+#[tokio::test]
+async fn items_belong_to_their_user_and_removing_one_user_keeps_the_rest() {
+    // The sibling of the migration: after upgrading, a second user holds the same ids.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("two.db");
+    deployed(&path, &[3], false).await;
+    let pool = db::connect_with_migrator(&url(&path), None, &embedded())
+        .await
+        .unwrap();
+    let sam = bread_tracker_server::users::create(&pool, "Sam", false)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO items (user_id, id, kind, name, points, updated_at, seq) VALUES (?, ?, 'chore', 'Sam', 1, 1, 7)")
+        .bind(sam)
+        .bind(I1)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(sqlx::query("INSERT INTO items (user_id, id, kind, name, points, updated_at, seq) VALUES (?, ?, 'chore', 'dup', 1, 1, 8)")
+        .bind(sam)
+        .bind(I1)
+        .execute(&pool)
+        .await
+        .is_err());
+    sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(sam)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(scalar(&pool, "SELECT COUNT(*) FROM items").await, 3);
+    let _ = I3;
+}

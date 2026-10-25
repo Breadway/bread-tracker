@@ -54,8 +54,6 @@ class _PairScreenState extends ConsumerState<PairScreen> {
       await store.setServerUrl(server);
       await store.saveToken(token);
       await store.resetSync();
-      // A (re)paired server may be empty or rebuilt, so offer it everything we have.
-      await ref.read(dbProvider).markAllDirty();
       ref.invalidate(pairedProvider);
       ref.read(controllerProvider).syncNow();
       ref.read(pushProvider).register(requestPermission: true);
@@ -110,7 +108,7 @@ class _PairScreenState extends ConsumerState<PairScreen> {
             ),
             const SizedBox(height: 8),
             Text(
-              'Make a code on Hestia with: docker exec bread-tracker bread-tracker-server pair',
+              'Make a code on the server with: docker exec bread-tracker bread-tracker-server pair',
               style: TextStyle(color: p.dim, fontSize: 12),
             ),
             if (_error != null)

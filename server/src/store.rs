@@ -170,11 +170,20 @@ pub async fn all_completions(db: &Db) -> Result<Vec<Completion>, sqlx::Error> {
     .await
 }
 
-/// Items the scheduler can remind about, instead of loading every row each tick.
+/// Items the scheduler can remind about, instead of loading every row each tick. Only the
+/// first user's: the background scheduler is single owner until per-user scheduling exists, so
+/// nobody else's item can be turned into a notification on someone else's device.
+///
+/// `INDEXED BY` keeps the partial index from migration 0003 (restored by 0005 after the users
+/// rebuild) in use. Without it the extra `user_id` filter makes SQLite prefer `items_user_seq`
+/// and walk every row of the user on each tick. The index holds only reminder candidates and
+/// `user_id` is applied to those rows.
 pub async fn reminder_items(db: &Db) -> Result<Vec<Item>, sqlx::Error> {
     sqlx::query_as::<_, Item>(&format!(
-        "SELECT {ITEM_COLS} FROM items WHERE active = 1 AND deleted_at IS NULL AND remind_time IS NOT NULL"
+        "SELECT {ITEM_COLS} FROM items INDEXED BY items_reminder_candidates
+         WHERE user_id = ? AND active = 1 AND deleted_at IS NULL AND remind_time IS NOT NULL"
     ))
+    .bind(ADMIN_ID)
     .fetch_all(db)
     .await
 }
@@ -185,25 +194,61 @@ pub async fn reminder_items_query_plan(
     db: &Db,
 ) -> Result<Vec<(i64, i64, i64, String)>, sqlx::Error> {
     sqlx::query_as(
-        "EXPLAIN QUERY PLAN SELECT id FROM items WHERE active = 1 AND deleted_at IS NULL AND remind_time IS NOT NULL",
+        "EXPLAIN QUERY PLAN SELECT id FROM items INDEXED BY items_reminder_candidates
+         WHERE user_id = ? AND active = 1 AND deleted_at IS NULL AND remind_time IS NOT NULL",
     )
+    .bind(ADMIN_ID)
     .fetch_all(db)
     .await
 }
 
+/// Completions the scheduler needs, first user only (see [`reminder_items`]): everything dated
+/// `date` or `yesterday`, plus every completion of a to-do.
 pub async fn reminder_completions(
     db: &Db,
     date: &str,
     yesterday: &str,
 ) -> Result<Vec<Completion>, sqlx::Error> {
     sqlx::query_as::<_, Completion>(&format!(
-        "SELECT {COMPLETION_COLS} FROM completions WHERE date IN (?, ?)
+        "SELECT {COMPLETION_COLS} FROM completions WHERE user_id = ? AND date IN (?, ?)
          UNION
          SELECT {COMPLETION_COLS} FROM completions
-         WHERE item_id IN (SELECT id FROM items WHERE kind = 'todo')"
+         WHERE user_id = ? AND item_id IN (SELECT id FROM items WHERE user_id = ? AND kind = 'todo')"
     ))
+    .bind(ADMIN_ID)
     .bind(date)
     .bind(yesterday)
+    .bind(ADMIN_ID)
+    .bind(ADMIN_ID)
+    .fetch_all(db)
+    .await
+}
+
+/// (item_id, date) of reminders already sent to the first user on either date.
+pub async fn sent_reminders(
+    db: &Db,
+    d1: &str,
+    d2: &str,
+) -> Result<std::collections::HashSet<(String, String)>, sqlx::Error> {
+    Ok(sqlx::query_as::<_, (String, String)>(
+        "SELECT item_id, date FROM reminders_sent WHERE user_id = ? AND date IN (?, ?)",
+    )
+    .bind(ADMIN_ID)
+    .bind(d1)
+    .bind(d2)
+    .fetch_all(db)
+    .await?
+    .into_iter()
+    .collect())
+}
+
+/// FCM devices of the first user: the only destination a scheduled reminder may have.
+pub async fn reminder_devices(db: &Db) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, fcm_token FROM devices
+         WHERE user_id = ? AND fcm_token IS NOT NULL AND fcm_token != ''",
+    )
+    .bind(ADMIN_ID)
     .fetch_all(db)
     .await
 }

@@ -5,6 +5,7 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use bread_tracker_server::config::Config;
 use bread_tracker_server::push::{self, MockSender};
+use bread_tracker_server::store::UserDb;
 use bread_tracker_server::{api, auth, db, store, AppState};
 use chrono::{Duration, TimeZone, Utc};
 use http_body_util::BodyExt;
@@ -324,7 +325,8 @@ async fn scheduler_queries_use_indexes_and_keep_any_date_todo_completion() {
     let now = store::now_ms();
     let tok = paired(&h).await;
     call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"items": [item(C1, "todo", "Pay", 0, None, now)], "completions": [comp(C1, "2026-10-18", now, None)]}))).await;
-    let rows = store::reminder_completions(&h.state.db, "2026-10-19", "2026-10-18")
+    let rows = UserDb::new(&h.state.db, 1)
+        .reminder_completions("2026-10-19", "2026-10-18")
         .await
         .unwrap();
     assert_eq!(
@@ -355,7 +357,10 @@ async fn scheduler_queries_use_indexes_and_keep_any_date_todo_completion() {
                 .any(|(_, _, _, d)| d.contains("SCAN items")),
         "todo suppression should use indexes, got {todo_plan:?}"
     );
-    let item_plan = store::reminder_items_query_plan(&h.state.db).await.unwrap();
+    let item_plan = UserDb::new(&h.state.db, 1)
+        .reminder_items_query_plan()
+        .await
+        .unwrap();
     assert!(
         item_plan
             .iter()
@@ -384,7 +389,8 @@ async fn scheduler_queries_use_indexes_and_keep_any_date_todo_completion() {
         )
         .await;
     }
-    let queried = store::reminder_completions(&h.state.db, "2026-10-19", "2026-10-18")
+    let queried = UserDb::new(&h.state.db, 1)
+        .reminder_completions("2026-10-19", "2026-10-18")
         .await
         .unwrap();
     assert_eq!(

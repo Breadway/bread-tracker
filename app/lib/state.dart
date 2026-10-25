@@ -175,6 +175,8 @@ class AppController {
   bool _pairingPending = false;
   Completer<void>? _wipeCommitCompletion;
   bool _wipeCommitFailed = false;
+  bool get isWipeRecoveryPending => _wipeCommitFailed;
+  Future<bool>? _wipeRecovery;
   int _combo = 0;
   DateTime _lastTick = DateTime.fromMillisecondsSinceEpoch(0);
 
@@ -221,6 +223,7 @@ class AppController {
     final store = ref.read(storeProvider);
     store.claimAuthGeneration();
     final storeGeneration = store.authGeneration;
+    final wipeRecoveryRetry = !wipeLocal && _wipeCommitFailed;
     final generation = ++_authGeneration;
     _signedOut = true;
     _signOutCleanupPending = true;
@@ -231,10 +234,29 @@ class AppController {
     final cursorBeforeCleanup = store.cursor;
     final token = await store.readTokenForGeneration(storeGeneration);
     if (generation != _authGeneration ||
-        !_signedOut ||
+        (!_signedOut && !wipeRecoveryRetry) ||
         store.credentialEpoch != epoch ||
         store.authGeneration != storeGeneration) {
       return false;
+    }
+    if (wipeRecoveryRetry && _wipeCommitFailed) {
+      return store.runIfCredentialCurrentForRecovery(
+        token,
+        storeGeneration,
+        store.serverUrl,
+        () async {
+          try {
+            await _db.select(_db.items).get();
+            await _db.select(_db.completions).get();
+            await store.resetSync();
+            _wipeCommitFailed = false;
+            _signOutCleanupPending = false;
+            return true;
+          } catch (_) {
+            return false;
+          }
+        },
+      );
     }
     final server = store.serverUrl;
     var revoked = true;
@@ -251,7 +273,7 @@ class AppController {
     // transfers ownership to the new generation, so the old sign-out must not
     // clear that credential, cursor, or the replacement device's local data.
     if (generation != _authGeneration ||
-        !_signedOut ||
+        (!_signedOut && !wipeRecoveryRetry) ||
         store.authGeneration != storeGeneration) {
       return revoked;
     }
@@ -287,14 +309,15 @@ class AppController {
           );
     if (!cleanup ||
         generation != _authGeneration ||
-        !_signedOut ||
+        (!_signedOut && !wipeRecoveryRetry) ||
         store.credentialEpoch != epoch ||
         store.authGeneration != storeGeneration) {
       return revoked;
     }
     _signOutCleanupPending = false;
+    if (!wipeLocal && _wipeCommitFailed) _wipeCommitFailed = false;
     if (generation == _authGeneration &&
-        _signedOut &&
+        (_signedOut || wipeRecoveryRetry) &&
         store.credentialEpoch == epoch) {
       ref.read(syncStatusProvider.notifier).set(SyncStatus.unpaired);
       ref.invalidate(pairedProvider);
@@ -385,8 +408,99 @@ class AppController {
     ref.read(syncEngineProvider).invalidate();
   }
 
+  /// Recover a rolled-back destructive wipe without deleting retained rows or
+  /// revoking the just-issued pairing credential. The caller must retry the
+  /// pending pairing only after this returns true.
+  Future<bool> recoverAfterWipeFailure() async {
+    if (!_wipeCommitFailed) return true;
+    final active = _wipeRecovery;
+    if (active != null) return active;
+    final recovery = _verifyRolledBackDatabase();
+    _wipeRecovery = recovery;
+    try {
+      return await recovery;
+    } finally {
+      if (identical(_wipeRecovery, recovery)) _wipeRecovery = null;
+    }
+  }
+
+  Future<bool> _verifyRolledBackDatabase() async {
+    final pendingWipe = _wipeCommitCompletion;
+    if (pendingWipe != null) await pendingWipe.future;
+    if (!_wipeCommitFailed) return true;
+    try {
+      // Read every retained row before releasing the fail-closed latch. This
+      // proves rollback readability on the current production executor. The
+      // latch remains set until a keep-data sign-out completes successfully.
+      await _db.select(_db.items).get();
+      await _db.select(_db.completions).get();
+      return _wipeCommitFailed;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> claimPairingAfterRecovery() async {
+    final recovered = await recoverAfterWipeFailure();
+    if (!recovered) return false;
+    if (_wipeCommitFailed) {
+      // This is an explicit keep-data recovery transition, serialized with
+      // token/cursor mutations. It does not contact the server or wipe rows.
+      final store = ref.read(storeProvider);
+      final generation = store.authGeneration;
+      final server = store.serverUrl;
+      final token = await store.readTokenForGeneration(generation);
+      if (store.authGeneration != generation || store.serverUrl != server) {
+        return false;
+      }
+      final kept = await store.runIfCredentialCurrentForRecovery(
+        token,
+        generation,
+        server,
+        () async {
+          try {
+            await _db.select(_db.items).get();
+            await _db.select(_db.completions).get();
+            await store.resetSync();
+            return true;
+          } catch (_) {
+            return false;
+          }
+        },
+      );
+      if (!kept) return false;
+      _wipeCommitFailed = false;
+    }
+    if (_wipeCommitFailed) return false;
+    _authGeneration++;
+    _signedOut = true;
+    ref.read(storeProvider).claimPairingOwnership();
+    _pairingPending = true;
+    ref.read(syncEngineProvider).invalidate();
+    return true;
+  }
+
+  Future<void> abandonRecoveredPairing(String expectedToken) async {
+    final store = ref.read(storeProvider);
+    final generation = store.authGeneration;
+    final server = store.serverUrl;
+    await store.clearTokenIfCurrent(
+      expectedToken,
+      generation,
+      expectedServer: server,
+    );
+    if (store.authGeneration == generation && store.serverUrl == server) {
+      _authGeneration++;
+      _signedOut = true;
+      _pairingPending = false;
+      _signOutCleanupPending = false;
+      ref.read(syncEngineProvider).invalidate();
+    }
+  }
+
   void pairingPersisted() {
     _pairingPending = false;
+    _signedOut = false;
     if (!_signedOut) {
       _signOutCleanupPending = false;
       ref.read(syncEngineProvider).revalidate();

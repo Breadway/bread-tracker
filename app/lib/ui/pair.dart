@@ -26,9 +26,78 @@ class _PairScreenState extends ConsumerState<PairScreen> {
   final _code = TextEditingController();
   bool _busy = false;
   String? _error;
+  String? _issuedTokenForRetry;
+  String? _issuedServerForRetry;
+  String? _issuedCodeForRetry;
+  String? _claimedTokenForRetry;
+  int _pairAttemptGeneration = 0;
+  bool _disposed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _server.addListener(_onPairInputChanged);
+    _code.addListener(_onPairInputChanged);
+  }
+
+  void _onPairInputChanged() {
+    if (_issuedTokenForRetry != null || _claimedTokenForRetry != null) {
+      _invalidatePendingPairingResult();
+    } else {
+      _pairAttemptGeneration++;
+    }
+  }
+
+  void _invalidatePendingPairingResult() {
+    _pairAttemptGeneration++;
+    _issuedTokenForRetry = null;
+    _issuedServerForRetry = null;
+    _issuedCodeForRetry = null;
+    _claimedTokenForRetry = null;
+  }
+
+  Future<void> _recoverKeepingData() async {
+    final controller = ref.read(controllerProvider);
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final recovered = await controller.signOut(wipeLocal: false);
+      if (!mounted) return;
+      if (!recovered || controller.isWipeRecoveryPending) {
+        setState(
+          () => _error = 'Local recovery could not be verified. Your data and pairing result remain preserved. Try again.',
+        );
+        return;
+      }
+      if (controller.isWipeRecoveryPending) {
+        setState(
+          () => _error = 'The retained database is readable, but local credential cleanup did not complete. Retry recovery.',
+        );
+        return;
+      }
+      setState(
+        () => _error = 'Retained data is verified and kept. Tap Pair to finish using the already-issued pairing result.',
+      );
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _error =
+              'Local recovery failed. Your data and pairing result remain preserved. Details: $e',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
 
   @override
   void dispose() {
+    _disposed = true;
+    _invalidatePendingPairingResult();
+    _server.removeListener(_onPairInputChanged);
+    _code.removeListener(_onPairInputChanged);
     _server.dispose();
     _code.dispose();
     super.dispose();
@@ -48,28 +117,110 @@ class _PairScreenState extends ConsumerState<PairScreen> {
       _busy = true;
       _error = null;
     });
+    final attemptServer = server;
+    final attemptCode = _code.text.trim();
+    final attemptGeneration = ++_pairAttemptGeneration;
+    bool attemptStillCurrent() =>
+        !_disposed &&
+        mounted &&
+        attemptGeneration == _pairAttemptGeneration &&
+        _server.text.trim().replaceAll(RegExp(r'/+$'), '') == attemptServer &&
+        _code.text.trim() == attemptCode;
+    final controller = ref.read(controllerProvider);
+    final store = ref.read(storeProvider);
+    final retryingIssuedToken =
+        _issuedTokenForRetry != null &&
+        _issuedServerForRetry == attemptServer &&
+        _issuedCodeForRetry == attemptCode;
+    var codeWasRedeemed = false;
+    String? issuedToken;
     try {
-      final token = await Api(server).pair(_code.text.trim(), 'Android');
+      String? token = retryingIssuedToken ? _issuedTokenForRetry : null;
+      if (!retryingIssuedToken) {
+        token ??= await Api(attemptServer).pair(attemptCode, 'Android');
+        codeWasRedeemed = true;
+      }
+      final pairedToken = token!;
+      issuedToken = pairedToken;
+      if (!attemptStillCurrent()) {
+        _invalidatePendingPairingResult();
+        return;
+      }
       // Claim the new auth generation before any credential/cursor write awaits,
       // so a pending sign-out cannot wipe data belonging to this pairing.
-      await ref.read(controllerProvider).pairedAgain();
-      final store = ref.read(storeProvider);
-      await store.setServerUrl(server);
-      await store.saveToken(token);
+      try {
+        if (retryingIssuedToken) {
+          if (!await controller.claimPairingAfterRecovery()) {
+            throw StateError(
+              'Retained data recovery verification did not pass.',
+            );
+          }
+        } else {
+          await controller.pairedAgain();
+        }
+        if (retryingIssuedToken) _claimedTokenForRetry = pairedToken;
+      } on Exception catch (e) {
+        if (!attemptStillCurrent()) {
+          _invalidatePendingPairingResult();
+          return;
+        }
+        _issuedTokenForRetry = pairedToken;
+        _issuedServerForRetry = attemptServer;
+        _issuedCodeForRetry = attemptCode;
+        setState(
+          () => _error =
+              'Local recovery is incomplete. Existing data was preserved. Retry pairing to recover without redeeming the one-time code again. Details: $e',
+        );
+        return;
+      }
+      if (!attemptStillCurrent()) {
+        _invalidatePendingPairingResult();
+        return;
+      }
+      await store.setServerUrl(attemptServer);
+      await store.saveToken(pairedToken);
       await store.resetSync();
-      ref.read(controllerProvider).pairingPersisted();
+      if (!attemptStillCurrent()) {
+        await controller.abandonRecoveredPairing(pairedToken);
+        _invalidatePendingPairingResult();
+        return;
+      }
+      controller.pairingPersisted();
+      _invalidatePendingPairingResult();
       ref.invalidate(pairedProvider);
-      ref.read(controllerProvider).syncNow();
+      controller.syncNow();
       ref.read(pushProvider).register(requestPermission: true);
       if (mounted && Navigator.canPop(context)) Navigator.pop(context);
     } on ApiException catch (e) {
-      setState(
-        () => _error = e.message == 'unauthorized'
-            ? 'That code is wrong or has expired. Make a new one on the server.'
-            : e.message,
-      );
+      if (mounted) {
+        setState(
+          () => _error = e.message == 'unauthorized'
+              ? 'That code is wrong or has expired. Make a new one on the server.'
+              : e.message,
+        );
+      }
     } on AuthLost catch (e) {
-      setState(() => _error = e.toString());
+      if (mounted) setState(() => _error = e.toString());
+    } catch (e) {
+      if (codeWasRedeemed && issuedToken != null && attemptStillCurrent()) {
+        _issuedTokenForRetry = issuedToken;
+        _issuedServerForRetry = attemptServer;
+        _issuedCodeForRetry = attemptCode;
+      }
+      if (_claimedTokenForRetry != null) {
+        try {
+          await controller.abandonRecoveredPairing(_claimedTokenForRetry!);
+          _claimedTokenForRetry = null;
+        } catch (_) {
+          // Keep the retry token scoped to this live screen if rollback cleanup fails.
+        }
+      }
+      if (mounted) {
+        setState(() {
+          _error =
+              'Pairing was issued, but local recovery failed. Existing data was preserved. Retry pairing to finish locally without redeeming the code again. Details: $e';
+        });
+      }
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -119,6 +270,11 @@ class _PairScreenState extends ConsumerState<PairScreen> {
               Padding(
                 padding: const EdgeInsets.only(top: 12),
                 child: Text(_error!, style: TextStyle(color: p.pink)),
+              ),
+            if (_issuedTokenForRetry != null && _error != null)
+              TextButton(
+                onPressed: _busy ? null : _recoverKeepingData,
+                child: const Text('Verify recovery and keep data'),
               ),
             const SizedBox(height: 20),
             FilledButton(

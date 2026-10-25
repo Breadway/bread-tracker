@@ -21,6 +21,7 @@ import 'package:tracker/data/sync.dart';
 import 'package:tracker/fx/sfx.dart';
 import 'package:tracker/push.dart';
 import 'package:tracker/ui/settings.dart';
+import 'package:tracker/ui/pair.dart';
 import 'package:tracker/ui/server_settings.dart';
 
 import 'signout_test.dart' as fixture;
@@ -102,10 +103,13 @@ void main() {
     await entered.future.timeout(const Duration(seconds: 3));
     await ctl.pairedAgain();
     final write = store.saveToken('replacement');
-    await store.setServerUrl('https://replacement.example.invalid');
+    final serverWrite = store.setServerUrl(
+      'https://replacement.example.invalid',
+    );
     release.complete();
     await pending.timeout(const Duration(seconds: 3));
     await write;
+    await serverWrite;
     expect(await store.token, 'replacement');
     expect(await db.select(db.items).get(), hasLength(1));
     expect(await db.select(db.completions).get(), hasLength(1));
@@ -232,14 +236,210 @@ void main() {
     gate.release.complete();
     await expectLater(signout, throwsA(isA<StateError>()));
     expect(await store.token, isNull);
+    final controller = c.read(controllerProvider);
+    expect(await controller.recoverAfterWipeFailure(), isTrue);
+    final keepDataRecovery = controller.signOut(wipeLocal: false);
+    expect(await keepDataRecovery, isTrue);
+    expect(await store.token, isNull);
     await db.close();
-    final reopened = AppDb(NativeDatabase(File(path)));
+    final recovered = AppDb(NativeDatabase(File(path)));
     expect(
-      (await reopened.select(reopened.items).get()).single.name,
+      (await recovered.select(recovered.items).get()).single.name,
       'preserve on rollback',
     );
-    await reopened.close();
+    await recovered.close();
   });
+
+  testWidgets(
+    'PairScreen retries local recovery without redeeming one-time code again',
+    (tester) async {
+      final setup = await tester.runAsync(() async {
+        final dir = await Directory.systemTemp.createTemp(
+          'track71-pair-recovery-',
+        );
+        SharedPreferences.setMockInitialValues({});
+        final prefs = await SharedPreferences.getInstance();
+        FlutterSecureStoragePlatform.instance =
+            TestFlutterSecureStoragePlatform({'token': 'tok'});
+        final store = Store(prefs);
+        final gate = _CommitGate();
+        final db = AppDb(
+          NativeDatabase(File('${dir.path}/tracker.sqlite'))
+              .interceptWith(gate),
+        );
+        await db.upsertItem(
+          ItemsCompanion.insert(
+            id: fixture.id1,
+            kind: 'chore',
+            name: 'keep through recovery',
+            points: 10,
+            updatedAt: 1,
+          ),
+        );
+        await db.setCompletion(fixture.id1, '2026-10-19', true, 2);
+        return (dir, prefs, store, gate, db);
+      });
+      final (dir, prefs, store, gate, db) = setup!;
+      addTearDown(() => dir.delete(recursive: true));
+      final pairEntered = Completer<void>();
+      var pairCalls = 0;
+      final client = MockClient((request) async {
+        if (request.url.path == '/pair') {
+          pairCalls++;
+          pairEntered.complete();
+          return http.Response('{"token":"issued-once"}', 200);
+        }
+        if (request.method == 'DELETE') return http.Response('{}', 200);
+        return http.Response('{}', 200);
+      });
+      final previousClient = Api.sharedClient;
+      Api.sharedClient = client;
+      addTearDown(() => Api.sharedClient = previousClient);
+      final push = _ReadyPush();
+      final c = ProviderContainer(
+        overrides: [
+          prefsProvider.overrideWithValue(prefs),
+          storeProvider.overrideWithValue(store),
+          dbProvider.overrideWithValue(db),
+          apiFactoryProvider.overrideWithValue(
+            (base, token) => Api(base, token: token, client: client),
+          ),
+          pushProvider.overrideWithValue(push),
+        ],
+      );
+      addTearDown(c.dispose);
+      addTearDown(db.close);
+      await tester.runAsync(() async {
+        final controller = c.read(controllerProvider);
+        final failedWipe = controller.signOut(wipeLocal: true);
+        gate
+          ..armed = true
+          ..fail = true;
+        await gate.entered.future.timeout(const Duration(seconds: 3));
+        gate.release.complete();
+        await expectLater(failedWipe, throwsA(isA<StateError>()));
+      });
+      final widget = UncontrolledProviderScope(
+        container: c,
+        child: const MaterialApp(home: PairScreen()),
+      );
+      await tester.pumpWidget(widget);
+      await tester.pumpAndSettle();
+      await tester.enterText(
+        find.byType(TextField).at(0),
+        'https://tracker.breadway.dev',
+      );
+      await tester.enterText(find.byType(TextField).at(1), 'ABCD-1234');
+      await tester.tap(find.text('Pair'));
+      await tester.pump();
+      for (var i = 0; i < 40 && !gate.entered.isCompleted; i++) {
+        await tester.pump(const Duration(milliseconds: 25));
+      }
+      expect(
+        pairEntered.isCompleted,
+        isTrue,
+        reason:
+            'the PairScreen exchanged the one-time code and cached its token',
+      );
+      await tester.pumpAndSettle();
+      expect(
+        find.textContaining('Local recovery is incomplete'),
+        findsOneWidget,
+      );
+      expect(pairCalls, 1);
+      await tester.runAsync(() async {
+        expect(await store.token, isNull);
+      });
+      expect(
+        await tester.runAsync(() async => db.select(db.items).get()),
+        hasLength(1),
+      );
+      gate.fail = false;
+      await tester.tap(find.text('Verify recovery and keep data'));
+      await tester.pump();
+      for (
+        var i = 0;
+        i < 40 &&
+            find
+                .textContaining('Retained data is verified and kept')
+                .evaluate()
+                .isEmpty;
+        i++
+      ) {
+        await tester.pump(const Duration(milliseconds: 25));
+        await tester.runAsync(() async {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        });
+      }
+      await tester.pumpAndSettle();
+      if (find
+          .textContaining('Retained data is verified and kept')
+          .evaluate()
+          .isEmpty) {
+        fail(
+          'Keep-data recovery did not finish within the bounded UI pump: ${tester.widgetList<Text>(find.byType(Text)).map((t) => t.data).whereType<String>().toList()}',
+        );
+      }
+      expect(
+        find.textContaining('Retained data is verified and kept'),
+        findsOneWidget,
+      );
+      await tester.runAsync(() async {
+        expect(
+          await store.token,
+          isNull,
+          reason: 'recovery does not claim paired state until the cached token is persisted',
+        );
+        expect(
+          (await db.select(db.items).get()).single.name,
+          'keep through recovery',
+        );
+        expect(await db.select(db.completions).get(), hasLength(1));
+      });
+      await tester.tap(find.text('Pair'));
+      await tester.pump();
+      for (
+        var i = 0;
+        i < 40 &&
+            ((await tester.runAsync(() async => store.token)) !=
+                    'issued-once' ||
+                find
+                    .textContaining('Local recovery is incomplete')
+                    .evaluate()
+                    .isNotEmpty);
+        i++
+      ) {
+        await tester.pump(const Duration(milliseconds: 25));
+      }
+      await tester.pumpAndSettle();
+      expect(
+        find.textContaining('Local recovery is incomplete'),
+        findsNothing,
+        reason: 'the local recovery retry should complete, not remain blocked',
+      );
+      expect(
+        pairCalls,
+        1,
+        reason: 'the same live screen reused its cached successful exchange',
+      );
+      await tester.runAsync(() async {
+        expect(await store.token, 'issued-once');
+        await db.close();
+        final finalReopen = AppDb(
+          NativeDatabase(File('${dir.path}/tracker.sqlite')),
+        );
+        expect(
+          (await finalReopen.select(finalReopen.items).get()).single.name,
+          'keep through recovery',
+        );
+        expect(
+          await finalReopen.select(finalReopen.completions).get(),
+          hasLength(1),
+        );
+        await finalReopen.close();
+      });
+    },
+  );
 
   test('pairing during DELETE cannot wipe replacement data', () async {
     final enteredDelete = Completer<void>();
@@ -260,9 +460,6 @@ void main() {
       }),
     );
     addTearDown(db.close);
-    addTearDown(() {
-      if (!releaseDelete.isCompleted) releaseDelete.complete();
-    });
     addTearDown(() {
       if (!releaseDelete.isCompleted) releaseDelete.complete();
     });
@@ -462,6 +659,9 @@ void main() {
         }),
       );
       addTearDown(db.close);
+      addTearDown(() {
+        if (!release.isCompleted) release.complete();
+      });
       final ctl = c.read(controllerProvider);
       final pending = ctl.signOut(wipeLocal: true);
       await entered.future;
@@ -493,6 +693,9 @@ void main() {
       }),
     );
     addTearDown(db.close);
+    addTearDown(() {
+      if (!release.isCompleted) release.complete();
+    });
     final ctl = c.read(controllerProvider);
     final pending = ctl.signOut(wipeLocal: true);
     await entered.future;

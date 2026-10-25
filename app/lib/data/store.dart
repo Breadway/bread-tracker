@@ -160,6 +160,30 @@ class Store {
     return ran;
   }
 
+  Future<bool> runIfCredentialCurrentForRecovery(
+    String? expectedToken,
+    int expectedGeneration,
+    String expectedServer,
+    Future<bool> Function() verifyAndRecover,
+  ) async {
+    var recovered = false;
+    await _serializeCredentialMutation(() async {
+      if (_authGeneration != expectedGeneration ||
+          serverUrl != expectedServer ||
+          await _secure.read(key: 'token') != expectedToken ||
+          _authGeneration != expectedGeneration ||
+          serverUrl != expectedServer) {
+        return;
+      }
+      recovered = await verifyAndRecover();
+      if (_authGeneration != expectedGeneration ||
+          serverUrl != expectedServer) {
+        recovered = false;
+      }
+    });
+    return recovered;
+  }
+
   Future<String?> readTokenForGeneration(int expectedGeneration) async {
     final value = await token;
     if (_authGeneration != expectedGeneration) return null;

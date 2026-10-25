@@ -20,6 +20,7 @@ class SyncEngine {
   int _generation = 0;
   bool _invalidated = false;
   String? _token;
+  String? _server;
 
   void invalidate() {
     _generation++;
@@ -32,12 +33,15 @@ class SyncEngine {
     _invalidated = false;
   }
 
+  /// Close new sync admission while sign-out owns local cleanup.
+  void beginSignOut() => invalidate();
+
   /// Push dirty rows, pull everything newer than the cursor. Safe to call often;
   /// overlapping calls collapse into one follow-up pass.
   Future<SyncStatus> sync() async {
     if (_invalidated) return SyncStatus.unpaired;
     if (_running) {
-      _again = true;
+      if (!_invalidated) _again = true;
       return SyncStatus.syncing;
     }
     _running = true;
@@ -62,10 +66,13 @@ class SyncEngine {
       return SyncStatus.unpaired;
     }
     if (token == null) return SyncStatus.unpaired;
-    if (_token != null && _token != token) _generation++;
+    if (_token != null && (_token != token || _server != store.serverUrl)) {
+      _generation++;
+    }
     _token = token;
     final generation = _generation;
     final server = store.serverUrl;
+    _server = server;
     final api = _apiFactory(server, token);
 
     final dirtyItems = await (db.select(

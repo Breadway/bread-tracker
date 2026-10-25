@@ -208,8 +208,12 @@ class SettingsScreen extends ConsumerWidget {
               } on ApiException catch (e) {
                 toast(e.message);
               } on AuthLost catch (e) {
-                if (await store.token == token) {
-                  await store.clearToken();
+                final generation = store.authGeneration;
+                if (await store.clearTokenIfCurrentForGeneration(
+                  token,
+                  generation,
+                  expectedServer: store.serverUrl,
+                )) {
                   ref.invalidate(pairedProvider);
                   await ref.read(pushProvider).register();
                 }

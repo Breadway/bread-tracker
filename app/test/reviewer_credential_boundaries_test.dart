@@ -82,23 +82,32 @@ void main() {
           await entered.future;
           if (sameToken) {
             // Same token can belong to another server or a newly claimed pairing.
+            final serverChange = kind == 'push';
             store.claimCredentialOwnership();
             engine.revalidate();
-            await store.setServerUrl('https://new.example.invalid');
+            if (serverChange) {
+              await store.setServerUrl('https://new.example.invalid');
+            }
             await store.saveToken('old');
             release.complete();
             await request;
             expect(await store.token, 'old');
           } else {
+            final generation = store.authGeneration;
             secure.armed = true;
+            final ownershipClaimed = Completer<void>();
             release.complete();
             await secure.readEntered.future.timeout(const Duration(seconds: 3));
-            store.claimCredentialOwnership();
+            store.claimPairingOwnership();
+            expect(generation + 1, store.authGeneration);
             engine.revalidate();
-            await store.saveToken('replacement');
+            ownershipClaimed.complete();
+            final replacementWrite = store.saveToken('replacement');
             secure.releaseRead.complete();
             await request;
+            await replacementWrite;
             expect(await store.token, 'replacement');
+            expect(ownershipClaimed.isCompleted, isTrue);
           }
         },
       );

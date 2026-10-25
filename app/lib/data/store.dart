@@ -30,29 +30,29 @@ class Store {
     _credentialEpoch++;
   }
 
+  void claimPairingOwnership() => claimAuthGeneration();
+
   Future<bool> clearTokenIfCurrent(
     String expected,
     int expectedGeneration, {
     String? expectedServer,
   }) async {
-    if (_authGeneration != expectedGeneration ||
-        (expectedServer != null && serverUrl != expectedServer)) {
-      return false;
-    }
-    final current = await _secure.read(key: 'token');
-    if (_authGeneration != expectedGeneration ||
-        current != expected ||
-        (expectedServer != null && serverUrl != expectedServer)) {
-      return false;
-    }
     var cleared = false;
     await _serializeCredentialMutation(() async {
-      if (_authGeneration != expectedGeneration) return;
-      await _secure.delete(key: 'token');
-      if (_authGeneration == expectedGeneration &&
-          (expectedServer == null || serverUrl == expectedServer)) {
-        cleared = true;
+      if (_authGeneration != expectedGeneration ||
+          (expectedServer != null && serverUrl != expectedServer)) {
+        return;
       }
+      final server = serverUrl;
+      final observed = await _secure.read(key: 'token');
+      if (_authGeneration != expectedGeneration ||
+          observed != expected ||
+          serverUrl != server ||
+          (expectedServer != null && server != expectedServer)) {
+        return;
+      }
+      await _secure.delete(key: 'token');
+      cleared = true;
     });
     return cleared;
   }
@@ -60,17 +60,39 @@ class Store {
   Future<bool> clearTokenAndRunIfCurrent(
     String expected,
     int expectedEpoch,
-    Future<void> Function() action,
-  ) async {
+    Future<void> Function() action, {
+    int? expectedGeneration,
+    String? expectedServer,
+  }) async {
+    final requestGeneration = expectedGeneration ?? _authGeneration;
+    final requestServer = expectedServer ?? serverUrl;
     var ran = false;
     await _serializeCredentialMutation(() async {
+      final generation = requestGeneration;
+      final server = requestServer;
       if (_credentialEpoch != expectedEpoch ||
-          await _secure.read(key: 'token') != expected) {
+          _authGeneration != generation ||
+          serverUrl != server) {
+        return;
+      }
+      final current = await _secure.read(key: 'token');
+      if (current != expected ||
+          _credentialEpoch != expectedEpoch ||
+          _authGeneration != generation ||
+          serverUrl != server) {
         return;
       }
       await _secure.delete(key: 'token');
+      if (_credentialEpoch != expectedEpoch ||
+          _authGeneration != generation ||
+          serverUrl != server) {
+        return;
+      }
       await action();
-      if (_credentialEpoch == expectedEpoch) ran = true;
+      ran =
+          _credentialEpoch == expectedEpoch &&
+          _authGeneration == generation &&
+          serverUrl == server;
     });
     return ran;
   }
@@ -80,10 +102,19 @@ class Store {
     int expectedGeneration,
     Future<void> Function() action,
   ) async {
-    final current = await readTokenForGeneration(expectedGeneration);
-    if (current != expected) return false;
-    await action();
-    return _authGeneration == expectedGeneration;
+    var ran = false;
+    await _serializeCredentialMutation(() async {
+      final server = serverUrl;
+      final current = await _secure.read(key: 'token');
+      if (_authGeneration != expectedGeneration ||
+          current != expected ||
+          serverUrl != server) {
+        return;
+      }
+      await action();
+      ran = _authGeneration == expectedGeneration && serverUrl == server;
+    });
+    return ran;
   }
 
   Future<bool> runIfTokenless(Future<void> Function() action) async {
@@ -98,17 +129,33 @@ class Store {
 
   Future<bool> runIfTokenlessAndEpochCurrent(
     int expectedEpoch,
-    Future<void> Function() action,
-  ) async {
+    Future<void> Function() action, {
+    int? expectedGeneration,
+    String? expectedServer,
+  }) async {
+    final requestGeneration = expectedGeneration ?? _authGeneration;
+    final requestServer = expectedServer ?? serverUrl;
     var ran = false;
     await _serializeCredentialMutation(() async {
+      final generation = requestGeneration;
+      final server = requestServer;
       if (_credentialEpoch != expectedEpoch ||
-          await _secure.read(key: 'token') != null) {
+          _authGeneration != generation ||
+          serverUrl != server) {
+        return;
+      }
+      final current = await _secure.read(key: 'token');
+      if (current != null ||
+          _credentialEpoch != expectedEpoch ||
+          _authGeneration != generation ||
+          serverUrl != server) {
         return;
       }
       await action();
-      if (_credentialEpoch != expectedEpoch) return;
-      ran = true;
+      ran =
+          _credentialEpoch == expectedEpoch &&
+          _authGeneration == generation &&
+          serverUrl == server;
     });
     return ran;
   }

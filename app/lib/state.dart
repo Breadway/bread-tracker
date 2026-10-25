@@ -210,19 +210,22 @@ class AppController {
   /// Returns false when the server could not be told, so the caller can say the token may
   /// still be valid until revoked from the server.
   Future<bool> signOut({bool wipeLocal = false}) async {
-    final generation = ++_authGeneration;
     final store = ref.read(storeProvider);
+    store.claimAuthGeneration();
+    final storeGeneration = store.authGeneration;
+    final generation = ++_authGeneration;
     _signedOut = true;
     _signOutCleanupPending = true;
+    _pairingPending = false;
     _syncTimer?.cancel();
-    ref.read(syncEngineProvider).invalidate();
+    ref.read(syncEngineProvider).beginSignOut();
     final epoch = store.credentialEpoch;
     final cursorBeforeCleanup = store.cursor;
-    final token = await store.readTokenForGeneration(store.authGeneration);
+    final token = await store.readTokenForGeneration(storeGeneration);
     if (generation != _authGeneration ||
         !_signedOut ||
-        store.credentialEpoch != epoch) {
-      _signOutCleanupPending = false;
+        store.credentialEpoch != epoch ||
+        store.authGeneration != storeGeneration) {
       return false;
     }
     final server = store.serverUrl;
@@ -239,34 +242,46 @@ class AppController {
     // DELETE can be slow. Pairing a replacement credential while it is in-flight
     // transfers ownership to the new generation, so the old sign-out must not
     // clear that credential, cursor, or the replacement device's local data.
-    if (generation != _authGeneration || !_signedOut) {
-      if (generation == _authGeneration) _signOutCleanupPending = false;
+    if (generation != _authGeneration ||
+        !_signedOut ||
+        store.authGeneration != storeGeneration) {
       return revoked;
     }
     final cleanup = token == null
-        ? await store.runIfTokenlessAndEpochCurrent(epoch, () async {
-            if (generation != _authGeneration || !_signedOut) return;
-            await _finishSignoutCleanup(
-              generation,
-              epoch,
-              cursorBeforeCleanup,
-              wipeLocal,
-            );
-          })
-        : await store.clearTokenAndRunIfCurrent(token, epoch, () async {
-            if (generation != _authGeneration || !_signedOut) return;
-            await _finishSignoutCleanup(
-              generation,
-              epoch,
-              cursorBeforeCleanup,
-              wipeLocal,
-            );
-          });
+        ? await store.runIfTokenlessAndEpochCurrent(
+            epoch,
+            () async {
+              if (generation != _authGeneration || !_signedOut) return;
+              await _finishSignoutCleanup(
+                generation,
+                epoch,
+                cursorBeforeCleanup,
+                wipeLocal,
+              );
+            },
+            expectedGeneration: storeGeneration,
+            expectedServer: server,
+          )
+        : await store.clearTokenAndRunIfCurrent(
+            token,
+            epoch,
+            () async {
+              if (generation != _authGeneration || !_signedOut) return;
+              await _finishSignoutCleanup(
+                generation,
+                epoch,
+                cursorBeforeCleanup,
+                wipeLocal,
+              );
+            },
+            expectedGeneration: storeGeneration,
+            expectedServer: server,
+          );
     if (!cleanup ||
         generation != _authGeneration ||
         !_signedOut ||
-        store.credentialEpoch != epoch) {
-      if (generation == _authGeneration) _signOutCleanupPending = false;
+        store.credentialEpoch != epoch ||
+        store.authGeneration != storeGeneration) {
       return revoked;
     }
     _signOutCleanupPending = false;
@@ -286,24 +301,30 @@ class AppController {
     int cursorBeforeCleanup,
     bool wipeLocal,
   ) async {
+    final store = ref.read(storeProvider);
     if (generation != _authGeneration ||
         !_signedOut ||
-        ref.read(storeProvider).credentialEpoch != epoch) {
+        store.credentialEpoch != epoch) {
       return;
     }
     try {
-      await ref.read(storeProvider).resetSync();
+      await store.resetSync();
     } catch (_) {
-      await ref.read(storeProvider).setCursor(cursorBeforeCleanup);
+      await store.setCursor(cursorBeforeCleanup);
       rethrow;
     }
     if (generation != _authGeneration ||
         !_signedOut ||
-        ref.read(storeProvider).credentialEpoch != epoch) {
+        store.credentialEpoch != epoch) {
       return;
     }
     if (wipeLocal && !await _wipeLocalIfCurrent(generation)) {
-      await ref.read(storeProvider).setCursor(cursorBeforeCleanup);
+      await store.setCursor(cursorBeforeCleanup);
+    }
+    if (generation != _authGeneration ||
+        !_signedOut ||
+        store.credentialEpoch != epoch) {
+      return;
     }
   }
 
@@ -328,14 +349,18 @@ class AppController {
   void pairedAgain() {
     _authGeneration++;
     _signedOut = false;
-    _signOutCleanupPending = false;
+    ref.read(storeProvider).claimPairingOwnership();
     _pairingPending = true;
-    ref.read(storeProvider).claimAuthGeneration();
-    ref.read(syncEngineProvider).revalidate();
+    // Keep sync admission closed until the old sign-out's local cleanup finishes.
+    ref.read(syncEngineProvider).invalidate();
   }
 
   void pairingPersisted() {
     _pairingPending = false;
+    if (!_signedOut) {
+      _signOutCleanupPending = false;
+      ref.read(syncEngineProvider).revalidate();
+    }
   }
 
   Future<void> toggle(ItemRow item, DateTime date, {Offset? at}) async {

@@ -178,6 +178,8 @@ class AppController {
   bool _pairingPending = false;
   bool _pairedCredentialAccepted = false;
   bool get pairedCredentialAccepted => _pairedCredentialAccepted;
+  bool _hasEstablishedPairing = false;
+  bool get isSignedOutForPairing => _signedOut || _pairingPending;
   Completer<void>? _wipeCommitCompletion;
   bool _wipeCommitFailed = false;
   bool get isWipeRecoveryPending => _wipeCommitFailed;
@@ -190,6 +192,7 @@ class AppController {
   int get acceptedPairingGeneration => _pairedGeneration;
   int? get acceptedStoreGeneration => _pairedStoreGeneration;
   String? get acceptedPairingServer => _pairedServer;
+  bool get hasEstablishedPairing => _hasEstablishedPairing;
 
   static int nowMs() => DateTime.now().millisecondsSinceEpoch;
 
@@ -537,6 +540,7 @@ class AppController {
     _pairedGeneration = _authGeneration;
     _pairedStoreGeneration = ref.read(storeProvider).authGeneration;
     _pairedServer = ref.read(storeProvider).serverUrl;
+    _hasEstablishedPairing = true;
     if (!_signedOut) {
       _signOutCleanupPending = false;
       ref.read(syncEngineProvider).revalidate();

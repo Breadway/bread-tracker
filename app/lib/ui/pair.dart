@@ -13,14 +13,22 @@ final pairedProvider = FutureProvider<bool>((ref) async {
   final store = ref.watch(storeProvider);
   final generation = store.authGeneration;
   final appGeneration = controller.currentAuthGeneration;
+  final acceptedPairing = controller.hasEstablishedPairing
+      ? controller.pairedCredentialAccepted &&
+            controller.acceptedPairingGeneration == appGeneration &&
+            controller.acceptedStoreGeneration == generation &&
+            controller.acceptedPairingServer == store.serverUrl
+      : controller.pairedCredentialAccepted &&
+            !controller.isSignedOutForPairing;
   final token = await store.readTokenForGeneration(generation);
   return token != null &&
-      controller.pairedCredentialAccepted &&
+      acceptedPairing &&
       store.authGeneration == generation &&
       controller.currentAuthGeneration == appGeneration &&
-      controller.acceptedPairingGeneration == appGeneration &&
-      controller.acceptedStoreGeneration == generation &&
-      controller.acceptedPairingServer == store.serverUrl;
+      (!controller.hasEstablishedPairing ||
+          (controller.acceptedPairingGeneration == appGeneration &&
+              controller.acceptedStoreGeneration == generation &&
+              controller.acceptedPairingServer == store.serverUrl));
 });
 
 class PairScreen extends ConsumerStatefulWidget {

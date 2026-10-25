@@ -151,6 +151,10 @@ class _AuthTransitionSuperseded implements Exception {
   const _AuthTransitionSuperseded();
 }
 
+class _LocalWipeFailed implements Exception {
+  const _LocalWipeFailed();
+}
+
 const starterChores = [
   StarterChore('Take out the bins', 1, '18:00'),
   StarterChore('Water the plants', 4, '17:00'),
@@ -169,6 +173,8 @@ class AppController {
   bool _signedOut = false;
   bool _signOutCleanupPending = false;
   bool _pairingPending = false;
+  Completer<void>? _wipeCommitCompletion;
+  bool _wipeCommitFailed = false;
   int _combo = 0;
   DateTime _lastTick = DateTime.fromMillisecondsSinceEpoch(0);
 
@@ -210,6 +216,8 @@ class AppController {
   /// Returns false when the server could not be told, so the caller can say the token may
   /// still be valid until revoked from the server.
   Future<bool> signOut({bool wipeLocal = false}) async {
+    final pendingWipe = _wipeCommitCompletion;
+    if (pendingWipe != null) await pendingWipe.future;
     final store = ref.read(storeProvider);
     store.claimAuthGeneration();
     final storeGeneration = store.authGeneration;
@@ -318,8 +326,16 @@ class AppController {
         store.credentialEpoch != epoch) {
       return;
     }
-    if (wipeLocal && !await _wipeLocalIfCurrent(generation)) {
-      await store.setCursor(cursorBeforeCleanup);
+    if (wipeLocal) {
+      try {
+        if (!await _wipeLocalIfCurrent(generation)) {
+          if (_wipeCommitFailed) throw const _LocalWipeFailed();
+          await store.setCursor(cursorBeforeCleanup);
+        }
+      } catch (_) {
+        await store.setCursor(cursorBeforeCleanup);
+        rethrow;
+      }
     }
     if (generation != _authGeneration ||
         !_signedOut ||
@@ -329,6 +345,8 @@ class AppController {
   }
 
   Future<bool> _wipeLocalIfCurrent(int generation) async {
+    final completion = Completer<void>();
+    _wipeCommitCompletion = completion;
     try {
       await _db.transaction(() async {
         if (generation != _authGeneration || !_signedOut) {
@@ -340,13 +358,25 @@ class AppController {
           throw const _AuthTransitionSuperseded();
         }
       });
+      _wipeCommitFailed = false;
       return generation == _authGeneration && _signedOut;
     } on _AuthTransitionSuperseded {
       return false;
+    } catch (_) {
+      _wipeCommitFailed = true;
+      rethrow;
+    } finally {
+      if (identical(_wipeCommitCompletion, completion)) {
+        _wipeCommitCompletion = null;
+      }
+      if (!completion.isCompleted) completion.complete();
     }
   }
 
-  void pairedAgain() {
+  Future<void> pairedAgain() async {
+    final pendingWipe = _wipeCommitCompletion;
+    if (pendingWipe != null) await pendingWipe.future;
+    if (_wipeCommitFailed) throw const _LocalWipeFailed();
     _authGeneration++;
     _signedOut = false;
     ref.read(storeProvider).claimPairingOwnership();

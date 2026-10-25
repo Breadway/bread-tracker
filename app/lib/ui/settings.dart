@@ -192,8 +192,14 @@ class SettingsScreen extends ConsumerWidget {
             title: 'Send a test notification',
             subtitle: 'Checks that the server can reach this phone',
             onTap: () async {
-              final token = await store.token;
-              if (token == null) return toast('Pair with the server first.');
+              final generation = store.authGeneration;
+              final server = store.serverUrl;
+              final token = await store.readTokenForGeneration(generation);
+              if (token == null ||
+                  store.authGeneration != generation ||
+                  store.serverUrl != server) {
+                return toast('Pair with the server first.');
+              }
               try {
                 final push = ref.read(pushProvider);
                 await push.register(requestPermission: true);
@@ -201,18 +207,15 @@ class SettingsScreen extends ConsumerWidget {
                   toast('Enable notifications and register this phone first.');
                   return;
                 }
-                await ref
-                    .read(apiFactoryProvider)(store.serverUrl, token)
-                    .pushTest();
+                await ref.read(apiFactoryProvider)(server, token).pushTest();
                 toast('Sent. It should arrive in a moment.');
               } on ApiException catch (e) {
                 toast(e.message);
               } on AuthLost catch (e) {
-                final generation = store.authGeneration;
                 if (await store.clearTokenIfCurrentForGeneration(
                   token,
                   generation,
-                  expectedServer: store.serverUrl,
+                  expectedServer: server,
                 )) {
                   ref.invalidate(pairedProvider);
                   await ref.read(pushProvider).register();

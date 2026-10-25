@@ -324,7 +324,7 @@ void main() {
       final ctl = container.read(controllerProvider);
       await ctl.signOut();
       await store.saveToken('new-token');
-      ctl.pairedAgain();
+      await ctl.pairedAgain();
       release.complete();
       expect(await syncing, SyncStatus.unpaired);
       expect(await store.token, 'new-token');
@@ -351,7 +351,7 @@ void main() {
           .signOut(wipeLocal: true);
       await enteredDelete.future;
 
-      container.read(controllerProvider).pairedAgain();
+      await container.read(controllerProvider).pairedAgain();
       final replacementWrite = store.saveToken('replacement');
       await replacementWrite;
       await db.upsertItem(
@@ -450,7 +450,7 @@ void main() {
         .read(controllerProvider)
         .signOut(wipeLocal: true);
     await enteredReset.future.timeout(const Duration(seconds: 3));
-    container.read(controllerProvider).pairedAgain();
+    await container.read(controllerProvider).pairedAgain();
     var tokenWriteFinished = false;
     final replacementWrite = store.saveToken('replacement').then((_) {
       tokenWriteFinished = true;

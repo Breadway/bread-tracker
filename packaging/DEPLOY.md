@@ -64,14 +64,17 @@ released. See "Users and migrations" in DESIGN.md.
   whatever they synced since. Phones keep their own data, but rows that already synced are not
   sent again, so do not roll back after live use unless you accept that loss; fix forward
   instead. Old-client reconciliation after a restore has not been tested.
-* The Litestream replica is a second copy, not the recovery point, and its counts alone do not
-  show that it is current. Only the frozen copy from step 2 is authoritative.
+* The Litestream replica is a second copy, not the recovery point, and it is only trusted after
+  a mandatory gate (step 3) shows it holds exactly the same data as the frozen copy. Its file
+  names and modification times prove nothing about what is inside, so the gate compares the
+  data itself. Only the frozen copy from step 2 is authoritative.
 
 Everything below uses only what this repository ships: the pinned Litestream image (it has
-`sh`, `cp`, `tar`) and `python3` on the host with its standard `sqlite3` module (the server image
-has no SQLite command line). Run it as the ordinary deploy user, from the checkout, with the
+`sh`, `cp`, `tar`) and `python3` on the host with its standard `sqlite3` module, driven by
+`scripts/db-evidence.py` (read-only, standard library only; the server image has no SQLite
+command line). Run it as the ordinary deploy user, from the checkout, with the
 default compose project name. Plan a short maintenance window: the app is unavailable between
-step 2 and step 5 and phones retry on their own.
+step 2 and step 4 and phones retry on their own.
 
 1. **Record what is running.** Pin the current image under a name that building cannot
    overwrite (`up --build` replaces `bread-tracker:local`), and find the data volume:
@@ -83,51 +86,58 @@ step 2 and step 5 and phones retry on their own.
    echo "data volume: $VOL"                                               # must not be empty
    ```
 
-2. **Freeze writers and take the recovery copy.** Stop the server and Litestream first; a
-   copy of a live database file is not a backup. The directory name is unique, so an earlier
-   attempt can never be mistaken for this one:
+2. **Freeze writers and take the recovery copy.** Stop the server first, give Litestream a
+   moment to ship the last changes, then stop it too; a copy of a live database file is not a
+   backup. The sleep is only a courtesy to the replica: step 3 is what proves it. The directory
+   name is unique, so an earlier attempt can never be mistaken for this one:
 
    ```sh
    COPY=$HOME/bread-tracker-pre-multiuser-$(date +%Y%m%d-%H%M%S)
    mkdir "$COPY"
-   docker compose -f packaging/compose.yaml --project-directory . stop bread-tracker litestream
+   docker compose -f packaging/compose.yaml --project-directory . stop bread-tracker
+   sleep 10
+   docker compose -f packaging/compose.yaml --project-directory . stop litestream
    docker run --rm -v "$VOL":/data:ro -v "$COPY":/out \
      --entrypoint sh litestream/litestream:0.3.13 -c 'cp -a /data/. /out/'
    ls -l "$COPY"
    ```
 
-   Do not start the containers again until step 5. Verify the copy itself, and note the
-   counts and the last sequence number:
+   Do not start the containers again until step 4. Verify the copy itself. It must open,
+   pass `integrity_check` and `foreign_key_check`, and record only migrations this release
+   supports (`1`, `2`, `3`, `5`, `6`):
 
    ```sh
-   python3 - "$COPY/bread-tracker.db" <<'PY'
-   import sqlite3, sys
-   c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
-   print("integrity", c.execute("pragma integrity_check").fetchone()[0])
-   print("foreign keys", c.execute("pragma foreign_key_check").fetchall())
-   for t in ("items", "completions", "devices", "reminders_sent", "pairing_codes"):
-       print(t, c.execute(f"select count(*) from {t}").fetchone()[0])
-   print("meta.seq", c.execute("select val from meta where key = 'seq'").fetchone()[0])
-   print("migrations", [r[0] for r in c.execute("select version from _sqlx_migrations order by version")])
-   PY
+   python3 scripts/db-evidence.py check "$COPY/bread-tracker.db" --ledger-subset 1,2,3,5,6
    ```
 
-   `integrity` must be `ok` and `foreign keys` empty. Opening a copy that has a `-wal` file
-   next to it is read-only here, so the copy is not modified.
+   It prints the evidence (row counts, `meta.seq`, migration versions, a digest of every row)
+   and ends with `CHECK PASSED`. Anything else, including a recorded migration this release
+   does not ship such as `0004`, is a stop: leave the copy as it is, go to "If the gate or
+   the upgrade fails" below, and do not deploy.
 
-3. **(Optional) Check the replica against the frozen copy.** The replica is current only if it
-   restores to the same `meta.seq` and counts as the frozen copy:
+3. **Mandatory backup gate: the Litestream replica must restore and match the frozen copy.**
+   The original requirement for this upgrade is a Litestream-checked backup before deploying.
+   Restore the replica into a scratch file and compare it with the frozen copy:
 
    ```sh
+   BACKUP_DIR=$(realpath "${BREADTRACKER_BACKUP_DIR:-./backups}")
    WORK=$(mktemp -d)
-   docker run --rm -v /var/backups/bread-tracker:/b:ro -v "$WORK":/o litestream/litestream:0.3.13 \
-     restore -o /o/replica.db file:///b/litestream    # your BREADTRACKER_BACKUP_DIR
+   if docker run --rm --user "$(id -u):$(id -g)" -v "$BACKUP_DIR":/b:ro -v "$WORK":/o \
+        litestream/litestream:0.3.13 restore -o /o/replica.db file:///b/litestream \
+      && python3 scripts/db-evidence.py compare "$COPY/bread-tracker.db" "$WORK/replica.db"
+   then echo "BACKUP GATE PASSED"; else echo "BACKUP GATE FAILED: do not deploy"; fi
    ```
 
-   then run the same Python block on `$WORK/replica.db` and compare it with step 2.
+   Proceed to step 4 only if this prints `BACKUP GATE PASSED`. The gate fails closed: a
+   missing or empty replica directory, a restore error, an unreadable or empty restored file,
+   a failed integrity or foreign key check, a different migration ledger, and any difference
+   in `meta.seq`, row counts or row contents (a stale replica) all stop it. Nothing about file
+   times is used. If it fails, do not deploy and do not delete or edit `$COPY`: it stays the
+   authoritative recovery point while you repair replication (see below).
 
-4. **Name the first user and deploy.** Set `BREADTRACKER_ADMIN_NAME` in `.env` (for example
-   `Riley`), then build and start the new release:
+4. **Name the first user and deploy.** Only after `BACKUP GATE PASSED`. Set
+   `BREADTRACKER_ADMIN_NAME` in `.env` (for example `Riley`), then build and start the new
+   release:
 
    ```sh
    docker compose -f packaging/compose.yaml --project-directory . up -d --build
@@ -138,19 +148,44 @@ step 2 and step 5 and phones retry on their own.
    The name is applied once: it takes effect only while the first user has never been named,
    and later restarts with the same or another value change nothing. If it is unset the user
    is called `admin` and can still be named by a later start. A name another user already
-   holds stops startup with a message. A database that has recorded a migration this release
-   does not ship (for example `0004` from the durable pairing limiter) is refused.
+   holds stops startup with a message.
 
-5. **Verify the result.** Give Litestream a few seconds, restore the replica as in step 3
-   and run the same Python block on it. Expect: `integrity ok`, empty `foreign keys`, the same
-   five counts as step 2 (plus whatever phones synced since), `select id, name, is_admin from
-   users` showing one admin, and migrations `1, 2, 3, 5, 6` (and `4` if it was already there).
+   This release ships migrations `1`, `2`, `3`, `5` and `6` only. A database that has already
+   recorded `4` (the durable pairing limiter, PR31) is refused at start with a missing
+   migration error and is not served. Supporting `4` needs a separately accepted PR31 that is
+   integrated with this change so its migration and runtime ship together; this release does
+   not include them, and the test fixture for `4` in the repository only exercises the ledger.
 
-### If the upgrade fails or must be undone
+5. **Verify the result.** The new release and Litestream are now running. Give Litestream a
+   few seconds, then restore the replica into a new scratch directory, as in step 3, and check
+   it against the release's exact ledger:
 
-Stay in the maintenance window: leave the writers stopped, then restore the frozen copy and
-the previous image. Replace the data files, put the pinned image back under the name compose
-uses, and start without building:
+   ```sh
+   WORK=$(mktemp -d)
+   docker run --rm --user "$(id -u):$(id -g)" -v "$BACKUP_DIR":/b:ro -v "$WORK":/o \
+     litestream/litestream:0.3.13 restore -o /o/replica.db file:///b/litestream
+   python3 scripts/db-evidence.py check "$WORK/replica.db" --ledger-exact 1,2,3,5,6
+   ```
+
+   Expect `CHECK PASSED` and the same counts for `items`, `completions`, `devices`,
+   `reminders_sent` and `pairing_codes` as in step 2 (plus whatever phones synced since). The
+   admin name is applied at start; confirm it in the server log or with the evidence output of
+   a stopped copy of the volume.
+
+### If the gate or the upgrade fails
+
+*Before step 4 (the gate or the copy check failed).* Nothing has been changed. Bring the
+current release back and fix the cause; repeat from step 2 with a new `$COPY` once replication
+is healthy (the old one can be kept or removed by you afterwards):
+
+```sh
+docker compose -f packaging/compose.yaml --project-directory . start bread-tracker litestream
+docker logs bread-tracker-litestream | tail
+```
+
+*After step 4 (the upgrade failed or must be undone).* Stay in the maintenance window. Stop
+both containers, restore the frozen copy over the data files, put the pinned image back under
+the name compose uses, and start without building:
 
 ```sh
 docker compose -f packaging/compose.yaml --project-directory . stop bread-tracker litestream
@@ -161,8 +196,13 @@ docker compose -f packaging/compose.yaml --project-directory . up -d --no-build
 curl -s http://127.0.0.1:7290/healthz
 ```
 
-Then repeat the Python check on the restored copy: counts and `meta.seq` equal to step 2. Keep
+Then show the restored database's evidence from a stopped copy of the volume, as in step 2,
+and compare with the step 2 output: the same counts, `meta.seq`, migrations and data digest.
+Keep
 `$COPY` and `bread-tracker:pre-multiuser` until the new release has run well. Litestream
 notices that the database file was replaced and begins a new generation; confirm with
 `docker logs bread-tracker-litestream`. A Litestream generation is not the sync-epoch
-mechanism for phones, which this release does not ship.
+mechanism for phones, which this release does not ship. A full Compose restart of the old
+image with Litestream resuming a generation, and phone recovery after a restore, are operator
+deployment checks that have not been run for this change; they need no other pull request to
+be merged first.

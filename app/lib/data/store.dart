@@ -8,6 +8,7 @@ class Store {
   final SharedPreferences prefs;
   final FlutterSecureStorage _secure;
   Future<void> _credentialMutation = Future<void>.value();
+  int _credentialEpoch = 0;
   static const defaultServer = 'https://tracker.breadway.dev';
 
   Future<String?> get token => _secure.read(key: 'token');
@@ -16,6 +17,20 @@ class Store {
 
   Future<void> clearToken() =>
       _serializeCredentialMutation(() => _secure.delete(key: 'token'));
+
+  int get credentialEpoch => _credentialEpoch;
+
+  void claimCredentialOwnership() => _credentialEpoch++;
+
+  Future<bool> clearTokenIfCurrent(String expected) async {
+    var cleared = false;
+    await _serializeCredentialMutation(() async {
+      if (await _secure.read(key: 'token') != expected) return;
+      await _secure.delete(key: 'token');
+      cleared = true;
+    });
+    return cleared;
+  }
 
   /// Deletes only [expected], then keeps cleanup ahead of any re-pair write.
   Future<bool> clearTokenAndRunIfCurrent(
@@ -68,6 +83,16 @@ class Store {
   int get cursor => prefs.getInt('cursor') ?? 0;
   Future<void> setCursor(int v) => prefs.setInt('cursor', v);
   Future<void> resetSync() => prefs.remove('cursor');
+
+  Future<bool> resetSyncIfEpochCurrent(int expectedEpoch) async {
+    var reset = false;
+    await _serializeCredentialMutation(() async {
+      if (_credentialEpoch != expectedEpoch) return;
+      await resetSync();
+      reset = true;
+    });
+    return reset;
+  }
 
   bool get sound => prefs.getBool('sound') ?? true;
   Future<void> setSound(bool v) => prefs.setBool('sound', v);

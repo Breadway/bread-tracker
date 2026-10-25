@@ -25,19 +25,33 @@ class MemStore extends Store {
   Future<void> saveToken(String t) async => _t = t;
 
   @override
-  Future<bool> clearTokenIfCurrent(String expected) async {
-    if (_t != expected) return false;
-    _t = null;
+  @override
+  int credentialEpoch = 0;
+  bool pauseConditionalReset = false;
+
+  @override
+  void claimCredentialOwnership() => credentialEpoch++;
+
+  @override
+  Future<bool> resetSyncIfEpochCurrent(int expectedEpoch) async {
+    if (pauseConditionalReset) {
+      if (resetStarted != null && !resetStarted!.isCompleted) {
+        resetStarted!.complete();
+      }
+      if (releaseReset != null) await releaseReset!.future;
+    }
+    if (credentialEpoch != expectedEpoch) return false;
+    await super.resetSync();
     return true;
   }
 
   @override
-  Future<bool> clearTokenIfCurrentAndRun(
+  Future<bool> clearTokenAndRunIfCurrent(
     String expected,
     Future<void> Function() action,
   ) async {
     if (_t != expected) return false;
-    await clearTokenIfCurrent(expected);
+    _t = null;
     await action();
     return true;
   }
@@ -53,12 +67,10 @@ class MemStore extends Store {
   }
 
   @override
-  Future<void> resetSync() async {
-    if (resetStarted != null && !resetStarted!.isCompleted) {
-      resetStarted!.complete();
-    }
-    if (releaseReset != null) await releaseReset!.future;
-    await super.resetSync();
+  Future<bool> clearTokenIfCurrent(String expected) async {
+    if (_t != expected) return false;
+    _t = null;
+    return true;
   }
 
   @override
@@ -365,8 +377,8 @@ void main() {
           .signOut(wipeLocal: true);
       await enteredDelete.future;
 
-      final replacementWrite = store.saveToken('replacement');
       container.read(controllerProvider).pairedAgain();
+      final replacementWrite = store.saveToken('replacement');
       await replacementWrite;
       await db.upsertItem(
         ItemsCompanion.insert(
@@ -423,20 +435,22 @@ void main() {
       final (container, store, db) = await setup(
         MockClient((_) async => http.Response('{"ok":true}', 200)),
       );
-      store.resetStarted = Completer<void>();
-      store.releaseReset = Completer<void>();
       final signingOut = container
           .read(controllerProvider)
           .signOut(wipeLocal: true);
-      await store.resetStarted!.future;
-      final replacementWrite = store.saveToken('replacement');
+      final resetStarted = Completer<void>();
+      store.resetStarted = resetStarted;
+      store.releaseReset = Completer<void>();
+      store.pauseConditionalReset = true;
+      await resetStarted.future;
       container.read(controllerProvider).pairedAgain();
+      final replacementWrite = store.saveToken('replacement');
       store.releaseReset!.complete();
 
       expect(await signingOut, isTrue);
       await replacementWrite;
       expect(await store.token, 'replacement');
-      expect(store.cursor, 0);
+      expect(store.cursor, 12);
       expect(await db.select(db.items).get(), hasLength(1));
       expect(await db.select(db.completions).get(), hasLength(1));
     },

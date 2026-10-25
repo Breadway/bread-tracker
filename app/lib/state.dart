@@ -221,10 +221,17 @@ class AppController {
             if (generation != _authGeneration || !_signedOut) return;
             if (wipeLocal) await _wipeLocalIfCurrent(generation);
           })
-        : await store.clearTokenIfCurrentAndRun(token, () async {
-            await store.resetSync();
-            if (generation != _authGeneration || !_signedOut) return;
+        : await store.clearTokenIfCurrent(token).then((cleared) async {
+            if (!cleared) return false;
+            final cursor = store.cursor;
+            final epoch = store.credentialEpoch;
+            if (!await store.resetSyncIfEpochCurrent(epoch)) return false;
+            if (generation != _authGeneration || !_signedOut) {
+              await store.setCursor(cursor);
+              return false;
+            }
             if (wipeLocal) await _wipeLocalIfCurrent(generation);
+            return true;
           });
     if (!cleanup || generation != _authGeneration || !_signedOut) {
       return revoked;
@@ -252,6 +259,7 @@ class AppController {
   void pairedAgain() {
     _authGeneration++;
     _signedOut = false;
+    ref.read(storeProvider).claimCredentialOwnership();
     ref.read(syncEngineProvider).revalidate();
   }
 

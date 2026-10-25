@@ -32,16 +32,20 @@ class Store {
     return cleared;
   }
 
-  /// Deletes only [expected], then keeps cleanup ahead of any re-pair write.
   Future<bool> clearTokenAndRunIfCurrent(
     String expected,
+    int expectedEpoch,
     Future<void> Function() action,
   ) async {
     var ran = false;
     await _serializeCredentialMutation(() async {
-      if (await _secure.read(key: 'token') != expected) return;
+      if (_credentialEpoch != expectedEpoch ||
+          await _secure.read(key: 'token') != expected) {
+        return;
+      }
       await _secure.delete(key: 'token');
       await action();
+      if (_credentialEpoch != expectedEpoch) return;
       ran = true;
     });
     return ran;
@@ -70,6 +74,23 @@ class Store {
     return ran;
   }
 
+  Future<bool> runIfTokenlessAndEpochCurrent(
+    int expectedEpoch,
+    Future<void> Function() action,
+  ) async {
+    var ran = false;
+    await _serializeCredentialMutation(() async {
+      if (_credentialEpoch != expectedEpoch ||
+          await _secure.read(key: 'token') != null) {
+        return;
+      }
+      await action();
+      if (_credentialEpoch != expectedEpoch) return;
+      ran = true;
+    });
+    return ran;
+  }
+
   Future<void> _serializeCredentialMutation(Future<void> Function() action) {
     final next = _credentialMutation.then((_) => action());
     _credentialMutation = next.catchError((Object _) {});
@@ -83,16 +104,6 @@ class Store {
   int get cursor => prefs.getInt('cursor') ?? 0;
   Future<void> setCursor(int v) => prefs.setInt('cursor', v);
   Future<void> resetSync() => prefs.remove('cursor');
-
-  Future<bool> resetSyncIfEpochCurrent(int expectedEpoch) async {
-    var reset = false;
-    await _serializeCredentialMutation(() async {
-      if (_credentialEpoch != expectedEpoch) return;
-      await resetSync();
-      reset = true;
-    });
-    return reset;
-  }
 
   bool get sound => prefs.getBool('sound') ?? true;
   Future<void> setSound(bool v) => prefs.setBool('sound', v);

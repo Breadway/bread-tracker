@@ -215,25 +215,32 @@ class AppController {
     // transfers ownership to the new generation, so the old sign-out must not
     // clear that credential, cursor, or the replacement device's local data.
     if (generation != _authGeneration || !_signedOut) return revoked;
+    final epoch = store.credentialEpoch;
     final cleanup = token == null
-        ? await store.runIfTokenless(() async {
-            await store.resetSync();
+        ? await store.runIfTokenlessAndEpochCurrent(epoch, () async {
             if (generation != _authGeneration || !_signedOut) return;
-            if (wipeLocal) await _wipeLocalIfCurrent(generation);
-          })
-        : await store.clearTokenIfCurrent(token).then((cleared) async {
-            if (!cleared) return false;
-            final cursor = store.cursor;
-            final epoch = store.credentialEpoch;
-            if (!await store.resetSyncIfEpochCurrent(epoch)) return false;
-            if (generation != _authGeneration || !_signedOut) {
-              await store.setCursor(cursor);
-              return false;
+            await store.resetSync();
+            if (generation != _authGeneration ||
+                !_signedOut ||
+                store.credentialEpoch != epoch) {
+              return;
             }
             if (wipeLocal) await _wipeLocalIfCurrent(generation);
-            return true;
+          })
+        : await store.clearTokenAndRunIfCurrent(token, epoch, () async {
+            if (generation != _authGeneration || !_signedOut) return;
+            await store.resetSync();
+            if (generation != _authGeneration ||
+                !_signedOut ||
+                store.credentialEpoch != epoch) {
+              return;
+            }
+            if (wipeLocal) await _wipeLocalIfCurrent(generation);
           });
-    if (!cleanup || generation != _authGeneration || !_signedOut) {
+    if (!cleanup ||
+        generation != _authGeneration ||
+        !_signedOut ||
+        store.credentialEpoch != epoch) {
       return revoked;
     }
     ref.read(syncStatusProvider.notifier).set(SyncStatus.unpaired);
@@ -242,7 +249,7 @@ class AppController {
     return revoked;
   }
 
-  Future<void> _wipeLocalIfCurrent(int generation) async {
+  Future<bool> _wipeLocalIfCurrent(int generation) async {
     try {
       await _db.transaction(() async {
         await _db.delete(_db.completions).go();
@@ -251,8 +258,9 @@ class AppController {
           throw const _AuthTransitionSuperseded();
         }
       });
+      return generation == _authGeneration && _signedOut;
     } on _AuthTransitionSuperseded {
-      return;
+      return false;
     }
   }
 

@@ -5,6 +5,10 @@ import 'package:drift/drift.dart' show Value;
 import 'package:drift/native.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+// ignore_for_file: depend_on_referenced_packages
+import 'package:flutter_secure_storage_platform_interface/flutter_secure_storage_platform_interface.dart';
+import 'package:flutter_secure_storage/test/test_flutter_secure_storage_platform.dart';
+import 'package:shared_preferences_platform_interface/shared_preferences_platform_interface.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -14,87 +18,34 @@ import 'package:tracker/data/store.dart';
 import 'package:tracker/data/sync.dart';
 import 'package:tracker/state.dart';
 
-class MemStore extends Store {
-  MemStore(super.prefs);
-  String? _t = 'tok';
-  Completer<void>? resetStarted;
-  Completer<void>? releaseReset;
-  @override
-  Future<String?> get token async => _t;
-  @override
-  Future<void> saveToken(String t) async => _t = t;
+const id1 = '11111111-1111-4111-8111-111111111111';
+
+class GatedPreferencesStore extends InMemorySharedPreferencesStore {
+  GatedPreferencesStore(
+    this.enteredRemove,
+    this.releaseRemove,
+    Map<String, Object> data,
+  ) : super.withData(data);
+  final Completer<void> enteredRemove;
+  final Completer<void> releaseRemove;
 
   @override
-  @override
-  int credentialEpoch = 0;
-  bool pauseConditionalReset = false;
-
-  @override
-  void claimCredentialOwnership() => credentialEpoch++;
-
-  @override
-  Future<bool> resetSyncIfEpochCurrent(int expectedEpoch) async {
-    if (pauseConditionalReset) {
-      if (resetStarted != null && !resetStarted!.isCompleted) {
-        resetStarted!.complete();
-      }
-      if (releaseReset != null) await releaseReset!.future;
+  Future<bool> remove(String key) async {
+    if (key == 'flutter.cursor') {
+      if (!enteredRemove.isCompleted) enteredRemove.complete();
+      await releaseRemove.future;
     }
-    if (credentialEpoch != expectedEpoch) return false;
-    await super.resetSync();
-    return true;
-  }
-
-  @override
-  Future<bool> clearTokenAndRunIfCurrent(
-    String expected,
-    Future<void> Function() action,
-  ) async {
-    if (_t != expected) return false;
-    _t = null;
-    await action();
-    return true;
-  }
-
-  @override
-  Future<void> clearToken() async => _t = null;
-
-  @override
-  Future<bool> runIfTokenless(Future<void> Function() action) async {
-    if (_t != null) return false;
-    await action();
-    return true;
-  }
-
-  @override
-  Future<bool> clearTokenIfCurrent(String expected) async {
-    if (_t != expected) return false;
-    _t = null;
-    return true;
-  }
-
-  @override
-  Future<bool> runIfTokenCurrent(
-    String expected,
-    Future<void> Function() action,
-  ) async {
-    if (_t != expected) return false;
-    if (resetStarted != null && !resetStarted!.isCompleted) {
-      resetStarted!.complete();
-    }
-    if (releaseReset != null) await releaseReset!.future;
-    if (_t != expected) return false;
-    await action();
-    return true;
+    return super.remove(key);
   }
 }
 
-const id1 = '11111111-1111-4111-8111-111111111111';
-
-Future<(ProviderContainer, MemStore, AppDb)> setup(MockClient client) async {
+Future<(ProviderContainer, Store, AppDb)> setup(MockClient client) async {
   SharedPreferences.setMockInitialValues({});
   final prefs = await SharedPreferences.getInstance();
-  final store = MemStore(prefs);
+  FlutterSecureStoragePlatform.instance = TestFlutterSecureStoragePlatform({
+    'token': 'tok',
+  });
+  final store = Store(prefs);
   await store.setCursor(12);
   final db = AppDb(NativeDatabase.memory());
   await db.upsertItem(
@@ -121,7 +72,15 @@ Future<(ProviderContainer, MemStore, AppDb)> setup(MockClient client) async {
   return (c, store, db);
 }
 
+Future<Store> makeStore(SharedPreferences prefs, {String token = 'tok'}) async {
+  FlutterSecureStoragePlatform.instance = TestFlutterSecureStoragePlatform({
+    'token': token,
+  });
+  return Store(prefs);
+}
+
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
   test('existing file-backed database reopens with retained item and completion history', () async {
     final dir = await Directory.systemTemp.createTemp('track10-db-reopen-');
     addTearDown(() => dir.delete(recursive: true));
@@ -205,7 +164,7 @@ void main() {
       final release = Completer<void>();
       SharedPreferences.setMockInitialValues({});
       final prefs = await SharedPreferences.getInstance();
-      final store = MemStore(prefs);
+      final store = await makeStore(prefs);
       final db = AppDb(NativeDatabase.memory());
       await db.upsertItem(
         ItemsCompanion.insert(
@@ -257,7 +216,7 @@ void main() {
     final release = Completer<void>();
     SharedPreferences.setMockInitialValues({});
     final prefs = await SharedPreferences.getInstance();
-    final store = MemStore(prefs);
+    final store = await makeStore(prefs);
     final db = AppDb(NativeDatabase.memory());
     await db.upsertItem(
       ItemsCompanion.insert(
@@ -309,7 +268,7 @@ void main() {
       final release = Completer<void>();
       SharedPreferences.setMockInitialValues({});
       final prefs = await SharedPreferences.getInstance();
-      final store = MemStore(prefs);
+      final store = await makeStore(prefs);
       final db = AppDb(NativeDatabase.memory());
       await db.upsertItem(
         ItemsCompanion.insert(
@@ -429,28 +388,103 @@ void main() {
     },
   );
 
-  test(
-    'replacement at database wipe boundary retains rows and cursor',
-    () async {
-      final (container, store, db) = await setup(
-        MockClient((_) async => http.Response('{"ok":true}', 200)),
-      );
-      final signingOut = container
-          .read(controllerProvider)
-          .signOut(wipeLocal: true);
-      final resetStarted = Completer<void>();
-      store.resetStarted = resetStarted;
-      store.releaseReset = Completer<void>();
-      store.pauseConditionalReset = true;
-      await resetStarted.future;
-      container.read(controllerProvider).pairedAgain();
-      final replacementWrite = store.saveToken('replacement');
-      store.releaseReset!.complete();
+  test('replacement queued during actual cursor reset waits until cleanup releases ownership', () async {
+    final enteredReset = Completer<void>();
+    final releaseReset = Completer<void>();
+    final platform = GatedPreferencesStore(enteredReset, releaseReset, {
+      'flutter.cursor': 12,
+    });
+    SharedPreferencesStorePlatform.instance = platform;
+    final prefs = await SharedPreferences.getInstance();
+    final securePlatform = TestFlutterSecureStoragePlatform({'token': 'tok'});
+    FlutterSecureStoragePlatform.instance = securePlatform;
+    final store = Store(prefs);
+    final dbPath =
+        '${Directory.systemTemp.path}/track10-race-${DateTime.now().microsecondsSinceEpoch}.sqlite';
+    final db = AppDb(NativeDatabase.createInBackground(File(dbPath)));
+    await db.upsertItem(
+      ItemsCompanion.insert(
+        id: id1,
+        kind: 'chore',
+        name: 'retained',
+        points: 10,
+        updatedAt: 1,
+      ),
+    );
+    await db.setCompletion(id1, '2026-10-19', true, 2);
+    final container = ProviderContainer(
+      overrides: [
+        prefsProvider.overrideWithValue(prefs),
+        storeProvider.overrideWithValue(store),
+        dbProvider.overrideWithValue(db),
+        apiFactoryProvider.overrideWithValue(
+          (base, token) => Api(
+            base,
+            token: token,
+            client: MockClient((_) async => http.Response('{"ok":true}', 200)),
+          ),
+        ),
+      ],
+    );
+    addTearDown(() async {
+      container.dispose();
+      await db.close();
+      await File(dbPath).delete();
+    });
+    final signingOut = container
+        .read(controllerProvider)
+        .signOut(wipeLocal: true);
+    await enteredReset.future.timeout(const Duration(seconds: 3));
+    container.read(controllerProvider).pairedAgain();
+    var tokenWriteFinished = false;
+    final replacementWrite = store.saveToken('replacement').then((_) {
+      tokenWriteFinished = true;
+    });
+    var writeFinished = false;
+    replacementWrite.then((_) => writeFinished = true);
+    await Future<void>.delayed(Duration.zero);
+    expect(writeFinished, isFalse);
+    expect(tokenWriteFinished, isFalse);
+    releaseReset.complete();
+    expect(await signingOut, isTrue);
+    expect(tokenWriteFinished, isFalse);
+    await replacementWrite;
+    expect(await store.token, 'replacement');
+    expect(store.cursor, 0);
+    expect(container.read(syncStatusProvider), isNot(SyncStatus.unpaired));
+    await db.close();
+    final reopened = AppDb(NativeDatabase.createInBackground(File(dbPath)));
+    expect(
+      (await reopened.select(reopened.items).get()).single.name,
+      'retained',
+    );
+    expect(await reopened.select(reopened.completions).get(), hasLength(1));
+    await reopened.close();
+  });
 
-      expect(await signingOut, isTrue);
-      await replacementWrite;
-      expect(await store.token, 'replacement');
-      expect(store.cursor, 12);
+  test(
+    'overlapping signouts preserve only the latest cleanup and keep data',
+    () async {
+      final enteredDelete = Completer<void>();
+      final releaseDelete = Completer<void>();
+      var deletes = 0;
+      final (container, store, db) = await setup(
+        MockClient((request) async {
+          if (request.method == 'DELETE' && ++deletes == 1) {
+            enteredDelete.complete();
+            await releaseDelete.future;
+          }
+          return http.Response('{"ok":true}', 200);
+        }),
+      );
+      final controller = container.read(controllerProvider);
+      final first = controller.signOut(wipeLocal: true);
+      await enteredDelete.future.timeout(const Duration(seconds: 3));
+      final second = controller.signOut();
+      expect(await second.timeout(const Duration(seconds: 3)), isTrue);
+      releaseDelete.complete();
+      expect(await first.timeout(const Duration(seconds: 3)), isTrue);
+      expect(await store.token, isNull);
       expect(await db.select(db.items).get(), hasLength(1));
       expect(await db.select(db.completions).get(), hasLength(1));
     },

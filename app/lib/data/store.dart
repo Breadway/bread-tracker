@@ -1,6 +1,34 @@
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+class PairingOwnership {
+  const PairingOwnership({
+    required this.generation,
+    required this.epoch,
+    required this.server,
+  });
+  final int generation;
+  final int epoch;
+  final String server;
+}
+
+class PairingPersistenceReceipt {
+  const PairingPersistenceReceipt({
+    required this.ownership,
+    required this.token,
+    required this.server,
+    required this.previousToken,
+    required this.previousServer,
+    required this.previousCursor,
+  });
+  final PairingOwnership ownership;
+  final String token;
+  final String server;
+  final String? previousToken;
+  final String previousServer;
+  final int previousCursor;
+}
+
 /// Device credentials (secure storage) and small preferences.
 class Store {
   Store(this.prefs, [FlutterSecureStorage? secure])
@@ -24,6 +52,146 @@ class Store {
   void claimCredentialOwnership() => claimAuthGeneration();
 
   int get authGeneration => _authGeneration;
+
+  PairingOwnership pairingOwnership(String server) => PairingOwnership(
+    generation: _authGeneration,
+    epoch: _credentialEpoch,
+    server: serverUrl,
+  );
+
+  bool ownsPairing(PairingOwnership owner) =>
+      _authGeneration == owner.generation && serverUrl == owner.server;
+
+  Future<PairingPersistenceReceipt> persistPairing(
+    PairingOwnership owner,
+    String server,
+    String token,
+  ) async {
+    late PairingPersistenceReceipt receipt;
+    await _serializeCredentialMutation(() async {
+      if (!ownsPairing(owner) || _credentialEpoch != owner.epoch) {
+        throw StateError('Pairing ownership changed before local persistence.');
+      }
+      final previousToken = await _secure.read(key: 'token');
+      final previousServer = serverUrl;
+      final previousCursor = cursor;
+      receipt = PairingPersistenceReceipt(
+        ownership: owner,
+        token: token,
+        server: server,
+        previousToken: previousToken,
+        previousServer: previousServer,
+        previousCursor: previousCursor,
+      );
+      try {
+        await setServerUrl(server);
+        if (_authGeneration != owner.generation ||
+            _credentialEpoch != owner.epoch ||
+            serverUrl != server) {
+          throw StateError(
+            'Pairing ownership changed during local persistence.',
+          );
+        }
+        if (previousToken != token) {
+          await _secure.write(key: 'token', value: token);
+          if (_authGeneration != owner.generation ||
+              _credentialEpoch != owner.epoch ||
+              serverUrl != server ||
+              await _secure.read(key: 'token') != token) {
+            throw StateError(
+              'Pairing ownership changed during local persistence.',
+            );
+          }
+        }
+        await resetSync();
+        if (_authGeneration != owner.generation ||
+            _credentialEpoch != owner.epoch ||
+            serverUrl != server) {
+          throw StateError(
+            'Pairing ownership changed during local persistence.',
+          );
+        }
+      } catch (_) {
+        if (_authGeneration == owner.generation &&
+            serverUrl == server &&
+            _credentialEpoch == owner.epoch &&
+            await _secure.read(key: 'token') == token) {
+          var credentialRestored = false;
+          if (previousToken == null) {
+            await _secure.delete(key: 'token');
+            credentialRestored = await _secure.read(key: 'token') == null;
+          } else if (previousToken != token) {
+            await _secure.write(key: 'token', value: previousToken);
+            credentialRestored =
+                await _secure.read(key: 'token') == previousToken;
+          } else {
+            credentialRestored =
+                await _secure.read(key: 'token') == previousToken;
+          }
+          if (_authGeneration == owner.generation &&
+              _credentialEpoch == owner.epoch &&
+              serverUrl == server &&
+              credentialRestored) {
+            await setServerUrl(previousServer);
+            await setCursor(previousCursor);
+          }
+        }
+        rethrow;
+      }
+    });
+    return receipt;
+  }
+
+  Future<bool> rollbackPairing(PairingPersistenceReceipt receipt) async {
+    var rolledBack = false;
+    await _serializeCredentialMutation(() async {
+      final owner = receipt.ownership;
+      if (_authGeneration != owner.generation ||
+          _credentialEpoch != owner.epoch ||
+          serverUrl != receipt.server ||
+          await _secure.read(key: 'token') != receipt.token ||
+          _authGeneration != owner.generation ||
+          _credentialEpoch != owner.epoch ||
+          serverUrl != receipt.server) {
+        return;
+      }
+      if (receipt.previousToken == null) {
+        await _secure.delete(key: 'token');
+      } else if (receipt.previousToken != receipt.token) {
+        await _secure.write(key: 'token', value: receipt.previousToken);
+      }
+      if (_authGeneration == owner.generation &&
+          _credentialEpoch == owner.epoch &&
+          serverUrl == receipt.server &&
+          await _secure.read(key: 'token') == receipt.previousToken) {
+        await setServerUrl(receipt.previousServer);
+        await setCursor(receipt.previousCursor);
+      }
+      rolledBack =
+          _authGeneration == owner.generation &&
+          _credentialEpoch == owner.epoch &&
+          serverUrl == receipt.previousServer &&
+          await _secure.read(key: 'token') == receipt.previousToken;
+    });
+    return rolledBack;
+  }
+
+  Future<void> abandonPairingAttempt(PairingOwnership owner, String token) =>
+      _serializeCredentialMutation(() async {
+        if (_authGeneration != owner.generation ||
+            _credentialEpoch != owner.epoch ||
+            serverUrl != owner.server ||
+            await _secure.read(key: 'token') != token) {
+          return;
+        }
+        await _secure.delete(key: 'token');
+        if (_authGeneration == owner.generation &&
+            _credentialEpoch == owner.epoch &&
+            serverUrl == owner.server &&
+            await _secure.read(key: 'token') == null) {
+          await setCursor(0);
+        }
+      });
 
   void claimAuthGeneration() {
     _authGeneration++;

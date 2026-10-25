@@ -170,9 +170,14 @@ class AppController {
   final Ref ref;
   Timer? _syncTimer;
   int _authGeneration = 0;
+  int _pairedGeneration = 0;
+  int? _pairedStoreGeneration;
+  String? _pairedServer;
   bool _signedOut = false;
   bool _signOutCleanupPending = false;
   bool _pairingPending = false;
+  bool _pairedCredentialAccepted = false;
+  bool get pairedCredentialAccepted => _pairedCredentialAccepted;
   Completer<void>? _wipeCommitCompletion;
   bool _wipeCommitFailed = false;
   bool get isWipeRecoveryPending => _wipeCommitFailed;
@@ -181,6 +186,10 @@ class AppController {
   DateTime _lastTick = DateTime.fromMillisecondsSinceEpoch(0);
 
   AppDb get _db => ref.read(dbProvider);
+  int get currentAuthGeneration => _authGeneration;
+  int get acceptedPairingGeneration => _pairedGeneration;
+  int? get acceptedStoreGeneration => _pairedStoreGeneration;
+  String? get acceptedPairingServer => _pairedServer;
 
   static int nowMs() => DateTime.now().millisecondsSinceEpoch;
 
@@ -226,6 +235,7 @@ class AppController {
     final wipeRecoveryRetry = !wipeLocal && _wipeCommitFailed;
     final generation = ++_authGeneration;
     _signedOut = true;
+    _pairedCredentialAccepted = false;
     _signOutCleanupPending = true;
     _pairingPending = false;
     _syncTimer?.cancel();
@@ -402,6 +412,7 @@ class AppController {
     if (_wipeCommitFailed) throw const _LocalWipeFailed();
     _authGeneration++;
     _signedOut = false;
+    _pairedCredentialAccepted = false;
     ref.read(storeProvider).claimPairingOwnership();
     _pairingPending = true;
     // Keep sync admission closed until the old sign-out's local cleanup finishes.
@@ -474,6 +485,7 @@ class AppController {
     if (_wipeCommitFailed) return false;
     _authGeneration++;
     _signedOut = true;
+    _pairedCredentialAccepted = false;
     ref.read(storeProvider).claimPairingOwnership();
     _pairingPending = true;
     ref.read(syncEngineProvider).invalidate();
@@ -498,9 +510,33 @@ class AppController {
     }
   }
 
+  void pairingPersistenceFailed() {
+    _pairingPending = false;
+    _signedOut = true;
+    _pairedCredentialAccepted = false;
+    _signOutCleanupPending = true;
+    ref.read(syncEngineProvider).invalidate();
+  }
+
+  void pairingPersistenceFailedForCredentialOwner(
+    int expectedGeneration,
+    String expectedServer,
+  ) {
+    final store = ref.read(storeProvider);
+    if (_authGeneration != expectedGeneration ||
+        store.serverUrl != expectedServer) {
+      return;
+    }
+    pairingPersistenceFailed();
+  }
+
   void pairingPersisted() {
     _pairingPending = false;
     _signedOut = false;
+    _pairedCredentialAccepted = true;
+    _pairedGeneration = _authGeneration;
+    _pairedStoreGeneration = ref.read(storeProvider).authGeneration;
+    _pairedServer = ref.read(storeProvider).serverUrl;
     if (!_signedOut) {
       _signOutCleanupPending = false;
       ref.read(syncEngineProvider).revalidate();

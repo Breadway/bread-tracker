@@ -67,6 +67,26 @@ class _CommitGate extends QueryInterceptor {
   }
 }
 
+class _FailCursorReset extends InMemorySharedPreferencesStore {
+  _FailCursorReset() : super.withData({});
+  bool armed = false;
+  final entered = Completer<void>();
+  final release = Completer<void>();
+  final removedKeys = <String>[];
+
+  @override
+  Future<bool> remove(String key) async {
+    removedKeys.add(key);
+    if (key == 'flutter.cursor' && armed) {
+      armed = false;
+      if (!entered.isCompleted) entered.complete();
+      await release.future;
+      throw StateError('injected real cursor reset failure');
+    }
+    return super.remove(key);
+  }
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   test('provider honors the bootstrap Store instance', () async {
@@ -332,6 +352,9 @@ void main() {
       await tester.enterText(find.byType(TextField).at(1), 'ABCD-1234');
       await tester.tap(find.text('Pair'));
       await tester.pump();
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      });
       for (var i = 0; i < 40 && !gate.entered.isCompleted; i++) {
         await tester.pump(const Duration(milliseconds: 25));
       }
@@ -440,6 +463,391 @@ void main() {
       });
     },
   );
+
+  for (final invalidation in ['none', 'server-change', 'dispose']) {
+    testWidgets('fresh pairing rollback is attempt-owned: $invalidation', (
+      tester,
+    ) async {
+      final gate = _FailCursorReset();
+      late Store store;
+      late ProviderContainer container;
+      late AppDb db;
+      var pairRequests = 0;
+      final releasePairResponse = Completer<void>();
+      final client = MockClient((request) async {
+        if (request.url.path == '/pair') {
+          pairRequests++;
+          await releasePairResponse.future;
+          return http.Response('{"token":"fresh-token"}', 200);
+        }
+        return http.Response('{}', 200);
+      });
+      await tester.runAsync(() async {
+        SharedPreferences.setMockInitialValues({});
+        SharedPreferencesStorePlatform.instance = gate;
+        final prefs = await SharedPreferences.getInstance();
+        FlutterSecureStoragePlatform.instance =
+            TestFlutterSecureStoragePlatform({});
+        store = Store(prefs);
+        db = AppDb(NativeDatabase.memory());
+        container = ProviderContainer(
+          overrides: [
+            prefsProvider.overrideWithValue(prefs),
+            storeProvider.overrideWithValue(store),
+            dbProvider.overrideWithValue(db),
+            apiFactoryProvider.overrideWithValue(
+              (base, token) => Api(base, token: token, client: client),
+            ),
+          ],
+        );
+      });
+      addTearDown(container.dispose);
+      addTearDown(db.close);
+      final oldClient = Api.sharedClient;
+      Api.sharedClient = client;
+      addTearDown(() => Api.sharedClient = oldClient);
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: const MaterialApp(home: PairScreen()),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField).at(1), 'ABCD1234');
+      gate.armed = true;
+      await tester.tap(find.text('Pair'));
+      await tester.pump();
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+      for (var i = 0; i < 40 && pairRequests == 0; i++) {
+        await tester.pump(const Duration(milliseconds: 10));
+        await tester.runAsync(() async {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        });
+      }
+      expect(pairRequests, 1, reason: 'fresh pair request was issued once');
+      releasePairResponse.complete();
+      for (var i = 0; i < 40 && !gate.entered.isCompleted; i++) {
+        await tester.pump(const Duration(milliseconds: 10));
+        await tester.runAsync(() async {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        });
+      }
+      expect(
+        gate.entered.isCompleted,
+        isTrue,
+        reason: 'cursor write failpoint reached after issued token response',
+      );
+      await tester.runAsync(() async {
+        expect(await store.token, 'fresh-token');
+      });
+      if (invalidation == 'server-change') {
+        await tester.enterText(
+          find.byType(TextField).at(0),
+          'https://changed.example.invalid',
+        );
+      }
+      if (invalidation == 'dispose') {
+        await tester.pumpWidget(const MaterialApp(home: SizedBox()));
+      }
+      gate.release.complete();
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 40));
+      });
+      await tester.pumpAndSettle();
+      expect(pairRequests, 1);
+      await tester.runAsync(() async {
+        expect(await store.token, isNull);
+        expect(await container.read(pairedProvider.future), isFalse);
+      });
+    });
+  }
+
+  testWidgets(
+    'failed old attempt cannot roll back newer token on changed server',
+    (tester) async {
+      final gate = _FailCursorReset();
+      late Store store;
+      late ProviderContainer container;
+      late AppDb db;
+      var pairCalls = 0;
+      final releasePairResponse = Completer<void>();
+      final client = MockClient((r) async {
+        if (r.url.path == '/pair') {
+          pairCalls++;
+          await releasePairResponse.future;
+          return http.Response('{"token":"old-token"}', 200);
+        }
+        return http.Response('{}', 200);
+      });
+      await tester.runAsync(() async {
+        SharedPreferences.setMockInitialValues({});
+        SharedPreferencesStorePlatform.instance = gate;
+        final prefs = await SharedPreferences.getInstance();
+        FlutterSecureStoragePlatform.instance =
+            TestFlutterSecureStoragePlatform({});
+        store = Store(prefs);
+        db = AppDb(NativeDatabase.memory());
+        container = ProviderContainer(
+          overrides: [
+            prefsProvider.overrideWithValue(prefs),
+            storeProvider.overrideWithValue(store),
+            dbProvider.overrideWithValue(db),
+            apiFactoryProvider.overrideWithValue(
+              (b, t) => Api(b, token: t, client: client),
+            ),
+          ],
+        );
+      });
+      addTearDown(container.dispose);
+      addTearDown(db.close);
+      final oldClient = Api.sharedClient;
+      Api.sharedClient = client;
+      addTearDown(() => Api.sharedClient = oldClient);
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: const MaterialApp(home: PairScreen()),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField).at(1), 'ABCD1234');
+      gate.armed = true;
+      await tester.tap(find.text('Pair'));
+      await tester.pump();
+      for (var i = 0; i < 40 && pairCalls == 0; i++) {
+        await tester.pump(const Duration(milliseconds: 10));
+        await tester.runAsync(() async {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        });
+      }
+      expect(pairCalls, 1, reason: 'one-time exchange was sent');
+      await tester.runAsync(() async {
+        releasePairResponse.complete();
+      });
+      for (var i = 0; i < 40 && !gate.entered.isCompleted; i++) {
+        await tester.pump(const Duration(milliseconds: 10));
+        await tester.runAsync(() async {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        });
+      }
+      if (!gate.entered.isCompleted) {
+        fail(
+          'old attempt cursor fault not reached; requests=$pairCalls state=${tester.widgetList<Text>(find.byType(Text)).map((w) => w.data).whereType<String>().toList()}',
+        );
+      }
+      expect(
+        gate.entered.isCompleted,
+        isTrue,
+        reason: 'old attempt is paused at real cursor reset after token write',
+      );
+      final controller = container.read(controllerProvider);
+      await controller.pairedAgain();
+      final replacementOwnership = store.pairingOwnership(store.serverUrl);
+      final replacementWrite = store.persistPairing(
+        replacementOwnership,
+        'https://new-owner.example.invalid',
+        'replacement-token',
+      );
+      final oldAttemptRelease = tester.runAsync(() async {
+        gate.release.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 40));
+      });
+      await oldAttemptRelease;
+      await replacementWrite;
+      controller.pairingPersisted();
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 40));
+      });
+      await tester.pumpAndSettle();
+      await tester.runAsync(() async {
+        expect(await store.token, 'replacement-token');
+        expect(store.serverUrl, 'https://new-owner.example.invalid');
+        expect(await container.read(pairedProvider.future), isTrue);
+      });
+    },
+  );
+
+  for (final invalidation in ['none', 'server-change', 'dispose']) {
+    testWidgets(
+      'fresh PairScreen cursor reset failure rolls back credential: $invalidation',
+      (tester) async {
+        final resetGate = _FailCursorReset();
+        late Store store;
+        late ProviderContainer container;
+        late AppDb db;
+        var pairCalls = 0;
+        final client = MockClient((request) async {
+          if (request.url.path == '/pair') {
+            pairCalls++;
+            return http.Response('{"token":"fresh-issued"}', 200);
+          }
+          return http.Response('{"cursor":0,"items":[],"completions":[]}', 200);
+        });
+        await tester.runAsync(() async {
+          SharedPreferences.setMockInitialValues({});
+          SharedPreferencesStorePlatform.instance = resetGate;
+          final prefs = await SharedPreferences.getInstance();
+          FlutterSecureStoragePlatform.instance =
+              TestFlutterSecureStoragePlatform({});
+          store = Store(prefs);
+          db = AppDb(NativeDatabase.memory());
+          container = ProviderContainer(
+            overrides: [
+              prefsProvider.overrideWithValue(prefs),
+              storeProvider.overrideWithValue(store),
+              dbProvider.overrideWithValue(db),
+              apiFactoryProvider.overrideWithValue(
+                (base, token) => Api(base, token: token, client: client),
+              ),
+            ],
+          );
+        });
+        addTearDown(container.dispose);
+        addTearDown(db.close);
+        final previousClient = Api.sharedClient;
+        Api.sharedClient = client;
+        addTearDown(() => Api.sharedClient = previousClient);
+        await tester.pumpWidget(
+          UncontrolledProviderScope(
+            container: container,
+            child: const MaterialApp(home: PairScreen()),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.enterText(find.byType(TextField).at(1), 'ABCD1234');
+        resetGate.armed = true;
+        await tester.tap(find.text('Pair'));
+        await tester.pump();
+        for (var i = 0; i < 40 && !resetGate.entered.isCompleted; i++) {
+          await tester.pump(const Duration(milliseconds: 10));
+          await tester.runAsync(() async {
+            await Future<void>.delayed(const Duration(milliseconds: 10));
+          });
+        }
+        expect(
+          resetGate.entered.isCompleted,
+          isTrue,
+          reason: 'fresh attempt reached actual cursor failpoint',
+        );
+        await tester.runAsync(() async {
+          expect(await store.token, 'fresh-issued');
+          expect(resetGate.removedKeys, contains('flutter.cursor'));
+        });
+        if (invalidation == 'server-change') {
+          await tester.enterText(
+            find.byType(TextField).at(0),
+            'https://other.example.invalid',
+          );
+        }
+        if (invalidation == 'dispose') {
+          await tester.pumpWidget(const MaterialApp(home: SizedBox()));
+        }
+        resetGate.release.complete();
+        await tester.runAsync(() async {
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+        });
+        await tester.pumpAndSettle();
+        expect(pairCalls, 1);
+        await tester.runAsync(() async {
+          expect(
+            await container.read(pairedProvider.future),
+            isFalse,
+            reason: 'a token written before reset failure is not paired',
+          );
+          expect(
+            await store.token,
+            isNull,
+            reason: 'failed or invalidated attempt removes its own credential',
+          );
+        });
+      },
+    );
+  }
+
+  testWidgets('old attempt cleanup cannot undo a newer token/server owner', (
+    tester,
+  ) async {
+    final resetGate = _FailCursorReset()..armed = true;
+    late Store store;
+    late ProviderContainer container;
+    late AppDb db;
+    final client = MockClient((request) async {
+      if (request.url.path == '/pair') {
+        return http.Response('{"token":"old-attempt"}', 200);
+      }
+      return http.Response('{}', 200);
+    });
+    await tester.runAsync(() async {
+      SharedPreferences.setMockInitialValues({});
+      SharedPreferencesStorePlatform.instance = resetGate;
+      final prefs = await SharedPreferences.getInstance();
+      FlutterSecureStoragePlatform.instance = TestFlutterSecureStoragePlatform(
+        {},
+      );
+      store = Store(prefs);
+      db = AppDb(NativeDatabase.memory());
+      container = ProviderContainer(
+        overrides: [
+          prefsProvider.overrideWithValue(prefs),
+          storeProvider.overrideWithValue(store),
+          dbProvider.overrideWithValue(db),
+          apiFactoryProvider.overrideWithValue(
+            (base, token) => Api(base, token: token, client: client),
+          ),
+        ],
+      );
+    });
+    addTearDown(container.dispose);
+    addTearDown(db.close);
+    final previousClient = Api.sharedClient;
+    Api.sharedClient = client;
+    addTearDown(() => Api.sharedClient = previousClient);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(home: PairScreen()),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField).at(1), 'ABCD1234');
+    await tester.tap(find.text('Pair'));
+    await tester.pump();
+    for (var i = 0; i < 40 && !resetGate.entered.isCompleted; i++) {
+      await tester.pump(const Duration(milliseconds: 10));
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      });
+    }
+    expect(
+      resetGate.entered.isCompleted,
+      isTrue,
+      reason: 'old attempt must pause after writing its token at cursor reset',
+    );
+    final newerPairing = container.read(controllerProvider);
+    await newerPairing.pairedAgain();
+    final replacementOwner = store.pairingOwnership(store.serverUrl);
+    final replacement = store.persistPairing(
+      replacementOwner,
+      'https://new-owner.example.invalid',
+      'old-attempt',
+    );
+    resetGate.release.complete();
+    await replacement;
+    final newerControllerGeneration = newerPairing.currentAuthGeneration;
+    newerPairing.pairingPersisted();
+    expect(newerPairing.currentAuthGeneration, newerControllerGeneration);
+    expect(newerPairing.pairedCredentialAccepted, isTrue);
+    expect(
+      newerPairing.acceptedPairingServer,
+      'https://new-owner.example.invalid',
+    );
+    final currentToken = await tester.runAsync(() async => store.token);
+    final currentServer = store.serverUrl;
+    expect(currentToken, 'old-attempt');
+    expect(currentServer, 'https://new-owner.example.invalid');
+  });
 
   test('pairing during DELETE cannot wipe replacement data', () async {
     final enteredDelete = Completer<void>();

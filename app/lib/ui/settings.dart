@@ -91,29 +91,6 @@ class SettingsScreen extends ConsumerWidget {
               context,
             ).push(MaterialPageRoute<void>(builder: (_) => const PairScreen())),
           ),
-          if (paired) const Spacer8(),
-          if (paired)
-            PanelButton(
-              icon: Icons.logout_rounded,
-              title: 'Sign out',
-              subtitle: 'Stop syncing and reminders on this phone',
-              onTap: () async {
-                final choice = await showDialog<_SignOut>(
-                  context: context,
-                  builder: (_) => const _SignOutDialog(),
-                );
-                if (choice == null) return;
-                final revoked = await ctl.signOut(
-                  wipeLocal: choice == _SignOut.wipe,
-                );
-                toast(
-                  revoked
-                      ? 'Signed out'
-                      : 'Signed out here, but the server could not be reached. '
-                            'Revoke this device from the server to be sure.',
-                );
-              },
-            ),
           const SectionHeader('Your list'),
           PanelButton(
             icon: Icons.tune_rounded,
@@ -126,9 +103,9 @@ class SettingsScreen extends ConsumerWidget {
           const Spacer8(),
           PanelButton(
             icon: Icons.playlist_add_rounded,
-            title: 'Add starter chores',
+            title: 'Add example chores',
             subtitle:
-                'The weekly household schedule, skipping any already added',
+                'A few generic weekly chores, skipping any already added',
             onTap: () async =>
                 toast('Added ${await ctl.addStarterChores()} chores'),
           ),
@@ -215,34 +192,4 @@ class SettingsScreen extends ConsumerWidget {
       ),
     );
   }
-}
-
-enum _SignOut { keep, wipe }
-
-class _SignOutDialog extends StatelessWidget {
-  const _SignOutDialog();
-
-  @override
-  Widget build(BuildContext context) => AlertDialog(
-    title: const Text('Sign out of this phone?'),
-    content: const Text(
-      'This phone stops syncing and its reminders stop. '
-      'You can keep the items and ticks stored on this phone, or delete them. '
-      'Anything not yet synced is lost if you delete.',
-    ),
-    actions: [
-      TextButton(
-        onPressed: () => Navigator.pop(context),
-        child: const Text('Cancel'),
-      ),
-      TextButton(
-        onPressed: () => Navigator.pop(context, _SignOut.wipe),
-        child: const Text('Sign out and delete data'),
-      ),
-      FilledButton(
-        onPressed: () => Navigator.pop(context, _SignOut.keep),
-        child: const Text('Sign out'),
-      ),
-    ],
-  );
 }

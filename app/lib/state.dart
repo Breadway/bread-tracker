@@ -16,7 +16,6 @@ import 'fx/sfx.dart';
 import 'push.dart';
 import 'rules.dart';
 import 'theme.dart';
-import 'ui/pair.dart' show pairedProvider;
 
 final prefsProvider = Provider<SharedPreferences>(
   (ref) => throw UnimplementedError('override in main'),
@@ -78,24 +77,6 @@ final selectedDayProvider = NotifierProvider<SelectedDayNotifier, DateTime>(
   SelectedDayNotifier.new,
 );
 
-/// A request to show the Today screen on a given day, from a tapped notification.
-class OpenTodayRequest {
-  const OpenTodayRequest(this.date, this.serial);
-  final String? date;
-  final int serial;
-}
-
-class OpenTodayNotifier extends Notifier<OpenTodayRequest?> {
-  int _n = 0;
-  @override
-  OpenTodayRequest? build() => null;
-  void request(String? date) => state = OpenTodayRequest(date, ++_n);
-}
-
-final openTodayProvider = NotifierProvider<OpenTodayNotifier, OpenTodayRequest?>(
-  OpenTodayNotifier.new,
-);
-
 class SyncStatusNotifier extends Notifier<SyncStatus> {
   @override
   SyncStatus build() => SyncStatus.idle;
@@ -135,8 +116,9 @@ final statsProvider = Provider<Stats>((ref) {
 
 const _defaultPoints = {'chore': 10, 'habit': 15, 'todo': 20};
 
-/// Starter chores from the household schedule. Ids are deterministic (uuid v5) so seeding
-/// on two devices cannot create duplicates.
+/// Generic example chores offered from the empty state and Settings. Ids are deterministic
+/// (uuid v5) so seeding on two devices cannot create duplicates. Weekdays is a bitmask,
+/// bit0 = Monday .. bit6 = Sunday.
 class StarterChore {
   const StarterChore(this.name, this.weekdays, this.time);
   final String name, time;
@@ -144,17 +126,12 @@ class StarterChore {
 }
 
 const starterChores = [
-  StarterChore('Recycling', 1, '17:15'),
-  StarterChore('Worm Food', 4, '16:00'),
-  StarterChore('Put washing in machine', 16, '15:30'),
-  StarterChore('Hang out washing', 16, '16:30'),
-  StarterChore('Clean bathroom', 16, '17:00'),
-  StarterChore('Room clean', 32, '09:30'),
-  StarterChore('Bring in washing', 32, '12:00'),
-  StarterChore('Fold washing', 32, '13:00'),
-  StarterChore('Put washing away', 32, '14:00'),
-  StarterChore('Wash or dry dishes, or cook dinner', 119, '18:30'),
-  StarterChore('Dishes or dinner (early, game night)', 8, '17:30'),
+  StarterChore('Take out the bins', 1, '18:00'),
+  StarterChore('Water the plants', 4, '17:00'),
+  StarterChore('Laundry', 16, '16:00'),
+  StarterChore('Clean the bathroom', 16, '17:00'),
+  StarterChore('Tidy your room', 32, '10:00'),
+  StarterChore('Dishes or cook dinner', 127, '18:30'),
 ];
 
 /// All user actions that change data go through here: write locally, reward, schedule a sync.
@@ -185,36 +162,6 @@ class AppController {
     if (status != SyncStatus.syncing) {
       ref.read(syncStatusProvider.notifier).set(status);
     }
-    if (status == SyncStatus.unpaired) {
-      ref.invalidate(pairedProvider);
-      unawaited(ref.read(pushProvider).register());
-    }
-  }
-
-  /// Sign this phone out: ask the server to revoke the token (best effort, the phone may be
-  /// offline), forget the token and sync cursor, and optionally delete the local data.
-  /// Returns false when the server could not be told, so the caller can say the token may
-  /// still be valid until revoked from the server.
-  Future<bool> signOut({bool wipeLocal = false}) async {
-    final store = ref.read(storeProvider);
-    final token = await store.token;
-    var revoked = true;
-    if (token != null) {
-      try {
-        await ref.read(apiFactoryProvider)(store.serverUrl, token).signOut();
-      } on AuthLost {
-        // Already revoked on the server.
-      } catch (_) {
-        revoked = false;
-      }
-    }
-    await store.clearToken();
-    await store.resetSync();
-    if (wipeLocal) await _db.clearAll();
-    ref.read(syncStatusProvider.notifier).set(SyncStatus.unpaired);
-    ref.invalidate(pairedProvider);
-    unawaited(ref.read(pushProvider).register());
-    return revoked;
   }
 
   Future<void> toggle(ItemRow item, DateTime date, {Offset? at}) async {

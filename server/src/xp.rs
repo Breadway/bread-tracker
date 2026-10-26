@@ -43,7 +43,9 @@ fn parse(d: &str) -> Option<NaiveDate> {
 
 /// A chore or habit is scheduled on `date` when its weekday bit is set.
 fn scheduled_on(item: &Item, date: NaiveDate) -> bool {
-    item.active && (item.kind == "chore" || item.kind == "habit") && item.weekdays & (1 << date.weekday().num_days_from_monday()) != 0
+    item.active
+        && (item.kind == "chore" || item.kind == "habit")
+        && item.weekdays & (1 << date.weekday().num_days_from_monday()) != 0
 }
 
 pub fn compute(items: &[Item], completions: &[Completion], today: NaiveDate) -> Stats {
@@ -131,13 +133,18 @@ mod tests {
 
     #[test]
     fn shared_vectors() {
-        let cases: Vec<Case> = serde_json::from_str(include_str!("../../spec/xp_vectors.json")).unwrap();
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../../spec/xp_vectors.json")).unwrap();
         assert!(!cases.is_empty());
         for c in cases {
             let s = compute(&c.items, &c.completions, parse(&c.today).unwrap());
             assert_eq!(s.xp, c.expect.xp, "{}: xp", c.name);
             assert_eq!(s.level, c.expect.level, "{}: level", c.name);
-            assert_eq!(s.perfect_days, c.expect.perfect_days, "{}: perfect days", c.name);
+            assert_eq!(
+                s.perfect_days, c.expect.perfect_days,
+                "{}: perfect days",
+                c.name
+            );
             assert_eq!(s.streaks, c.expect.streaks, "{}: streaks", c.name);
         }
     }

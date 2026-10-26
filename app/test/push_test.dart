@@ -5,7 +5,6 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:tracker/data/api.dart';
 import 'package:tracker/data/store.dart';
 import 'package:tracker/push.dart';
-import 'package:tracker/reminders.dart';
 
 class MemoryStore extends Store {
   MemoryStore(super.prefs);
@@ -35,8 +34,6 @@ class FakeDevice implements PushDevice {
   Future<String?> token() async => registration;
   @override
   Stream<String> get tokens => events.stream;
-  @override
-  Stream<ReminderPayload> get taps => const Stream.empty();
   @override
   void dispose() => unawaited(events.close());
 }

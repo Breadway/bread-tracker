@@ -179,7 +179,7 @@ async fn existing_database_migrates_and_the_admin_owns_everything() {
         count(&pool, "SELECT val FROM meta WHERE key = 'seq'").await,
         5
     );
-    let tz: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'timezone'")
+    let tz: String = sqlx::query_scalar("SELECT timezone FROM user_settings WHERE user_id = 1")
         .fetch_one(&pool)
         .await
         .unwrap();

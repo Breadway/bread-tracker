@@ -38,17 +38,19 @@ sqlite3 /tmp/restored.db 'select count(*) from items;'
 ## Upgrading an existing single-user deployment to the multi-user schema
 
 This release adds migrations `0002_users.sql`, `0005_users_forward_repair.sql` and
-`0006_users_name_key_guard.sql`, applied automatically at server start, each in its own
+`0006_users_name_key_guard.sql` and `0007_user_settings.sql`, applied automatically at server start, each in its own
 transaction. 0002 adds a `users` table, gives all existing data to the first user (the admin)
 and rebuilds `items`, `completions`, `devices`, `reminders_sent` and `pairing_codes` with a
 `user_id`. 0005 restores the scheduler indexes the rebuild drops and adds a name key. 0006
 tightens the name-key guard. Phones keep working without an app update: the sync API did not
 change.
 
-**This release is not multi-user yet.** Only the first user's devices can authenticate, all
-routes read that user's data, and the background reminder scheduler serves that user alone.
-Do not create other users until the per-user routing, settings and scheduling changes are
-released. See "Users and migrations" in DESIGN.md.
+**This source branch is not a deployment approval.** Routes, reminder settings and scheduler
+are per-user here, but the upstream candidates and the rest of the multi-user stack still need
+integration and independent acceptance. Migration 0007 adopts existing admin preferences.
+Old experimental settings003 ledgers are deliberately unsupported: preserve the old file and
+create a new empty path ONLY for a positively identified task-owned disposable experiment.
+Never modify its ledger, recreate production, or remove reviewer evidence. See DESIGN.md.
 
 ### What can and cannot be undone
 
@@ -105,10 +107,10 @@ step 2 and step 4 and phones retry on their own.
    Do not start the containers again until step 4. Verify the copy itself. It must open,
    pass `integrity_check` and `foreign_key_check`, have a valid migration ledger (every
    migration recorded once and successful, with the checksum of the shipped file), and record
-   only migrations this release supports (`1`, `2`, `3`, `5`, `6`):
+   only migrations this release supports (`1`, `2`, `3`, `5`, `6`, `7`):
 
    ```sh
-   python3 scripts/db-evidence.py check "$COPY/bread-tracker.db" --ledger-subset 1,2,3,5,6
+   python3 scripts/db-evidence.py check "$COPY/bread-tracker.db" --ledger-subset 1,2,3,5,6,7
    ```
 
    It prints the evidence (row counts, `meta.seq`, the migration ledger, a digest of every
@@ -157,7 +159,7 @@ step 2 and step 4 and phones retry on their own.
    is called `admin` and can still be named by a later start. A name another user already
    holds stops startup with a message.
 
-   This release ships migrations `1`, `2`, `3`, `5` and `6` only. A database that has already
+   This release ships migrations `1`, `2`, `3`, `5`, `6` and `7` only. A database that has already
    recorded `4` (the durable pairing limiter, PR31) is refused at start with a missing
    migration error and is not served. Supporting `4` needs a separately accepted PR31 that is
    integrated with this change so its migration and runtime ship together; this release does
@@ -171,7 +173,7 @@ step 2 and step 4 and phones retry on their own.
    WORK=$(mktemp -d)
    docker run --rm --user "$(id -u):$(id -g)" -v "$BACKUP_DIR":/b:ro -v "$WORK":/o \
      litestream/litestream:0.3.13 restore -o /o/replica.db file:///b/litestream
-   python3 scripts/db-evidence.py check "$WORK/replica.db" --ledger-exact 1,2,3,5,6
+   python3 scripts/db-evidence.py check "$WORK/replica.db" --ledger-exact 1,2,3,5,6,7
    ```
 
    Expect `CHECK PASSED` and the same counts for `items`, `completions`, `devices`,

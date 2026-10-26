@@ -103,11 +103,28 @@ class SettingsScreen extends ConsumerWidget {
                   builder: (_) => const _SignOutDialog(),
                 );
                 if (choice == null) return;
+                var ownerGeneration = ctl.currentAuthGeneration;
+                var ownerStoreGeneration = store.authGeneration;
+                final ownerServer = store.serverUrl;
                 Future<void> finishSignOut() async {
+                  if (ctl.currentAuthGeneration != ownerGeneration ||
+                      store.authGeneration != ownerStoreGeneration ||
+                      store.serverUrl != ownerServer) {
+                    return;
+                  }
                   try {
-                    final revoked = await ctl.signOut(
+                    final pending = ctl.signOut(
                       wipeLocal: choice == _SignOut.wipe,
+                      expectedAuthGeneration: ownerGeneration,
+                      expectedStoreGeneration: ownerStoreGeneration,
+                      expectedServer: ownerServer,
                     );
+                    // signOut claims ownership synchronously before its first
+                    // await. Retain that attempt's identity, not the identity
+                    // that happens to exist when a later failure is handled.
+                    ownerGeneration = ctl.currentAuthGeneration;
+                    ownerStoreGeneration = store.authGeneration;
+                    final revoked = await pending;
                     toast(
                       revoked
                           ? 'Signed out'
@@ -116,6 +133,11 @@ class SettingsScreen extends ConsumerWidget {
                     );
                   } catch (_) {
                     if (!context.mounted) return;
+                    if (ctl.currentAuthGeneration != ownerGeneration ||
+                        store.authGeneration != ownerStoreGeneration ||
+                        store.serverUrl != ownerServer) {
+                      return;
+                    }
                     ScaffoldMessenger.of(context).showSnackBar(
                       SnackBar(
                         content: const Text(

@@ -239,10 +239,22 @@ class AppController {
   /// offline), forget the token and sync cursor, and optionally delete the local data.
   /// Returns false when the server could not be told, so the caller can say the token may
   /// still be valid until revoked from the server.
-  Future<bool> signOut({bool wipeLocal = false}) async {
+  Future<bool> signOut({
+    bool wipeLocal = false,
+    int? expectedAuthGeneration,
+    int? expectedStoreGeneration,
+    String? expectedServer,
+  }) async {
     final pendingWipe = _wipeCommitCompletion;
     if (pendingWipe != null) await pendingWipe.future;
     final store = ref.read(storeProvider);
+    if ((expectedAuthGeneration != null &&
+            _authGeneration != expectedAuthGeneration) ||
+        (expectedStoreGeneration != null &&
+            store.authGeneration != expectedStoreGeneration) ||
+        (expectedServer != null && store.serverUrl != expectedServer)) {
+      return false;
+    }
     store.claimAuthGeneration();
     final storeGeneration = store.authGeneration;
     final wipeRecoveryRetry = !wipeLocal && _wipeCommitFailed;

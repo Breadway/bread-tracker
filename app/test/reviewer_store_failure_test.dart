@@ -225,12 +225,13 @@ void main() {
     'cancel',
     'delete-throw',
     'delete-noop',
+    'delete-stale-retry',
   ]) {
     testWidgets('real Settings sign-out confirmation: $choice', (tester) async {
       SharedPreferences.setMockInitialValues({'server': 'https://old.invalid'});
       final deletionFailure = choice.startsWith('delete-');
       FlutterSecureStoragePlatform.instance = deletionFailure
-          ? FailDeleteOnce(noOp: choice == 'delete-noop')
+          ? FailDeleteOnce(noOp: choice != 'delete-throw')
           : TestFlutterSecureStoragePlatform({'token': 'existing-token'});
       final prefs = await SharedPreferences.getInstance();
       final store = Store(prefs);
@@ -282,7 +283,9 @@ void main() {
       final confirmLabel = switch (choice) {
         'keep' => 'Sign out',
         'wipe' => 'Sign out and delete data',
-        'delete-throw' || 'delete-noop' => 'Sign out and delete data',
+        'delete-throw' ||
+        'delete-noop' ||
+        'delete-stale-retry' => 'Sign out and delete data',
         _ => 'Cancel',
       };
       await tester.tap(find.text(confirmLabel).last);
@@ -300,6 +303,29 @@ void main() {
           await container.read(syncEngineProvider).sync(),
           SyncStatus.unpaired,
         );
+        if (choice == 'delete-stale-retry') {
+          final controller = container.read(controllerProvider);
+          await controller.pairedAgain();
+          final owner = store.pairingOwnership('https://replacement.invalid');
+          await store.persistPairing(
+            owner,
+            'https://replacement.invalid',
+            'new-owner-token',
+          );
+          controller.pairingPersisted();
+          container.read(pairedStateRevisionProvider.notifier).refresh();
+          expect(await container.read(pairedProvider.future), isTrue);
+          await tester.pumpAndSettle();
+          final requestsBeforeRetry = requests.length;
+          await tester.tap(find.text('Retry'));
+          await tester.pumpAndSettle();
+          expect(tester.takeException(), isNull);
+          expect(requests.length, requestsBeforeRetry);
+          expect(await store.token, 'new-owner-token');
+          expect(await container.read(pairedProvider.future), isTrue);
+          expect(await db.select(db.items).get(), hasLength(1));
+          return;
+        }
         await tester.tap(find.text('Retry'));
         await tester.pump();
         await tester.runAsync(() async {

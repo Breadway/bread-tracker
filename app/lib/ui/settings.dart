@@ -103,15 +103,57 @@ class SettingsScreen extends ConsumerWidget {
                   builder: (_) => const _SignOutDialog(),
                 );
                 if (choice == null) return;
-                final revoked = await ctl.signOut(
-                  wipeLocal: choice == _SignOut.wipe,
-                );
-                toast(
-                  revoked
-                      ? 'Signed out'
-                      : 'Signed out here, but the server could not be reached. '
-                            'Revoke this device from the server to be sure.',
-                );
+                var ownerGeneration = ctl.currentAuthGeneration;
+                var ownerStoreGeneration = store.authGeneration;
+                final ownerServer = store.serverUrl;
+                Future<void> finishSignOut() async {
+                  if (ctl.currentAuthGeneration != ownerGeneration ||
+                      store.authGeneration != ownerStoreGeneration ||
+                      store.serverUrl != ownerServer) {
+                    return;
+                  }
+                  try {
+                    final pending = ctl.signOut(
+                      wipeLocal: choice == _SignOut.wipe,
+                      expectedAuthGeneration: ownerGeneration,
+                      expectedStoreGeneration: ownerStoreGeneration,
+                      expectedServer: ownerServer,
+                    );
+                    // signOut claims ownership synchronously before its first
+                    // await. Retain that attempt's identity, not the identity
+                    // that happens to exist when a later failure is handled.
+                    ownerGeneration = ctl.currentAuthGeneration;
+                    ownerStoreGeneration = store.authGeneration;
+                    final revoked = await pending;
+                    toast(
+                      revoked
+                          ? 'Signed out'
+                          : 'Signed out here, but the server could not be reached. '
+                                'Revoke this device from the server to be sure.',
+                    );
+                  } catch (_) {
+                    if (!context.mounted) return;
+                    if (ctl.currentAuthGeneration != ownerGeneration ||
+                        store.authGeneration != ownerStoreGeneration ||
+                        store.serverUrl != ownerServer) {
+                      return;
+                    }
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: const Text(
+                          'Sign-out cleanup failed on this phone. '
+                          'Sync is paused. Retry local cleanup.',
+                        ),
+                        action: SnackBarAction(
+                          label: 'Retry',
+                          onPressed: finishSignOut,
+                        ),
+                      ),
+                    );
+                  }
+                }
+
+                await finishSignOut();
               },
             ),
           const SectionHeader('Your list'),
@@ -126,9 +168,8 @@ class SettingsScreen extends ConsumerWidget {
           const Spacer8(),
           PanelButton(
             icon: Icons.playlist_add_rounded,
-            title: 'Add starter chores',
-            subtitle:
-                'The weekly household schedule, skipping any already added',
+            title: 'Add example chores',
+            subtitle: 'A few generic weekly chores, skipping any already added',
             onTap: () async =>
                 toast('Added ${await ctl.addStarterChores()} chores'),
           ),
@@ -145,9 +186,20 @@ class SettingsScreen extends ConsumerWidget {
                       title: const Text('Sound effects'),
                       value: sfx.sound,
                       onChanged: (v) async {
-                        sfx.sound = v;
-                        await store.setSound(v);
-                        set(() {});
+                        try {
+                          await store.setSound(v);
+                          sfx.sound = v;
+                          set(() {});
+                        } catch (error) {
+                          if (!context.mounted) return;
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                'Could not save sound preference: $error',
+                              ),
+                            ),
+                          );
+                        }
                       },
                     ),
                   ),
@@ -157,9 +209,20 @@ class SettingsScreen extends ConsumerWidget {
                       title: const Text('Vibration'),
                       value: sfx.haptics,
                       onChanged: (v) async {
-                        sfx.haptics = v;
-                        await store.setHaptics(v);
-                        set(() {});
+                        try {
+                          await store.setHaptics(v);
+                          sfx.haptics = v;
+                          set(() {});
+                        } catch (error) {
+                          if (!context.mounted) return;
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                'Could not save vibration preference: $error',
+                              ),
+                            ),
+                          );
+                        }
                       },
                     ),
                   ),
@@ -193,8 +256,14 @@ class SettingsScreen extends ConsumerWidget {
             title: 'Send a test notification',
             subtitle: 'Checks that the server can reach this phone',
             onTap: () async {
-              final token = await store.token;
-              if (token == null) return toast('Pair with the server first.');
+              final generation = store.authGeneration;
+              final server = store.serverUrl;
+              final token = await store.readTokenForGeneration(generation);
+              if (token == null ||
+                  store.authGeneration != generation ||
+                  store.serverUrl != server) {
+                return toast('Pair with the server first.');
+              }
               try {
                 final push = ref.read(pushProvider);
                 await push.register(requestPermission: true);
@@ -202,11 +271,19 @@ class SettingsScreen extends ConsumerWidget {
                   toast('Enable notifications and register this phone first.');
                   return;
                 }
-                await Api(store.serverUrl, token: token).pushTest();
+                await ref.read(apiFactoryProvider)(server, token).pushTest();
                 toast('Sent. It should arrive in a moment.');
               } on ApiException catch (e) {
                 toast(e.message);
               } on AuthLost catch (e) {
+                if (await store.clearTokenIfCurrentForGeneration(
+                  token,
+                  generation,
+                  expectedServer: server,
+                )) {
+                  ref.read(pairedStateRevisionProvider.notifier).refresh();
+                  await ref.read(pushProvider).register();
+                }
                 toast(e.toString());
               }
             },

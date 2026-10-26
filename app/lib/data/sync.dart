@@ -10,19 +10,38 @@ class SyncEngine {
   SyncEngine(
     this.db,
     this.store, {
-    Api Function(String base, String? token)? apiFactory,
+    Api Function(String base, String token)? apiFactory,
   }) : _apiFactory = apiFactory ?? ((b, t) => Api(b, token: t));
   final AppDb db;
   final Store store;
-  final Api Function(String, String?) _apiFactory;
+  final Api Function(String, String) _apiFactory;
   bool _running = false;
   bool _again = false;
+  int _generation = 0;
+  bool _invalidated = false;
+  String? _token;
+  String? _server;
+
+  void invalidate() {
+    _generation++;
+    _invalidated = true;
+    _again = false;
+  }
+
+  void revalidate() {
+    _generation++;
+    _invalidated = false;
+  }
+
+  /// Close new sync admission while sign-out owns local cleanup.
+  void beginSignOut() => invalidate();
 
   /// Push dirty rows, pull everything newer than the cursor. Safe to call often;
   /// overlapping calls collapse into one follow-up pass.
   Future<SyncStatus> sync() async {
+    if (_invalidated) return SyncStatus.unpaired;
     if (_running) {
-      _again = true;
+      if (!_invalidated) _again = true;
       return SyncStatus.syncing;
     }
     _running = true;
@@ -35,13 +54,26 @@ class SyncEngine {
       return status;
     } finally {
       _running = false;
+      if (_invalidated) _again = false;
     }
   }
 
-  Future<SyncStatus> _once({bool afterReset = false}) async {
-    final token = await store.token;
+  Future<SyncStatus> _once() async {
+    if (_invalidated) return SyncStatus.unpaired;
+    final storeGeneration = store.authGeneration;
+    final token = await store.readTokenForGeneration(storeGeneration);
+    if (_invalidated || store.authGeneration != storeGeneration) {
+      return SyncStatus.unpaired;
+    }
     if (token == null) return SyncStatus.unpaired;
-    final api = _apiFactory(store.serverUrl, token);
+    if (_token != null && (_token != token || _server != store.serverUrl)) {
+      _generation++;
+    }
+    _token = token;
+    final generation = _generation;
+    final server = store.serverUrl;
+    _server = server;
+    final api = _apiFactory(server, token);
 
     final dirtyItems = await (db.select(
       db.items,
@@ -60,29 +92,38 @@ class SyncEngine {
     } on AuthLost {
       // The server no longer knows this token (device revoked). Forget it instead of
       // retrying a dead credential forever; local data is kept for the next pairing.
-      await store.clearToken();
+      if (generation == _generation &&
+          !_invalidated &&
+          await store.clearTokenIfCurrentForGeneration(
+            token,
+            storeGeneration,
+            expectedServer: server,
+          )) {
+        _invalidated = true;
+        _generation++;
+        return SyncStatus.unpaired;
+      }
       return SyncStatus.unpaired;
     } on ApiException {
       return SyncStatus.offline;
     }
 
-    // The cursor only means something against the database it came from. If the server is a
-    // different database (new epoch), or went backwards (restored from an older copy), the
-    // phone's cursor is meaningless and the server may be missing rows the phone has. Start
-    // over: cursor 0 and push everything (last write wins makes that safe).
-    final epoch = res['epoch'] as String?;
-    final serverCursor = res['cursor'] as int;
-    final known = store.epoch;
-    final changed = (epoch != null && known != null && epoch != known) || serverCursor < store.cursor;
-    if (changed && !afterReset) {
-      await store.resetSync();
-      await db.markAllDirty();
-      if (epoch != null) await store.setEpoch(epoch);
-      return _once(afterReset: true);
+    if (generation != _generation ||
+        _invalidated ||
+        store.authGeneration != storeGeneration ||
+        store.serverUrl != server) {
+      return SyncStatus.unpaired;
     }
-    if (epoch != null && known == null) await store.setEpoch(epoch);
-
+    final cursor = res['cursor'] as int;
     await db.transaction(() async {
+      // Re-check inside the same database write transaction used for applying the
+      // response. Sign-out performs its local wipe in a database transaction too.
+      if (generation != _generation ||
+          _invalidated ||
+          store.authGeneration != storeGeneration ||
+          store.serverUrl != server) {
+        return;
+      }
       // Rows unchanged since we pushed them are now clean.
       for (final i in dirtyItems) {
         await (db.update(db.items)..where(
@@ -126,7 +167,22 @@ class SyncEngine {
         await db.into(db.completions).insertOnConflictUpdate(_compCompanion(j));
       }
     });
-    await store.setCursor(res['cursor'] as int);
+    if (generation != _generation ||
+        _invalidated ||
+        store.authGeneration != storeGeneration ||
+        store.serverUrl != server) {
+      return SyncStatus.unpaired;
+    }
+    await store.setCursorIfGeneration(
+      cursor,
+      storeGeneration,
+      expectedServer: server,
+    );
+    if (generation != _generation ||
+        _invalidated ||
+        store.authGeneration != storeGeneration) {
+      return SyncStatus.unpaired;
+    }
     return SyncStatus.idle;
   }
 

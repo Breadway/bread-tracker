@@ -313,10 +313,16 @@ class Store {
         return;
       }
       await _secure.delete(key: 'token');
+      final remaining = await _secure.read(key: 'token');
       if (_credentialEpoch != expectedEpoch ||
           _authGeneration != generation ||
           serverUrl != server) {
         return;
+      }
+      if (remaining != null) {
+        throw StateError(
+          'Secure credential was not removed. Local data was kept.',
+        );
       }
       await action();
       ran =

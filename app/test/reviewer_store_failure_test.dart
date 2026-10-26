@@ -21,6 +21,25 @@ import 'package:tracker/push.dart';
 import 'package:tracker/data/api.dart';
 import 'package:tracker/ui/settings.dart';
 
+class FailDeleteOnce extends TestFlutterSecureStoragePlatform {
+  FailDeleteOnce({required this.noOp}) : super({'token': 'existing-token'});
+  final bool noOp;
+  bool failed = false;
+
+  @override
+  Future<void> delete({
+    required String key,
+    required Map<String, String> options,
+  }) async {
+    if (!failed) {
+      failed = true;
+      if (noOp) return;
+      throw StateError('injected credential deletion failure');
+    }
+    await super.delete(key: key, options: options);
+  }
+}
+
 class FailWrite extends TestFlutterSecureStoragePlatform {
   FailWrite() : super({'token': 'existing-token'});
   bool armed = true;
@@ -200,12 +219,19 @@ void main() {
     },
   );
 
-  for (final choice in ['keep', 'wipe', 'cancel']) {
+  for (final choice in [
+    'keep',
+    'wipe',
+    'cancel',
+    'delete-throw',
+    'delete-noop',
+  ]) {
     testWidgets('real Settings sign-out confirmation: $choice', (tester) async {
       SharedPreferences.setMockInitialValues({'server': 'https://old.invalid'});
-      FlutterSecureStoragePlatform.instance = TestFlutterSecureStoragePlatform({
-        'token': 'existing-token',
-      });
+      final deletionFailure = choice.startsWith('delete-');
+      FlutterSecureStoragePlatform.instance = deletionFailure
+          ? FailDeleteOnce(noOp: choice == 'delete-noop')
+          : TestFlutterSecureStoragePlatform({'token': 'existing-token'});
       final prefs = await SharedPreferences.getInstance();
       final store = Store(prefs);
       final db = AppDb(NativeDatabase.memory());
@@ -256,6 +282,7 @@ void main() {
       final confirmLabel = switch (choice) {
         'keep' => 'Sign out',
         'wipe' => 'Sign out and delete data',
+        'delete-throw' || 'delete-noop' => 'Sign out and delete data',
         _ => 'Cancel',
       };
       await tester.tap(find.text(confirmLabel).last);
@@ -265,6 +292,26 @@ void main() {
       });
       await tester.pumpAndSettle();
       expect(tester.takeException(), isNull);
+      if (deletionFailure) {
+        expect(await store.token, 'existing-token');
+        expect(await db.select(db.items).get(), hasLength(1));
+        expect(find.textContaining('Sign-out cleanup failed'), findsOneWidget);
+        expect(
+          await container.read(syncEngineProvider).sync(),
+          SyncStatus.unpaired,
+        );
+        await tester.tap(find.text('Retry'));
+        await tester.pump();
+        await tester.runAsync(() async {
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+        });
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull);
+        expect(await store.token, isNull);
+        expect(await container.read(pairedProvider.future), isFalse);
+        expect(await db.select(db.items).get(), isEmpty);
+        return;
+      }
       if (choice == 'cancel') {
         expect(requests, isNot(contains('DELETE /device')));
         expect(await store.token, 'existing-token');

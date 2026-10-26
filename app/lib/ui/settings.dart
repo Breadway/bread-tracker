@@ -103,15 +103,35 @@ class SettingsScreen extends ConsumerWidget {
                   builder: (_) => const _SignOutDialog(),
                 );
                 if (choice == null) return;
-                final revoked = await ctl.signOut(
-                  wipeLocal: choice == _SignOut.wipe,
-                );
-                toast(
-                  revoked
-                      ? 'Signed out'
-                      : 'Signed out here, but the server could not be reached. '
-                            'Revoke this device from the server to be sure.',
-                );
+                Future<void> finishSignOut() async {
+                  try {
+                    final revoked = await ctl.signOut(
+                      wipeLocal: choice == _SignOut.wipe,
+                    );
+                    toast(
+                      revoked
+                          ? 'Signed out'
+                          : 'Signed out here, but the server could not be reached. '
+                                'Revoke this device from the server to be sure.',
+                    );
+                  } catch (_) {
+                    if (!context.mounted) return;
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: const Text(
+                          'Sign-out cleanup failed on this phone. '
+                          'Sync is paused. Retry local cleanup.',
+                        ),
+                        action: SnackBarAction(
+                          label: 'Retry',
+                          onPressed: finishSignOut,
+                        ),
+                      ),
+                    );
+                  }
+                }
+
+                await finishSignOut();
               },
             ),
           const SectionHeader('Your list'),

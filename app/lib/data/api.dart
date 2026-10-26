@@ -151,4 +151,6 @@ class Api {
 
   /// Ask the server to revoke this device's token.
   Future<void> signOut() => _send('DELETE', '/device');
+
+  Future<Map<String, dynamic>> createPairCode() => _send('POST', '/pair-code');
 }

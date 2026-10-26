@@ -654,7 +654,8 @@ async fn a_failed_0005_keeps_the_0002_result_and_a_retry_completes_the_repair() 
 #[tokio::test]
 async fn sync_pull_searches_the_per_user_sequence_indexes() {
     let pool = db::connect_memory().await.unwrap();
-    let plans = bread_tracker_server::store::pull_query_plans(&pool)
+    let plans = bread_tracker_server::store::UserDb::new(&pool, 1)
+        .pull_query_plans()
         .await
         .unwrap();
     let joined = plans.join(" | ");

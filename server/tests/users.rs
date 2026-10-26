@@ -423,15 +423,17 @@ async fn expired_and_unknown_codes_change_nothing() {
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM devices").await, 0);
 }
 
-// ---- no partial multi-user exposure ----
+// ---- per-user scoping replaces the interim single-owner boundary ----
 
 #[tokio::test]
-async fn a_second_users_device_and_data_are_not_served_before_scoping_exists() {
+async fn each_users_device_sees_only_its_own_rows() {
     let pool = db::connect_memory().await.unwrap();
     let sam = users::create(&pool, "Sam", false).await.unwrap();
-    sqlx::query("INSERT INTO items (user_id, id, kind, name, points, updated_at, seq) VALUES (?, '11111111-1111-4111-8111-111111111111', 'chore', 'SAM PRIVATE', 10, 1, 1)")
-        .bind(sam).execute(&pool).await.unwrap();
-    sqlx::query("UPDATE meta SET val = 1 WHERE key = 'seq'")
+    for (uid, name) in [(1_i64, "ADMIN PRIVATE"), (sam, "SAM PRIVATE")] {
+        sqlx::query("INSERT INTO items (user_id, id, kind, name, points, updated_at, seq) VALUES (?, '11111111-1111-4111-8111-111111111111', 'chore', ?, 10, 1, ?)")
+            .bind(uid).bind(name).bind(uid).execute(&pool).await.unwrap();
+    }
+    sqlx::query("UPDATE meta SET val = 2 WHERE key = 'seq'")
         .execute(&pool)
         .await
         .unwrap();
@@ -448,33 +450,39 @@ async fn a_second_users_device_and_data_are_not_served_before_scoping_exists() {
         Config::from_env(),
         Arc::new(MockSender::default()),
     ));
-    let get = |token: &str| {
-        Request::builder()
-            .uri("/sync?since=0")
-            .header("authorization", format!("Bearer {token}"))
-            .body(Body::empty())
-            .unwrap()
+    let pull = |token: String| {
+        let app = app.clone();
+        async move {
+            let req = Request::builder()
+                .uri("/sync?since=0")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = http_body_util::BodyExt::collect(resp.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            String::from_utf8_lossy(&body).to_string()
+        }
     };
-    // The admin never sees Sam's row (pull is bound to the first user)...
-    let resp = app.clone().oneshot(get(&admin_token)).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = http_body_util::BodyExt::collect(resp.into_body())
-        .await
-        .unwrap()
-        .to_bytes();
-    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(v["items"].as_array().unwrap().len(), 0, "{v}");
-    assert!(!String::from_utf8_lossy(&body).contains("SAM PRIVATE"));
-    // ...and Sam's own device is refused outright until the scoping change gives Sam a view.
-    let resp = app.oneshot(get("sam-token")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let admin = pull(admin_token).await;
+    assert!(
+        admin.contains("ADMIN PRIVATE") && !admin.contains("SAM PRIVATE"),
+        "{admin}"
+    );
+    let sam_view = pull("sam-token".into()).await;
+    assert!(
+        sam_view.contains("SAM PRIVATE") && !sam_view.contains("ADMIN PRIVATE"),
+        "{sam_view}"
+    );
 }
-
-// ---- TRACK-89: the background scheduler is single owner (no cross-owner delivery) ----
 
 mod scheduler_boundary {
     use super::*;
     use bread_tracker_server::push;
+    use bread_tracker_server::store::UserDb;
     use chrono::{TimeZone, Utc};
 
     async fn two_owners_two_devices(pool: &SqlitePool) -> i64 {
@@ -503,69 +511,94 @@ mod scheduler_boundary {
         Utc.with_ymd_and_hms(2026, 10, 25, 10, 30, 0).unwrap()
     }
 
+    /// (token, title) of every delivery, sorted.
+    fn deliveries(mock: &push::MockSender) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = mock
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| (m.token.clone(), m.title.clone()))
+            .collect();
+        v.sort();
+        v
+    }
+
     #[tokio::test]
-    async fn two_owners_two_devices_produce_exactly_one_private_delivery() {
+    async fn two_owners_two_devices_each_get_only_their_own_private_reminder() {
         let pool = db::connect_memory().await.unwrap();
-        two_owners_two_devices(&pool).await;
+        let sam = two_owners_two_devices(&pool).await;
         let (st, mock) = state(&pool);
-        let n = push::tick(&st, at_1830()).await.unwrap();
-        let sent = mock.sent.lock().unwrap().clone();
-        assert_eq!(n, 1);
-        assert_eq!(sent.len(), 1, "{sent:?}");
-        assert_eq!(sent[0].title, "ADMIN PRIVATE");
-        assert_eq!(sent[0].token, "fcm1", "only the owner's device");
-        let all = format!("{sent:?}");
-        assert!(!all.contains("SAM PRIVATE") && !all.contains("sam-item") && !all.contains("fcm2"));
-        // The marker is the owner's alone.
-        let markers: Vec<(i64, String)> =
+        assert_eq!(push::tick(&st, at_1830()).await.unwrap(), 2);
+        assert_eq!(
+            deliveries(&mock),
+            vec![
+                ("fcm1".to_string(), "ADMIN PRIVATE".to_string()),
+                (format!("fcm{sam}"), "SAM PRIVATE".to_string()),
+            ],
+            "exactly one message per owner, to that owner's device only"
+        );
+        let mut markers: Vec<(i64, String)> =
             sqlx::query_as("SELECT user_id, item_id FROM reminders_sent")
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(markers, vec![(1, "admin-item".to_string())]);
+        markers.sort();
+        assert_eq!(
+            markers,
+            vec![(1, "admin-item".to_string()), (sam, "sam-item".to_string())]
+        );
+        // A second pass sends nothing: each marker is per owner.
+        assert_eq!(push::tick(&st, at_1830()).await.unwrap(), 0);
     }
 
     #[tokio::test]
-    async fn a_second_owner_with_a_device_alone_gets_no_background_work() {
-        // New user, no admin device: nothing is sent to anyone and nothing is marked.
+    async fn a_user_without_a_device_does_not_consume_or_leak_anothers_reminder() {
         let pool = db::connect_memory().await.unwrap();
-        two_owners_two_devices(&pool).await;
+        let sam = two_owners_two_devices(&pool).await;
         sqlx::query("DELETE FROM devices WHERE user_id = 1")
             .execute(&pool)
             .await
             .unwrap();
         let (st, mock) = state(&pool);
-        assert_eq!(push::tick(&st, at_1830()).await.unwrap(), 0);
-        assert!(mock.sent.lock().unwrap().is_empty());
-        assert_eq!(count(&pool, "SELECT COUNT(*) FROM reminders_sent").await, 0);
+        assert_eq!(push::tick(&st, at_1830()).await.unwrap(), 1);
+        assert_eq!(
+            deliveries(&mock),
+            vec![(format!("fcm{sam}"), "SAM PRIVATE".to_string())]
+        );
+        // The admin's reminder is still unsent, so it goes out once a device registers.
+        let markers: Vec<i64> = sqlx::query_scalar("SELECT user_id FROM reminders_sent")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(markers, vec![sam]);
     }
 
     #[tokio::test]
-    async fn another_owners_completion_does_not_suppress_the_admin_reminder() {
+    async fn another_owners_completion_does_not_suppress_the_reminder() {
         let pool = db::connect_memory().await.unwrap();
         let sam = users::create(&pool, "Sam", false).await.unwrap();
         sqlx::query("INSERT INTO items (user_id, id, kind, name, points, weekdays, remind_time, updated_at, seq) VALUES (1, 'shared', 'chore', 'ADMIN PRIVATE', 10, 127, '18:30', 1, 1)")
             .execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO devices (id, user_id, name, token_hash, fcm_token, created_at, last_seen) VALUES ('d1', 1, 'phone', 'h1', 'fcm1', 1, 1)")
             .execute(&pool).await.unwrap();
-        // Sam holds the same item id and has completed it today.
         sqlx::query("INSERT INTO completions (user_id, item_id, date, completed_at, updated_at, seq) VALUES (?, 'shared', '2026-10-25', 1, 1, 2)")
             .bind(sam).execute(&pool).await.unwrap();
-        assert!(bread_tracker_server::store::reminder_completions(
-            &pool,
-            "2026-10-25",
-            "2026-10-24"
-        )
-        .await
-        .unwrap()
-        .is_empty());
+        assert!(UserDb::new(&pool, 1)
+            .reminder_completions("2026-10-25", "2026-10-24")
+            .await
+            .unwrap()
+            .is_empty());
         let (st, mock) = state(&pool);
         assert_eq!(push::tick(&st, at_1830()).await.unwrap(), 1);
-        assert_eq!(mock.sent.lock().unwrap()[0].title, "ADMIN PRIVATE");
+        assert_eq!(
+            deliveries(&mock),
+            vec![("fcm1".to_string(), "ADMIN PRIVATE".to_string())]
+        );
     }
 
     #[tokio::test]
-    async fn another_owners_todo_and_sent_marker_stay_out_of_the_admin_view() {
+    async fn another_owners_todo_completion_and_sent_marker_stay_out_of_each_view() {
         let pool = db::connect_memory().await.unwrap();
         let sam = users::create(&pool, "Sam", false).await.unwrap();
         for uid in [1_i64, sam] {
@@ -576,33 +609,41 @@ mod scheduler_boundary {
             .bind(sam).execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO reminders_sent (user_id, item_id, date, sent_at) VALUES (?, 'todo-1', '2026-10-25', 1)")
             .bind(sam).execute(&pool).await.unwrap();
-        assert!(bread_tracker_server::store::reminder_completions(
-            &pool,
-            "2026-10-25",
-            "2026-10-24"
-        )
-        .await
-        .unwrap()
-        .is_empty());
-        assert!(
-            bread_tracker_server::store::sent_reminders(&pool, "2026-10-25", "2026-10-24")
+        let admin = UserDb::new(&pool, 1);
+        let other = UserDb::new(&pool, sam);
+        assert!(admin
+            .reminder_completions("2026-10-25", "2026-10-24")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(admin
+            .sent_reminders("2026-10-25", "2026-10-24")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            other
+                .reminder_completions("2026-10-25", "2026-10-24")
                 .await
                 .unwrap()
-                .is_empty()
+                .len(),
+            1
         );
-        let devs = bread_tracker_server::store::reminder_devices(&pool)
-            .await
-            .unwrap();
-        assert!(
-            devs.is_empty(),
-            "no admin device, and Sam's is never a destination"
+        assert_eq!(
+            other
+                .sent_reminders("2026-10-25", "2026-10-24")
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 
     #[tokio::test]
     async fn scheduler_item_selection_still_uses_the_restored_partial_index() {
         let pool = db::connect_memory().await.unwrap();
-        let plan = bread_tracker_server::store::reminder_items_query_plan(&pool)
+        let plan = UserDb::new(&pool, 1)
+            .reminder_items_query_plan()
             .await
             .unwrap();
         assert!(

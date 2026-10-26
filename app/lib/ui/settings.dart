@@ -239,7 +239,7 @@ class SettingsScreen extends ConsumerWidget {
                   generation,
                   expectedServer: server,
                 )) {
-                  ref.invalidate(pairedProvider);
+                  ref.read(pairedStateRevisionProvider.notifier).refresh();
                   await ref.read(pushProvider).register();
                 }
                 toast(e.toString());

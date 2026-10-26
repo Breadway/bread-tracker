@@ -7,7 +7,6 @@ import 'data/store.dart';
 import 'fx/sfx.dart';
 import 'push.dart';
 import 'state.dart';
-import 'ui/pair.dart' show pairedProvider;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -20,7 +19,8 @@ Future<void> main() async {
   late final ProviderContainer container;
   final push = FcmPushService(
     store,
-    onAuthLost: () => container.invalidate(pairedProvider),
+    onAuthLost: () =>
+        container.read(pairedStateRevisionProvider.notifier).refresh(),
   );
   container = createAppContainer(
     prefs: prefs,

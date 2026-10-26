@@ -16,7 +16,6 @@ import 'fx/sfx.dart';
 import 'push.dart';
 import 'rules.dart';
 import 'theme.dart';
-import 'ui/pair.dart' show pairedProvider;
 
 final prefsProvider = Provider<SharedPreferences>(
   (ref) => throw UnimplementedError('override in main'),
@@ -107,6 +106,19 @@ class SyncStatusNotifier extends Notifier<SyncStatus> {
 
 final syncStatusProvider = NotifierProvider<SyncStatusNotifier, SyncStatus>(
   SyncStatusNotifier.new,
+);
+
+/// Revision for consumers of the persisted pairing state. Auth transitions bump
+/// this dependency without coupling the controller to a UI-owned provider.
+class PairedStateRevision extends Notifier<int> {
+  @override
+  int build() => 0;
+
+  void refresh() => state++;
+}
+
+final pairedStateRevisionProvider = NotifierProvider<PairedStateRevision, int>(
+  PairedStateRevision.new,
 );
 
 List<RItem> toRItems(List<ItemRow> rows) => [
@@ -214,14 +226,11 @@ class AppController {
       status = SyncStatus.offline;
     }
     if (generation != _authGeneration || _signedOut) return;
-    if (status == SyncStatus.unpaired) {
-      ref.invalidate(pairedProvider);
-    }
     if (status != SyncStatus.syncing) {
       ref.read(syncStatusProvider.notifier).set(status);
     }
     if (status == SyncStatus.unpaired) {
-      ref.invalidate(pairedProvider);
+      ref.read(pairedStateRevisionProvider.notifier).refresh();
       unawaited(ref.read(pushProvider).register());
     }
   }
@@ -334,7 +343,7 @@ class AppController {
         (_signedOut || wipeRecoveryRetry) &&
         store.credentialEpoch == epoch) {
       ref.read(syncStatusProvider.notifier).set(SyncStatus.unpaired);
-      ref.invalidate(pairedProvider);
+      ref.read(pairedStateRevisionProvider.notifier).refresh();
       unawaited(ref.read(pushProvider).register());
     }
     return revoked;

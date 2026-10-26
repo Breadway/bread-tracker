@@ -3,6 +3,8 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 // ignore_for_file: depend_on_referenced_packages
 import 'package:flutter_secure_storage_platform_interface/flutter_secure_storage_platform_interface.dart';
@@ -11,10 +13,13 @@ import 'package:shared_preferences_platform_interface/shared_preferences_platfor
 import 'package:drift/native.dart';
 import 'package:tracker/data/database.dart';
 import 'package:tracker/data/store.dart';
+import 'package:tracker/data/sync.dart';
 import 'package:tracker/state.dart';
 import 'package:tracker/ui/pair.dart';
 import 'package:tracker/fx/sfx.dart';
 import 'package:tracker/push.dart';
+import 'package:tracker/data/api.dart';
+import 'package:tracker/ui/settings.dart';
 
 class FailWrite extends TestFlutterSecureStoragePlatform {
   FailWrite() : super({'token': 'existing-token'});
@@ -30,6 +35,26 @@ class FailWrite extends TestFlutterSecureStoragePlatform {
       throw StateError('injected secure write failure before mutation');
     }
     await super.write(key: key, value: value, options: options);
+  }
+}
+
+class FailWriteAfterMutation extends TestFlutterSecureStoragePlatform {
+  FailWriteAfterMutation() : super({'token': 'old-token'});
+  var armed = true;
+
+  @override
+  Future<void> write({
+    required String key,
+    required String value,
+    required Map<String, String> options,
+  }) async {
+    if (!armed) {
+      await super.write(key: key, value: value, options: options);
+      return;
+    }
+    armed = false;
+    await super.write(key: key, value: value, options: options);
+    throw StateError('injected secure write failure after mutation');
   }
 }
 
@@ -73,6 +98,39 @@ class FailServerSave extends InMemorySharedPreferencesStore {
   }
 }
 
+class FailPreferenceAfterMutation extends InMemorySharedPreferencesStore {
+  FailPreferenceAfterMutation(this.operation)
+    : super.withData({
+        'flutter.server': 'https://old.invalid',
+        'flutter.cursor': 12,
+      });
+  final String operation;
+  var failed = false;
+
+  @override
+  Future<bool> setValue(String type, String key, Object value) async {
+    final matches =
+        (operation == 'server' && key == 'flutter.server') ||
+        (operation == 'cursor' && key == 'flutter.cursor');
+    if (!failed && matches) {
+      failed = true;
+      await super.setValue(type, key, value);
+      return false;
+    }
+    return super.setValue(type, key, value);
+  }
+
+  @override
+  Future<bool> remove(String key) async {
+    if (!failed && operation == 'remove' && key == 'flutter.cursor') {
+      failed = true;
+      await super.remove(key);
+      return false;
+    }
+    return super.remove(key);
+  }
+}
+
 class FailPreferenceOperation extends InMemorySharedPreferencesStore {
   FailPreferenceOperation(this.operation, {this.throws = false})
     : super.withData({
@@ -106,6 +164,13 @@ class FailPreferenceOperation extends InMemorySharedPreferencesStore {
   }
 }
 
+class _ReadyPushService extends NoPushService {
+  @override
+  Future<void> register({bool requestPermission = false}) async {
+    status.value = PushStatus.ready;
+  }
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   test(
@@ -135,47 +200,90 @@ void main() {
     },
   );
 
-  testWidgets('installed token can reach the real Settings sign-out control', (
-    tester,
-  ) async {
-    SharedPreferences.setMockInitialValues({'server': 'https://old.invalid'});
-    FlutterSecureStoragePlatform.instance = TestFlutterSecureStoragePlatform({
-      'token': 'existing-token',
-    });
-    final prefs = await SharedPreferences.getInstance();
-    final store = Store(prefs);
-    final container = createAppContainer(
-      prefs: prefs,
-      store: store,
-      sfx: NoSfx(),
-      push: NoPushService(),
-    );
-    addTearDown(container.dispose);
-    expect(await container.read(pairedProvider.future), isTrue);
-    await tester.pumpWidget(
-      UncontrolledProviderScope(
-        container: container,
-        child: MaterialApp(
-          home: Scaffold(
-            body: Consumer(
-              builder: (context, ref, _) {
-                final paired = ref.watch(pairedProvider).value ?? false;
-                if (!paired) return const Text('Not paired');
-                final ctl = ref.read(controllerProvider);
-                return PanelButton(
-                  icon: Icons.logout_rounded,
-                  title: 'Sign out',
-                  onTap: () => ctl.signOut(),
-                );
-              },
-            ),
-          ),
+  for (final choice in ['keep', 'wipe', 'cancel']) {
+    testWidgets('real Settings sign-out confirmation: $choice', (tester) async {
+      SharedPreferences.setMockInitialValues({'server': 'https://old.invalid'});
+      FlutterSecureStoragePlatform.instance = TestFlutterSecureStoragePlatform({
+        'token': 'existing-token',
+      });
+      final prefs = await SharedPreferences.getInstance();
+      final store = Store(prefs);
+      final db = AppDb(NativeDatabase.memory());
+      final push = _ReadyPushService();
+      await db.upsertItem(
+        ItemsCompanion.insert(
+          id: 'retained',
+          kind: 'chore',
+          name: 'Retained item',
+          points: 1,
+          updatedAt: 1,
         ),
-      ),
-    );
-    await tester.pump();
-    expect(find.text('Sign out'), findsOneWidget);
-  });
+      );
+      final requests = <String>[];
+      final client = MockClient((request) async {
+        requests.add('${request.method} ${request.url.path}');
+        return http.Response('{}', 200);
+      });
+      final oldClient = Api.sharedClient;
+      Api.sharedClient = client;
+      addTearDown(() => Api.sharedClient = oldClient);
+      final container = ProviderContainer(
+        overrides: [
+          prefsProvider.overrideWithValue(prefs),
+          storeProvider.overrideWithValue(store),
+          dbProvider.overrideWithValue(db),
+          apiFactoryProvider.overrideWithValue(
+            (base, token) => Api(base, token: token, client: client),
+          ),
+          sfxProvider.overrideWithValue(NoSfx()),
+          pushProvider.overrideWithValue(push),
+        ],
+      );
+      addTearDown(container.dispose);
+      addTearDown(db.close);
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: const MaterialApp(home: Scaffold(body: SettingsScreen())),
+        ),
+      );
+      container.read(syncStatusProvider.notifier).set(SyncStatus.idle);
+      await tester.pumpAndSettle();
+      expect(find.text('Sign out'), findsOneWidget);
+      await tester.tap(find.text('Sign out'));
+      await tester.pumpAndSettle();
+      expect(find.text('Sign out of this phone?'), findsOneWidget);
+      final confirmLabel = switch (choice) {
+        'keep' => 'Sign out',
+        'wipe' => 'Sign out and delete data',
+        _ => 'Cancel',
+      };
+      await tester.tap(find.text(confirmLabel).last);
+      await tester.pump();
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      });
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+      if (choice == 'cancel') {
+        expect(requests, isNot(contains('DELETE /device')));
+        expect(await store.token, 'existing-token');
+        expect(await container.read(pairedProvider.future), isTrue);
+        expect(find.text('Sign out'), findsOneWidget);
+        expect(await db.select(db.items).get(), hasLength(1));
+      } else {
+        expect(requests, contains('DELETE /device'));
+        expect(await store.token, isNull);
+        expect(await container.read(pairedProvider.future), isFalse);
+        expect(find.text('Sign out'), findsNothing);
+        expect(find.text('Pair with server'), findsOneWidget);
+        expect(
+          await db.select(db.items).get(),
+          hasLength(choice == 'keep' ? 1 : 0),
+        );
+      }
+    });
+  }
 
   test(
     'secure write failure restores old server token cursor and retained fileDB',
@@ -284,6 +392,62 @@ void main() {
       );
     }
   }
+
+  for (final operation in ['server', 'cursor', 'remove']) {
+    test(
+      '$operation preference false-after-mutation reloads and compensates',
+      () async {
+        SharedPreferences.setMockInitialValues({
+          'server': 'https://old.invalid',
+          'cursor': 12,
+        });
+        final platform = FailPreferenceAfterMutation(operation);
+        SharedPreferencesStorePlatform.instance = platform;
+        FlutterSecureStoragePlatform.instance =
+            TestFlutterSecureStoragePlatform({});
+        final prefs = await SharedPreferences.getInstance();
+        final store = Store(prefs);
+        if (operation == 'cursor') {
+          await expectLater(store.setCursor(0), throwsStateError);
+        } else {
+          store.claimPairingOwnership();
+          final owner = store.pairingOwnership('https://old.invalid');
+          await expectLater(
+            store.persistPairing(owner, 'https://new.invalid', 'issued-token'),
+            throwsA(anything),
+          );
+        }
+        await prefs.reload();
+        expect(store.serverUrl, 'https://old.invalid');
+        expect(store.cursor, 12);
+        expect(await store.token, isNull);
+      },
+    );
+  }
+
+  test(
+    'secure write failure after token mutation restores all prior components',
+    () async {
+      SharedPreferences.setMockInitialValues({
+        'server': 'https://old.invalid',
+        'cursor': 12,
+      });
+      FlutterSecureStoragePlatform.instance = FailWriteAfterMutation();
+      final prefs = await SharedPreferences.getInstance();
+      final store = Store(prefs);
+      store.claimPairingOwnership();
+      final owner = store.pairingOwnership('https://old.invalid');
+      await expectLater(
+        store.persistPairing(owner, 'https://new.invalid', 'replacement'),
+        throwsA(isA<PairingPersistenceFailure>()),
+      );
+      await prefs.reload();
+      expect(store.serverUrl, 'https://old.invalid');
+      expect(store.cursor, 12);
+      expect(await store.token, 'old-token');
+      expect(store.preferencesReliable, isTrue);
+    },
+  );
   test('rollback secure-write failure stays unpaired and reports uncertain credential', () async {
     SharedPreferences.setMockInitialValues({
       'server': 'https://old.invalid',

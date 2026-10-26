@@ -9,6 +9,7 @@ import 'widgets.dart';
 
 /// Whether the device holds a token. Invalidate after pairing or unpairing.
 final pairedProvider = FutureProvider<bool>((ref) async {
+  ref.watch(pairedStateRevisionProvider);
   final controller = ref.watch(controllerProvider);
   final store = ref.watch(storeProvider);
   final generation = store.authGeneration;
@@ -295,7 +296,7 @@ class _PairScreenState extends ConsumerState<PairScreen> {
       }
       controller.pairingPersisted();
       _invalidatePendingPairingResult();
-      ref.invalidate(pairedProvider);
+      ref.read(pairedStateRevisionProvider.notifier).refresh();
       controller.syncNow();
       ref.read(pushProvider).register(requestPermission: true);
       if (mounted && Navigator.canPop(context)) Navigator.pop(context);

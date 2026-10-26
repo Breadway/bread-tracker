@@ -22,10 +22,24 @@ use crate::{store, xp, AppState};
 
 const MAX_BATCH: usize = 5000;
 
+/// Revoke only the authenticated caller's device within its owner scope.
+async fn sign_out(
+    State(st): State<AppState>,
+    Extension(DeviceId(id)): Extension<DeviceId>,
+    Extension(UserId(user_id)): Extension<UserId>,
+) -> ApiResult<Json<serde_json::Value>> {
+    sqlx::query("DELETE FROM devices WHERE id = ? AND user_id = ?")
+        .bind(id)
+        .bind(user_id)
+        .execute(&st.db)
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 pub fn router(state: AppState) -> Router {
     let authed = Router::new()
         .route("/sync", get(pull).post(sync))
-        .route("/device", put(set_device))
+        .route("/device", put(set_device).delete(sign_out))
         .route("/stats", get(stats))
         .route("/settings", get(get_settings).put(put_settings))
         .route("/push/test", post(push_test))

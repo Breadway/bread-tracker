@@ -2,6 +2,9 @@ import 'dart:io';
 
 import 'package:drift/drift.dart' show Value, driftRuntimeOptions;
 import 'package:drift/native.dart';
+
+import 'dart:async';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -13,6 +16,8 @@ import 'package:tracker/data/sync.dart';
 
 /// A tiny in-memory stand-in for the server's last-write-wins sync.
 class FakeServer {
+  Completer<void>? requestStarted;
+  Completer<void>? releaseAuthLost;
   int seq = 0;
   final items = <String, Map<String, dynamic>>{};
   final comps = <String, Map<String, dynamic>>{};
@@ -54,7 +59,14 @@ class FakeApi extends Api {
     int since,
     List<Map<String, dynamic>> items,
     List<Map<String, dynamic>> completions,
-  ) async => server.sync(since, items, completions);
+  ) async {
+    if (server.releaseAuthLost != null) {
+      server.requestStarted!.complete();
+      await server.releaseAuthLost!.future;
+      throw AuthLost();
+    }
+    return server.sync(since, items, completions);
+  }
 }
 
 class MemStore extends Store {
@@ -66,6 +78,16 @@ class MemStore extends Store {
   Future<void> saveToken(String t) async => _t = t;
   @override
   Future<void> clearToken() async => _t = null;
+  @override
+  Future<bool> clearTokenIfCurrentForGeneration(
+    String expected,
+    int expectedGeneration, {
+    String? expectedServer,
+  }) async {
+    if (_t != expected) return false;
+    _t = null;
+    return true;
+  }
 }
 
 const id1 = '11111111-1111-4111-8111-111111111111';
@@ -159,7 +181,7 @@ void main() {
 
   test('offline keeps rows dirty; auth loss reports unpaired', () async {
     final server = FakeServer()..down = true;
-    final (db, sync, _) = await device(server);
+    final (db, sync, store) = await device(server);
     await db.upsertItem(
       ItemsCompanion.insert(
         id: id1,
@@ -180,13 +202,46 @@ void main() {
       ..down = false
       ..reject = true;
     expect(await sync.sync(), SyncStatus.unpaired);
+    expect(
+      await store.token,
+      isNull,
+      reason: 'a revoked token is forgotten, not retried forever',
+    );
+    expect(
+      await sync.sync(),
+      SyncStatus.unpaired,
+      reason: 'and nothing is sent without a token',
+    );
+    expect(
+      await (db.select(db.items)..where((t) => t.dirty.equals(true))).get(),
+      hasLength(1),
+      reason: 'local data is kept',
+    );
 
     server.reject = false;
+    await store.saveToken('new');
+    sync.revalidate();
     expect(await sync.sync(), SyncStatus.idle);
     expect(
       await (db.select(db.items)..where((t) => t.dirty.equals(true))).get(),
       isEmpty,
     );
+  });
+
+  test('delayed old 401 cannot clear a newly paired token', () async {
+    final server = FakeServer()
+      ..requestStarted = Completer<void>()
+      ..releaseAuthLost = Completer<void>();
+    final (db, sync, store) = await device(server);
+    final pending = sync.sync();
+    await server.requestStarted!.future;
+    sync.invalidate();
+    await store.saveToken('new-token');
+    sync.revalidate();
+    server.releaseAuthLost!.complete();
+    expect(await pending, SyncStatus.unpaired);
+    expect(await store.token, 'new-token');
+    await db.close();
   });
 
   test('default Api instances share one http client instead of opening one per call', () async {

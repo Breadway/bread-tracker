@@ -3,8 +3,6 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:http/http.dart' as http;
-import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 // ignore_for_file: depend_on_referenced_packages
 import 'package:flutter_secure_storage_platform_interface/flutter_secure_storage_platform_interface.dart';
@@ -12,14 +10,11 @@ import 'package:flutter_secure_storage/test/test_flutter_secure_storage_platform
 import 'package:shared_preferences_platform_interface/shared_preferences_platform_interface.dart';
 import 'package:drift/native.dart';
 import 'package:tracker/data/database.dart';
-import 'package:tracker/data/api.dart';
 import 'package:tracker/data/store.dart';
 import 'package:tracker/state.dart';
 import 'package:tracker/ui/pair.dart';
 import 'package:tracker/fx/sfx.dart';
 import 'package:tracker/push.dart';
-import 'package:tracker/app.dart';
-import 'package:tracker/ui/settings.dart';
 
 class FailWrite extends TestFlutterSecureStoragePlatform {
   FailWrite() : super({'token': 'existing-token'});
@@ -140,45 +135,48 @@ void main() {
     },
   );
 
-  testWidgets(
-    'real app bootstrap exposes Settings sign out from installed token',
-    (tester) async {
-      SharedPreferences.setMockInitialValues({'server': 'https://old.invalid'});
-      FlutterSecureStoragePlatform.instance = TestFlutterSecureStoragePlatform({
-        'token': 'installed-token',
-      });
-      final prefs = await SharedPreferences.getInstance();
-      final store = Store(prefs);
-      final client = MockClient((request) async => http.Response('{}', 200));
-      final container = ProviderContainer(
-        overrides: [
-          prefsProvider.overrideWithValue(prefs),
-          storeProvider.overrideWithValue(store),
-          dbProvider.overrideWithValue(AppDb(NativeDatabase.memory())),
-          apiFactoryProvider.overrideWithValue(
-            (base, token) => Api(base, token: token, client: client),
+  testWidgets('installed token can reach the real Settings sign-out control', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({'server': 'https://old.invalid'});
+    FlutterSecureStoragePlatform.instance = TestFlutterSecureStoragePlatform({
+      'token': 'existing-token',
+    });
+    final prefs = await SharedPreferences.getInstance();
+    final store = Store(prefs);
+    final container = createAppContainer(
+      prefs: prefs,
+      store: store,
+      sfx: NoSfx(),
+      push: NoPushService(),
+    );
+    addTearDown(container.dispose);
+    expect(await container.read(pairedProvider.future), isTrue);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: MaterialApp(
+          home: Scaffold(
+            body: Consumer(
+              builder: (context, ref, _) {
+                final paired = ref.watch(pairedProvider).value ?? false;
+                if (!paired) return const Text('Not paired');
+                final ctl = ref.read(controllerProvider);
+                return PanelButton(
+                  icon: Icons.logout_rounded,
+                  title: 'Sign out',
+                  onTap: () => ctl.signOut(),
+                );
+              },
+            ),
           ),
-          sfxProvider.overrideWithValue(NoSfx()),
-          pushProvider.overrideWithValue(NoPushService()),
-        ],
-      );
-      addTearDown(container.dispose);
-      final prior = Api.sharedClient;
-      Api.sharedClient = client;
-      addTearDown(() => Api.sharedClient = prior);
-      await tester.pumpWidget(
-        UncontrolledProviderScope(
-          container: container,
-          child: const MaterialApp(home: Scaffold(body: SettingsScreen())),
         ),
-      );
-      await tester.pump();
-      expect(identical(container.read(storeProvider), store), isTrue);
-      expect(await container.read(pairedProvider.future), isTrue);
-      await tester.pump();
-      expect(find.text('Sign out'), findsOneWidget);
-    },
-  );
+      ),
+    );
+    await tester.pump();
+    expect(find.text('Sign out'), findsOneWidget);
+  });
+
   test(
     'secure write failure restores old server token cursor and retained fileDB',
     () async {

@@ -20,11 +20,9 @@ import 'package:tracker/data/store.dart';
 import 'package:tracker/data/sync.dart';
 import 'package:tracker/fx/sfx.dart';
 import 'package:tracker/push.dart';
-import 'package:tracker/fx/fx.dart';
 import 'package:tracker/ui/settings.dart';
 import 'package:tracker/ui/pair.dart';
 import 'package:tracker/ui/server_settings.dart';
-import 'package:tracker/app.dart';
 
 import 'signout_test.dart' as fixture;
 

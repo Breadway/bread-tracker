@@ -17,8 +17,8 @@ use crate::auth::{self, DeviceId, UserId};
 use crate::error::{ApiError, ApiResult};
 use crate::model::{SyncRequest, SyncResponse};
 use crate::push::{Message, SendOutcome};
-use crate::store::{PushError, UserDb};
-use crate::{store, xp, AppState};
+use crate::store::{PushError, UserDb, UserSettings};
+use crate::{xp, AppState};
 
 const MAX_BATCH: usize = 5000;
 
@@ -191,11 +191,6 @@ struct StatsQuery {
     date: Option<String>,
 }
 
-async fn timezone(st: &AppState) -> ApiResult<Tz> {
-    Ok(Tz::from_str(&store::get_setting(&st.db, "timezone").await?)
-        .unwrap_or(chrono_tz::Australia::Perth))
-}
-
 async fn stats(
     State(st): State<AppState>,
     Extension(UserId(uid)): Extension<UserId>,
@@ -204,7 +199,9 @@ async fn stats(
     let today = match q.date {
         Some(d) => NaiveDate::parse_from_str(&d, "%Y-%m-%d")
             .map_err(|_| ApiError::BadRequest("date must be YYYY-MM-DD".into()))?,
-        None => Utc::now().with_timezone(&timezone(&st).await?).date_naive(),
+        None => Utc::now()
+            .with_timezone(&UserDb::new(&st.db, uid).settings().await?.tz())
+            .date_naive(),
     };
     let user = UserDb::new(&st.db, uid);
     let items = user.all_items().await?;
@@ -224,26 +221,27 @@ struct Settings {
     utc_offset_minutes: i64,
 }
 
-async fn load_settings(st: &AppState) -> ApiResult<Settings> {
-    let timezone = store::get_setting(&st.db, "timezone").await?;
-    let tz = Tz::from_str(&timezone).unwrap_or(chrono_tz::Australia::Perth);
-    let utc_offset_minutes = Utc::now()
-        .with_timezone(&tz)
-        .offset()
-        .fix()
-        .local_minus_utc() as i64
-        / 60;
-    Ok(Settings {
-        utc_offset_minutes,
-        timezone,
-        quiet_start: store::get_setting(&st.db, "quiet_start").await?,
-        quiet_end: store::get_setting(&st.db, "quiet_end").await?,
-        reminders_enabled: store::get_setting(&st.db, "reminders_enabled").await? == "1",
-    })
+fn settings_response(s: &UserSettings) -> Settings {
+    Settings {
+        timezone: s.timezone.clone(),
+        quiet_start: s.quiet_start.clone(),
+        quiet_end: s.quiet_end.clone(),
+        reminders_enabled: s.reminders_enabled,
+        utc_offset_minutes: Utc::now()
+            .with_timezone(&s.tz())
+            .offset()
+            .fix()
+            .local_minus_utc() as i64
+            / 60,
+    }
 }
-
-async fn get_settings(State(st): State<AppState>) -> ApiResult<Json<Settings>> {
-    Ok(Json(load_settings(&st).await?))
+async fn get_settings(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+) -> ApiResult<Json<Settings>> {
+    Ok(Json(settings_response(
+        &UserDb::new(&st.db, uid).settings().await?,
+    )))
 }
 
 #[derive(Deserialize)]
@@ -260,59 +258,41 @@ fn valid_time_or_empty(t: &str) -> bool {
 
 async fn put_settings(
     State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
     Json(p): Json<SettingsPatch>,
 ) -> ApiResult<Json<Settings>> {
-    // Validate the complete resulting object before mutating any settings.
+    // Acquire the writer reservation BEFORE reading: disjoint partial patches serialize and
+    // merge with the last committed values, rather than replacing each other's stale snapshot.
     let mut tx = st.db.begin_with("BEGIN IMMEDIATE").await?;
-    let current: HashMap<String, String> = sqlx::query_as("SELECT key, value FROM settings")
-        .fetch_all(&mut *tx)
-        .await?
-        .into_iter()
-        .collect();
-    let cur = Settings {
-        timezone: current
-            .get("timezone")
-            .cloned()
-            .unwrap_or_else(|| "Australia/Perth".into()),
-        quiet_start: current.get("quiet_start").cloned().unwrap_or_default(),
-        quiet_end: current.get("quiet_end").cloned().unwrap_or_default(),
-        reminders_enabled: current.get("reminders_enabled").is_none_or(|v| v == "1"),
-        // This value is read-only response metadata, not persisted settings.
-        utc_offset_minutes: 0,
-    };
-    let start = p.quiet_start.clone().unwrap_or(cur.quiet_start);
-    let end = p.quiet_end.clone().unwrap_or(cur.quiet_end);
-    if start.is_empty() != end.is_empty() {
+    let mut s: UserSettings = sqlx::query_as("SELECT timezone, quiet_start, quiet_end, reminders_enabled FROM user_settings WHERE user_id = ?")
+        .bind(uid).fetch_one(&mut *tx).await?;
+    if let Some(tz) = p.timezone {
+        Tz::from_str(&tz).map_err(|_| ApiError::BadRequest("unknown timezone".into()))?;
+        s.timezone = tz;
+    }
+    if let Some(v) = p.quiet_start {
+        s.quiet_start = v;
+    }
+    if let Some(v) = p.quiet_end {
+        s.quiet_end = v;
+    }
+    if s.quiet_start.is_empty() != s.quiet_end.is_empty() {
         return Err(ApiError::BadRequest(
             "quiet_start and quiet_end must both be set or both be empty".into(),
         ));
     }
-    if !valid_time_or_empty(&start) || !valid_time_or_empty(&end) {
+    if !valid_time_or_empty(&s.quiet_start) || !valid_time_or_empty(&s.quiet_end) {
         return Err(ApiError::BadRequest(
             "quiet hours must be HH:MM or empty".into(),
         ));
     }
-    if let Some(tz) = &p.timezone {
-        Tz::from_str(tz).map_err(|_| ApiError::BadRequest("unknown timezone".into()))?;
+    if let Some(v) = p.reminders_enabled {
+        s.reminders_enabled = v;
     }
-    if let Some(tz) = &p.timezone {
-        sqlx::query("INSERT INTO settings (key, value) VALUES ('timezone', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-            .bind(tz).execute(&mut *tx).await?;
-    }
-    if p.quiet_start.is_some() {
-        sqlx::query("INSERT INTO settings (key, value) VALUES ('quiet_start', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-            .bind(&start).execute(&mut *tx).await?;
-    }
-    if p.quiet_end.is_some() {
-        sqlx::query("INSERT INTO settings (key, value) VALUES ('quiet_end', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-            .bind(&end).execute(&mut *tx).await?;
-    }
-    if let Some(on) = p.reminders_enabled {
-        sqlx::query("INSERT INTO settings (key, value) VALUES ('reminders_enabled', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-            .bind(if on { "1" } else { "0" }).execute(&mut *tx).await?;
-    }
+    sqlx::query("UPDATE user_settings SET timezone = ?, quiet_start = ?, quiet_end = ?, reminders_enabled = ? WHERE user_id = ?")
+        .bind(&s.timezone).bind(&s.quiet_start).bind(&s.quiet_end).bind(s.reminders_enabled).bind(uid).execute(&mut *tx).await?;
     tx.commit().await?;
-    Ok(Json(load_settings(&st).await?))
+    Ok(Json(settings_response(&s)))
 }
 
 /// Send a test notification to the calling device.

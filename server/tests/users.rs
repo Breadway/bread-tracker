@@ -67,7 +67,7 @@ async fn a_renamed_owner_survives_every_restart_with_data_and_settings_intact() 
     let pool = db::connect_with_admin(&u, Some("Riley")).await.unwrap();
     sqlx::query("INSERT INTO items (user_id, id, kind, name, points, updated_at, seq) VALUES (1, 'i', 'chore', 'Dishes', 10, 1, 1)")
         .execute(&pool).await.unwrap();
-    sqlx::query("UPDATE settings SET value = 'Europe/Berlin' WHERE key = 'timezone'")
+    sqlx::query("UPDATE user_settings SET timezone = 'Europe/Berlin' WHERE user_id = 1")
         .execute(&pool)
         .await
         .unwrap();
@@ -78,7 +78,7 @@ async fn a_renamed_owner_survives_every_restart_with_data_and_settings_intact() 
         assert_eq!(admin_name(&pool).await, "Riley", "restart with {restart:?}");
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM users").await, 1);
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM items").await, 1);
-        let tz: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'timezone'")
+        let tz: String = sqlx::query_scalar("SELECT timezone FROM user_settings WHERE user_id = 1")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -487,6 +487,11 @@ mod scheduler_boundary {
 
     async fn two_owners_two_devices(pool: &SqlitePool) -> i64 {
         let sam = users::create(pool, "Sam", false).await.unwrap();
+        sqlx::query("UPDATE user_settings SET timezone = 'Australia/Perth' WHERE user_id = ?")
+            .bind(sam)
+            .execute(pool)
+            .await
+            .unwrap();
         for (uid, item, title) in [
             (1_i64, "admin-item", "ADMIN PRIVATE"),
             (sam, "sam-item", "SAM PRIVATE"),
@@ -648,7 +653,7 @@ mod scheduler_boundary {
             .unwrap();
         assert!(
             plan.iter()
-                .any(|r| r.3.contains("items_reminder_candidates")),
+                .any(|r| r.3.contains("items_user_reminder_candidates")),
             "{plan:?}"
         );
         assert!(!plan.iter().any(|r| r.3.contains("SCAN items")), "{plan:?}");

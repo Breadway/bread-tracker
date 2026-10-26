@@ -277,3 +277,120 @@ async fn every_user_ends_with_their_own_distinct_token_after_mixed_concurrent_mo
         "the two losers hold nothing, and nothing else moved"
     );
 }
+
+#[tokio::test]
+async fn concurrent_disjoint_settings_patches_merge_after_external_writer_releases() {
+    let (w, p) = world(&["Bob"]).await;
+    let bob = p[1].1.clone();
+    for _ in 0..8 {
+        assert_eq!(
+            call(
+                &w.app,
+                "PUT",
+                "/settings",
+                Some(&bob),
+                Some(json!({"timezone":"UTC","reminders_enabled":true}))
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let mut writer = w.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let a = w.app.clone();
+        let t = bob.clone();
+        let first = tokio::spawn(async move {
+            call(
+                &a,
+                "PUT",
+                "/settings",
+                Some(&t),
+                Some(json!({"timezone":"Asia/Tokyo"})),
+            )
+            .await
+        });
+        let a = w.app.clone();
+        let t = bob.clone();
+        let second = tokio::spawn(async move {
+            call(
+                &a,
+                "PUT",
+                "/settings",
+                Some(&t),
+                Some(json!({"reminders_enabled":false})),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!first.is_finished() && !second.is_finished());
+        sqlx::query("SELECT 1").execute(&mut *writer).await.unwrap();
+        writer.commit().await.unwrap();
+        assert_eq!(first.await.unwrap().0, StatusCode::OK);
+        assert_eq!(second.await.unwrap().0, StatusCode::OK);
+        let (_, v) = call(&w.app, "GET", "/settings", Some(&bob), None).await;
+        assert_eq!(v["timezone"], "Asia/Tokyo");
+        assert_eq!(v["reminders_enabled"], false);
+        let (_, admin) = call(&w.app, "GET", "/settings", Some(&p[0].1), None).await;
+        assert_eq!(admin["timezone"], "Australia/Perth");
+    }
+}
+
+#[tokio::test]
+async fn competing_quiet_pair_patches_validate_serialized_result_and_reject_atomically() {
+    let (w, p) = world(&["Bob"]).await;
+    let bob = &p[1].1;
+    call(
+        &w.app,
+        "PUT",
+        "/settings",
+        Some(bob),
+        Some(json!({"quiet_start":"22:00","quiet_end":"07:00"})),
+    )
+    .await;
+    let a = w.app.clone();
+    let t = bob.clone();
+    let clear = tokio::spawn(async move {
+        call(
+            &a,
+            "PUT",
+            "/settings",
+            Some(&t),
+            Some(json!({"quiet_start":"","quiet_end":""})),
+        )
+        .await
+    });
+    let a = w.app.clone();
+    let t = bob.clone();
+    let partial = tokio::spawn(async move {
+        call(
+            &a,
+            "PUT",
+            "/settings",
+            Some(&t),
+            Some(json!({"quiet_start":"23:00","timezone":"Asia/Tokyo"})),
+        )
+        .await
+    });
+    assert_eq!(clear.await.unwrap().0, StatusCode::OK);
+    let result = partial.await.unwrap();
+    assert!(result.0 == StatusCode::OK || result.0 == StatusCode::BAD_REQUEST);
+    let (_, v) = call(&w.app, "GET", "/settings", Some(bob), None).await;
+    assert_eq!(v["quiet_start"], "");
+    assert_eq!(v["quiet_end"], "");
+    if result.0 == StatusCode::BAD_REQUEST {
+        assert_eq!(v["timezone"], "UTC");
+    }
+    let before = v;
+    let (status, _) = call(
+        &w.app,
+        "PUT",
+        "/settings",
+        Some(bob),
+        Some(json!({"timezone":"Europe/Berlin","quiet_start":"bad"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        call(&w.app, "GET", "/settings", Some(bob), None).await.1,
+        before
+    );
+}

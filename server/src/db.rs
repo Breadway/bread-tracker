@@ -38,6 +38,21 @@ pub async fn connect_with_migrator(
         .connect_with(opts)
         .await?;
 
+    // The owner declared experimental multi-user databases disposable. Never rewrite their
+    // applied SQLx ledger to disguise settings003 as the default hygiene003.
+    let old: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='_sqlx_migrations')",
+    )
+    .fetch_one(&pool)
+    .await?;
+    if old {
+        let checksum: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 3")
+                .fetch_optional(&pool)
+                .await?;
+        anyhow::ensure!(checksum.as_ref().map(hex::encode).as_deref() != Some("1e89bcb129fcdeadb396a48b8310419532c080e8b4a6e7e329532d7fbed72074ac4a43f70bb0a389f16cc885343b865f"),
+            "unsupported experimental settings003 ledger: preserve this database and recreate ONLY your positively identified disposable task-owned fixture with the current migrations; never edit _sqlx_migrations or delete production/reviewer databases");
+    }
     migrator.run(&pool).await?;
     crate::users::reconcile_name_keys(&pool).await?;
     if let Some(name) = admin_name {

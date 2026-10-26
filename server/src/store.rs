@@ -244,13 +244,10 @@ impl UserDb {
     /// `items_user_seq` and walk every row of the user on each tick. The index holds only
     /// reminder candidates, and `user_id` is applied to those rows.
     pub async fn reminder_items(&self) -> Result<Vec<Item>, sqlx::Error> {
-        sqlx::query_as::<_, Item>(&format!(
-            "SELECT {ITEM_COLS} FROM items INDEXED BY items_reminder_candidates
-             WHERE user_id = ? AND active = 1 AND deleted_at IS NULL AND remind_time IS NOT NULL"
-        ))
-        .bind(self.user_id)
-        .fetch_all(&self.db)
-        .await
+        sqlx::query_as::<_, Item>(&scheduler_items_sql())
+            .bind(self.user_id)
+            .fetch_all(&self.db)
+            .await
     }
 
     /// Representative query plan for the scheduler's item selection. Kept as a testable
@@ -259,7 +256,7 @@ impl UserDb {
         &self,
     ) -> Result<Vec<(i64, i64, i64, String)>, sqlx::Error> {
         sqlx::query_as(
-            "EXPLAIN QUERY PLAN SELECT id FROM items INDEXED BY items_reminder_candidates
+            "EXPLAIN QUERY PLAN SELECT id FROM items INDEXED BY items_user_reminder_candidates
              WHERE user_id = ? AND active = 1 AND deleted_at IS NULL AND remind_time IS NOT NULL",
         )
         .bind(self.user_id)
@@ -274,19 +271,14 @@ impl UserDb {
         date: &str,
         yesterday: &str,
     ) -> Result<Vec<Completion>, sqlx::Error> {
-        sqlx::query_as::<_, Completion>(&format!(
-            "SELECT {COMPLETION_COLS} FROM completions WHERE user_id = ? AND date IN (?, ?)
-             UNION
-             SELECT {COMPLETION_COLS} FROM completions
-             WHERE user_id = ? AND item_id IN (SELECT id FROM items WHERE user_id = ? AND kind = 'todo')"
-        ))
-        .bind(self.user_id)
-        .bind(date)
-        .bind(yesterday)
-        .bind(self.user_id)
-        .bind(self.user_id)
-        .fetch_all(&self.db)
-        .await
+        sqlx::query_as::<_, Completion>(&scheduler_completions_sql())
+            .bind(self.user_id)
+            .bind(date)
+            .bind(yesterday)
+            .bind(self.user_id)
+            .bind(self.user_id)
+            .fetch_all(&self.db)
+            .await
     }
 
     /// (item_id, date) of reminders already sent on either of two dates.
@@ -295,16 +287,19 @@ impl UserDb {
         d1: &str,
         d2: &str,
     ) -> Result<HashSet<(String, String)>, sqlx::Error> {
-        Ok(sqlx::query_as::<_, (String, String)>(
-            "SELECT item_id, date FROM reminders_sent WHERE user_id = ? AND date IN (?, ?)",
-        )
-        .bind(self.user_id)
-        .bind(d1)
-        .bind(d2)
-        .fetch_all(&self.db)
-        .await?
-        .into_iter()
-        .collect())
+        Ok(sqlx::query_as::<_, (String, String)>(SCHEDULER_SENT_SQL)
+            .bind(self.user_id)
+            .bind(d1)
+            .bind(d2)
+            .fetch_all(&self.db)
+            .await?
+            .into_iter()
+            .collect())
+    }
+
+    pub async fn settings(&self) -> Result<UserSettings, sqlx::Error> {
+        sqlx::query_as("SELECT timezone, quiet_start, quiet_end, reminders_enabled FROM user_settings WHERE user_id = ?")
+            .bind(self.user_id).fetch_one(&self.db).await
     }
 
     pub async fn mark_reminder_sent(&self, item_id: &str, date: &str) -> Result<(), sqlx::Error> {
@@ -357,19 +352,26 @@ pub async fn prune(db: &Db, now: i64) -> Result<Pruned, sqlx::Error> {
     })
 }
 
-pub async fn get_setting(db: &Db, key: &str) -> Result<String, sqlx::Error> {
-    sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ?")
-        .bind(key)
-        .fetch_optional(db)
-        .await
-        .map(|v| v.unwrap_or_default())
+/// Per-user reminder preferences. Unknown stored timezone falls back to neutral UTC.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct UserSettings {
+    pub timezone: String,
+    pub quiet_start: String,
+    pub quiet_end: String,
+    pub reminders_enabled: bool,
+}
+impl UserSettings {
+    pub fn tz(&self) -> chrono_tz::Tz {
+        std::str::FromStr::from_str(&self.timezone).unwrap_or(chrono_tz::UTC)
+    }
 }
 
-pub async fn set_setting(db: &Db, key: &str, value: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-        .bind(key)
-        .bind(value)
-        .execute(db)
-        .await?;
-    Ok(())
+/// Actual scheduler SQL, exposed for populated EXPLAIN/VM-step regression tests.
+pub fn scheduler_items_sql() -> String {
+    format!("SELECT {ITEM_COLS} FROM items INDEXED BY items_user_reminder_candidates WHERE user_id = ? AND active = 1 AND deleted_at IS NULL AND remind_time IS NOT NULL")
 }
+pub fn scheduler_completions_sql() -> String {
+    format!("SELECT {COMPLETION_COLS} FROM completions WHERE user_id = ? AND date IN (?, ?) UNION SELECT {COMPLETION_COLS} FROM completions WHERE user_id = ? AND item_id IN (SELECT id FROM items WHERE user_id = ? AND kind = 'todo')")
+}
+pub const SCHEDULER_SENT_SQL: &str =
+    "SELECT item_id, date FROM reminders_sent WHERE user_id = ? AND date IN (?, ?)";

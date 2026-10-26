@@ -32,3 +32,10 @@ BEGIN
 END;
 
 DROP TABLE settings;
+
+-- Owner-aware scheduler paths. Existing upstream indexes remain unchanged.
+CREATE INDEX items_user_reminder_candidates ON items (user_id, remind_time)
+  WHERE active = 1 AND deleted_at IS NULL AND remind_time IS NOT NULL;
+CREATE INDEX items_user_kind_id ON items (user_id, kind, id);
+CREATE INDEX completions_user_date_item ON completions (user_id, date, item_id);
+CREATE INDEX reminders_user_date_item ON reminders_sent (user_id, date, item_id);

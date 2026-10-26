@@ -20,9 +20,11 @@ import 'package:tracker/data/store.dart';
 import 'package:tracker/data/sync.dart';
 import 'package:tracker/fx/sfx.dart';
 import 'package:tracker/push.dart';
+import 'package:tracker/fx/fx.dart';
 import 'package:tracker/ui/settings.dart';
 import 'package:tracker/ui/pair.dart';
 import 'package:tracker/ui/server_settings.dart';
+import 'package:tracker/app.dart';
 
 import 'signout_test.dart' as fixture;
 
@@ -87,6 +89,37 @@ class _FailCursorReset extends InMemorySharedPreferencesStore {
   }
 }
 
+class _FailPreferenceWrite extends InMemorySharedPreferencesStore {
+  _FailPreferenceWrite(this.key, {this.throws = false})
+    : super.withData({
+        'flutter.server': 'https://old.invalid',
+        'flutter.cursor': 12,
+      });
+  final String key;
+  final bool throws;
+  var failed = false;
+
+  @override
+  Future<bool> setValue(String type, String key, Object value) async {
+    if (!failed && key == this.key) {
+      failed = true;
+      if (throws) throw StateError('injected preference set failure');
+      return false;
+    }
+    return super.setValue(type, key, value);
+  }
+
+  @override
+  Future<bool> remove(String key) async {
+    if (!failed && key == this.key) {
+      failed = true;
+      if (throws) throw StateError('injected preference remove failure');
+      return false;
+    }
+    return super.remove(key);
+  }
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   test('provider honors the bootstrap Store instance', () async {
@@ -106,6 +139,54 @@ void main() {
     expect(identical(c.read(storeProvider), bootstrapStore), isTrue);
     expect(await c.read(storeProvider).token, 'boot');
   });
+
+  for (final operation in ['server', 'cursor-write', 'cursor-remove']) {
+    for (final throws in [false, true]) {
+      test(
+        'pairing rejects $operation platform ${throws ? 'throw' : 'false'} and reloads persisted snapshot',
+        () async {
+          final key = switch (operation) {
+            'server' => 'flutter.server',
+            _ => 'flutter.cursor',
+          };
+          final platform = _FailPreferenceWrite(key, throws: throws);
+          SharedPreferences.setMockInitialValues({
+            'server': 'https://old.invalid',
+            'cursor': 12,
+          });
+          SharedPreferencesStorePlatform.instance = platform;
+          FlutterSecureStoragePlatform.instance =
+              TestFlutterSecureStoragePlatform({});
+          final prefs = await SharedPreferences.getInstance();
+          final store = Store(prefs);
+          if (operation == 'cursor-write') {
+            await expectLater(
+              store.setCursor(0),
+              throwsStateError,
+              reason: 'cursor false/throw must propagate from the Store API',
+            );
+            await prefs.reload();
+            expect(store.cursor, 12);
+            return;
+          }
+          store.claimPairingOwnership();
+          final owner = store.pairingOwnership('https://old.invalid');
+          final server = operation == 'server'
+              ? 'https://new.invalid'
+              : 'https://old.invalid';
+          await expectLater(
+            store.persistPairing(owner, server, 'issued-token'),
+            throwsA(anything),
+            reason:
+                'platform false/throw cannot be accepted as durable pairing',
+          );
+          expect(store.serverUrl, 'https://old.invalid');
+          expect(store.cursor, 12);
+          expect(await store.token, isNull);
+        },
+      );
+    }
+  }
 
   test('pair claim blocks old signout wipe until replacement persistence completes', () async {
     final entered = Completer<void>();

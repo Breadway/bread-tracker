@@ -29,6 +29,15 @@ class PairingPersistenceReceipt {
   final int previousCursor;
 }
 
+class PairingPersistenceFailure implements Exception {
+  const PairingPersistenceFailure(this.cause, {required this.restored});
+  final Object cause;
+  final bool restored;
+
+  @override
+  String toString() => '$cause';
+}
+
 /// Device credentials (secure storage) and small preferences.
 class Store {
   Store(this.prefs, [FlutterSecureStorage? secure])
@@ -38,20 +47,31 @@ class Store {
   Future<void> _credentialMutation = Future<void>.value();
   int _credentialEpoch = 0;
   int _authGeneration = 0;
+  bool _preferencesReliable = true;
   static const defaultServer = 'https://tracker.breadway.dev';
 
   Future<String?> get token => _secure.read(key: 'token');
-  Future<void> saveToken(String t) =>
-      _serializeCredentialMutation(() => _secure.write(key: 'token', value: t));
+  Future<void> saveToken(String t) => _serializeCredentialMutation(() async {
+    await _secure.write(key: 'token', value: t);
+    if (await _secure.read(key: 'token') != t) {
+      throw StateError('Secure credential was not durably saved.');
+    }
+  });
 
-  Future<void> clearToken() =>
-      _serializeCredentialMutation(() => _secure.delete(key: 'token'));
+  Future<void> clearToken() => _serializeCredentialMutation(() async {
+    await _secure.delete(key: 'token');
+    if (await _secure.read(key: 'token') != null) {
+      throw StateError('Secure credential was not durably removed.');
+    }
+  });
 
   int get credentialEpoch => _credentialEpoch;
 
   void claimCredentialOwnership() => claimAuthGeneration();
 
   int get authGeneration => _authGeneration;
+  bool get preferencesReliable => _preferencesReliable;
+  void markPreferencesUnreliable() => _preferencesReliable = false;
 
   PairingOwnership pairingOwnership(String server) => PairingOwnership(
     generation: _authGeneration,
@@ -73,6 +93,9 @@ class Store {
         throw StateError('Pairing ownership changed before local persistence.');
       }
       final previousToken = await _secure.read(key: 'token');
+      if (!_preferencesReliable) {
+        throw StateError('Shared preferences state is uncertain.');
+      }
       final previousServer = serverUrl;
       final previousCursor = cursor;
       receipt = PairingPersistenceReceipt(
@@ -83,7 +106,11 @@ class Store {
         previousServer: previousServer,
         previousCursor: previousCursor,
       );
+      var serverChanged = false;
+      var tokenWriteAttempted = false;
+      var cursorResetAttempted = false;
       try {
+        serverChanged = previousServer != server;
         await setServerUrl(server);
         if (_authGeneration != owner.generation ||
             _credentialEpoch != owner.epoch ||
@@ -93,6 +120,7 @@ class Store {
           );
         }
         if (previousToken != token) {
+          tokenWriteAttempted = true;
           await _secure.write(key: 'token', value: token);
           if (_authGeneration != owner.generation ||
               _credentialEpoch != owner.epoch ||
@@ -103,6 +131,7 @@ class Store {
             );
           }
         }
+        cursorResetAttempted = true;
         await resetSync();
         if (_authGeneration != owner.generation ||
             _credentialEpoch != owner.epoch ||
@@ -111,32 +140,49 @@ class Store {
             'Pairing ownership changed during local persistence.',
           );
         }
-      } catch (_) {
-        if (_authGeneration == owner.generation &&
-            serverUrl == server &&
-            _credentialEpoch == owner.epoch &&
-            await _secure.read(key: 'token') == token) {
-          var credentialRestored = false;
-          if (previousToken == null) {
-            await _secure.delete(key: 'token');
-            credentialRestored = await _secure.read(key: 'token') == null;
-          } else if (previousToken != token) {
-            await _secure.write(key: 'token', value: previousToken);
-            credentialRestored =
-                await _secure.read(key: 'token') == previousToken;
+      } catch (cause) {
+        var restored = false;
+        var superseded = false;
+        try {
+          if (_authGeneration != owner.generation ||
+              _credentialEpoch != owner.epoch) {
+            superseded = true;
           } else {
-            credentialRestored =
+            final currentToken = await _secure.read(key: 'token');
+            var credentialRestored = false;
+            if (tokenWriteAttempted && currentToken == token) {
+              if (previousToken == null) {
+                await _secure.delete(key: 'token');
+              } else {
+                await _secure.write(key: 'token', value: previousToken);
+              }
+              credentialRestored =
+                  await _secure.read(key: 'token') == previousToken;
+            } else {
+              credentialRestored = currentToken == previousToken;
+            }
+
+            if (serverChanged) {
+              await _restoreServerIfAttemptValue(previousServer, server);
+            }
+            final serverRestored = serverUrl == previousServer;
+            if (cursorResetAttempted && credentialRestored) {
+              await _restoreCursorIfAttemptValue(previousCursor, 0);
+            }
+            final cursorRestored = cursor == previousCursor;
+            restored =
+                credentialRestored &&
+                serverRestored &&
+                cursorRestored &&
                 await _secure.read(key: 'token') == previousToken;
           }
-          if (_authGeneration == owner.generation &&
-              _credentialEpoch == owner.epoch &&
-              serverUrl == server &&
-              credentialRestored) {
-            await setServerUrl(previousServer);
-            await setCursor(previousCursor);
-          }
+        } catch (_) {
+          restored = false;
         }
-        rethrow;
+        throw PairingPersistenceFailure(
+          cause,
+          restored: restored || superseded,
+        );
       }
     });
     return receipt;
@@ -148,30 +194,43 @@ class Store {
       final owner = receipt.ownership;
       if (_authGeneration != owner.generation ||
           _credentialEpoch != owner.epoch ||
+          !_preferencesReliable ||
           serverUrl != receipt.server ||
-          await _secure.read(key: 'token') != receipt.token ||
-          _authGeneration != owner.generation ||
-          _credentialEpoch != owner.epoch ||
-          serverUrl != receipt.server) {
+          await _secure.read(key: 'token') != receipt.token) {
         return;
       }
+      var tokenRestored = false;
       if (receipt.previousToken == null) {
         await _secure.delete(key: 'token');
+        tokenRestored = await _secure.read(key: 'token') == null;
       } else if (receipt.previousToken != receipt.token) {
         await _secure.write(key: 'token', value: receipt.previousToken);
+        tokenRestored =
+            await _secure.read(key: 'token') == receipt.previousToken;
+      } else {
+        tokenRestored =
+            await _secure.read(key: 'token') == receipt.previousToken;
       }
-      if (_authGeneration == owner.generation &&
+      var preferencesRestored = false;
+      if (tokenRestored &&
+          _authGeneration == owner.generation &&
           _credentialEpoch == owner.epoch &&
           serverUrl == receipt.server &&
           await _secure.read(key: 'token') == receipt.previousToken) {
         await setServerUrl(receipt.previousServer);
         await setCursor(receipt.previousCursor);
+        preferencesRestored =
+            serverUrl == receipt.previousServer &&
+            cursor == receipt.previousCursor;
       }
       rolledBack =
           _authGeneration == owner.generation &&
           _credentialEpoch == owner.epoch &&
+          tokenRestored &&
+          preferencesRestored &&
           serverUrl == receipt.previousServer &&
-          await _secure.read(key: 'token') == receipt.previousToken;
+          await _secure.read(key: 'token') == receipt.previousToken &&
+          cursor == receipt.previousCursor;
     });
     return rolledBack;
   }
@@ -185,6 +244,9 @@ class Store {
           return;
         }
         await _secure.delete(key: 'token');
+        if (await _secure.read(key: 'token') != null) {
+          throw StateError('Issued pairing credential was not removed.');
+        }
         if (_authGeneration == owner.generation &&
             _credentialEpoch == owner.epoch &&
             serverUrl == owner.server &&
@@ -220,7 +282,7 @@ class Store {
         return;
       }
       await _secure.delete(key: 'token');
-      cleared = true;
+      cleared = await _secure.read(key: 'token') == null;
     });
     return cleared;
   }
@@ -375,12 +437,139 @@ class Store {
   }
 
   String get serverUrl => prefs.getString('server') ?? defaultServer;
-  Future<void> setServerUrl(String v) =>
-      prefs.setString('server', v.trim().replaceAll(RegExp(r'/+$'), ''));
+  Future<void> setServerUrl(String v) async {
+    final normalized = v.trim().replaceAll(RegExp(r'/+$'), '');
+    final previous = serverUrl;
+    try {
+      await _checkPreferenceWrite(
+        () => prefs.setString('server', normalized),
+        'Server preference was not durably saved.',
+      );
+      if (serverUrl != normalized) {
+        throw StateError('Server preference was not durably saved.');
+      }
+    } catch (cause) {
+      try {
+        await _restoreServerIfAttemptValue(previous, normalized);
+      } catch (_) {
+        _preferencesReliable = false;
+        throw StateError('Server preference failed and rollback is uncertain.');
+      }
+      Error.throwWithStackTrace(cause, StackTrace.current);
+    }
+  }
 
   int get cursor => prefs.getInt('cursor') ?? 0;
-  Future<void> setCursor(int v) => prefs.setInt('cursor', v);
-  Future<void> resetSync() => prefs.remove('cursor');
+  Future<void> setCursor(int v) async {
+    final previous = cursor;
+    try {
+      await _checkPreferenceWrite(
+        () => prefs.setInt('cursor', v),
+        'Sync cursor was not durably saved.',
+      );
+      if (cursor != v) {
+        throw StateError('Sync cursor was not durably saved.');
+      }
+    } catch (cause) {
+      try {
+        await _restoreCursorIfAttemptValue(previous, v);
+      } catch (_) {
+        _preferencesReliable = false;
+        throw StateError('Sync cursor write failed and rollback is uncertain.');
+      }
+      Error.throwWithStackTrace(cause, StackTrace.current);
+    }
+  }
+
+  Future<void> resetSync() async {
+    final previous = cursor;
+    try {
+      await _checkPreferenceWrite(
+        () => prefs.remove('cursor'),
+        'Sync cursor reset was not durably saved.',
+      );
+      if (cursor != 0) {
+        throw StateError('Sync cursor reset was not durably saved.');
+      }
+    } catch (cause) {
+      try {
+        await _restoreCursorIfAttemptValue(previous, 0);
+      } catch (_) {
+        _preferencesReliable = false;
+        throw StateError('Sync cursor reset failed and rollback is uncertain.');
+      }
+      Error.throwWithStackTrace(cause, StackTrace.current);
+    }
+  }
+
+  Future<void> _restoreServerIfAttemptValue(
+    String previous,
+    String attempted,
+  ) async {
+    if (!_preferencesReliable) return;
+    await prefs.reload();
+    if (serverUrl != attempted || attempted == previous) return;
+    if (!await prefs.setString('server', previous)) {
+      await prefs.reload();
+      if (serverUrl != previous) {
+        throw StateError('Server rollback returned false and did not persist.');
+      }
+    } else if (serverUrl != previous) {
+      await prefs.reload();
+      if (serverUrl != previous) {
+        throw StateError('Server rollback could not be verified.');
+      }
+    }
+  }
+
+  Future<void> _restoreCursorIfAttemptValue(int previous, int attempted) async {
+    if (!_preferencesReliable) return;
+    await prefs.reload();
+    if (cursor != attempted || attempted == previous) return;
+    if (!await prefs.setInt('cursor', previous)) {
+      await prefs.reload();
+      if (cursor != previous) {
+        throw StateError('Cursor rollback returned false and did not persist.');
+      }
+    } else if (cursor != previous) {
+      await prefs.reload();
+      if (cursor != previous) {
+        throw StateError('Cursor rollback could not be verified.');
+      }
+    }
+  }
+
+  Future<void> _checkPreferenceWrite(
+    Future<bool> Function() write,
+    String failure,
+  ) async {
+    if (!_preferencesReliable) {
+      throw StateError('Shared preferences state is uncertain.');
+    }
+    try {
+      if (await write()) return;
+    } catch (_) {
+      try {
+        await _reloadPreferencesAfterFailure();
+      } catch (_) {
+        _preferencesReliable = false;
+      }
+      rethrow;
+    }
+    await _reloadPreferencesAfterFailure();
+    throw StateError(failure);
+  }
+
+  Future<void> _reloadPreferencesAfterFailure() async {
+    try {
+      await prefs.reload();
+    } catch (_) {
+      _preferencesReliable = false;
+      throw StateError(
+        'Shared preferences write failed and persisted state could not be reloaded.',
+      );
+    }
+  }
 
   Future<bool> setCursorIfGeneration(
     int value,
@@ -420,7 +609,13 @@ class Store {
   }
 
   bool get sound => prefs.getBool('sound') ?? true;
-  Future<void> setSound(bool v) => prefs.setBool('sound', v);
+  Future<void> setSound(bool v) => _checkPreferenceWrite(
+    () => prefs.setBool('sound', v),
+    'Sound preference was not durably saved.',
+  );
   bool get haptics => prefs.getBool('haptics') ?? true;
-  Future<void> setHaptics(bool v) => prefs.setBool('haptics', v);
+  Future<void> setHaptics(bool v) => _checkPreferenceWrite(
+    () => prefs.setBool('haptics', v),
+    'Haptics preference was not durably saved.',
+  );
 }

@@ -144,9 +144,20 @@ class SettingsScreen extends ConsumerWidget {
                       title: const Text('Sound effects'),
                       value: sfx.sound,
                       onChanged: (v) async {
-                        sfx.sound = v;
-                        await store.setSound(v);
-                        set(() {});
+                        try {
+                          await store.setSound(v);
+                          sfx.sound = v;
+                          set(() {});
+                        } catch (error) {
+                          if (!context.mounted) return;
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                'Could not save sound preference: $error',
+                              ),
+                            ),
+                          );
+                        }
                       },
                     ),
                   ),
@@ -156,9 +167,20 @@ class SettingsScreen extends ConsumerWidget {
                       title: const Text('Vibration'),
                       value: sfx.haptics,
                       onChanged: (v) async {
-                        sfx.haptics = v;
-                        await store.setHaptics(v);
-                        set(() {});
+                        try {
+                          await store.setHaptics(v);
+                          sfx.haptics = v;
+                          set(() {});
+                        } catch (error) {
+                          if (!context.mounted) return;
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                'Could not save vibration preference: $error',
+                              ),
+                            ),
+                          );
+                        }
                       },
                     ),
                   ),

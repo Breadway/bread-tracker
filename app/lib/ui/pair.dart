@@ -13,17 +13,25 @@ final pairedProvider = FutureProvider<bool>((ref) async {
   final store = ref.watch(storeProvider);
   final generation = store.authGeneration;
   final appGeneration = controller.currentAuthGeneration;
+  final token = await store.readTokenForGeneration(generation);
+  final server = store.serverUrl;
+  if (token != null &&
+      !controller.hasEstablishedPairing &&
+      !controller.isSignedOutForPairing) {
+    await controller.restoreEstablishedPairing(generation, server);
+  }
   final acceptedPairing = controller.hasEstablishedPairing
       ? controller.pairedCredentialAccepted &&
             controller.acceptedPairingGeneration == appGeneration &&
             controller.acceptedStoreGeneration == generation &&
-            controller.acceptedPairingServer == store.serverUrl
+            controller.acceptedPairingServer == server
       : controller.pairedCredentialAccepted &&
             !controller.isSignedOutForPairing;
-  final token = await store.readTokenForGeneration(generation);
   return token != null &&
       acceptedPairing &&
+      store.preferencesReliable &&
       store.authGeneration == generation &&
+      store.serverUrl == server &&
       controller.currentAuthGeneration == appGeneration &&
       (!controller.hasEstablishedPairing ||
           (controller.acceptedPairingGeneration == appGeneration &&
@@ -214,7 +222,9 @@ class _PairScreenState extends ConsumerState<PairScreen> {
           final owner = cleanupOwnership;
           if (owner != null) {
             await store.abandonPairingAttempt(owner, pairedToken);
-            if (store.credentialEpoch == owner.epoch) {
+            if (store.authGeneration == owner.generation &&
+                store.credentialEpoch == owner.epoch &&
+                store.serverUrl == owner.server) {
               controller.pairingPersistenceFailedForCredentialOwner(
                 controllerGeneration,
                 owner.server,
@@ -238,6 +248,9 @@ class _PairScreenState extends ConsumerState<PairScreen> {
         _issuedTokenForRetry = pairedToken;
         _issuedServerForRetry = attemptServer;
         _issuedCodeForRetry = attemptCode;
+        if (codeWasRedeemed && cleanupOwnership != null) {
+          _retryOwnership = cleanupOwnership;
+        }
         setState(
           () => _error =
               'Local recovery is incomplete. Existing data was preserved. Retry pairing to recover without redeeming the one-time code again. Details: $e',
@@ -299,6 +312,8 @@ class _PairScreenState extends ConsumerState<PairScreen> {
     } catch (e) {
       final receipt = _persistenceReceipt;
       final owner = attemptOwnership;
+      final storeRollbackVerified =
+          e is PairingPersistenceFailure && e.restored;
       if (owner == null &&
           codeWasRedeemed &&
           issuedToken != null &&
@@ -317,10 +332,18 @@ class _PairScreenState extends ConsumerState<PairScreen> {
       }
       if (owner != null && issuedToken != null) {
         try {
+          var cleanupVerified = false;
           if (receipt != null) {
-            await store.rollbackPairing(receipt);
+            cleanupVerified = await store.rollbackPairing(receipt);
+          } else if (persistenceStarted) {
+            cleanupVerified = storeRollbackVerified;
           } else if (!persistenceStarted) {
             await store.abandonPairingAttempt(owner, issuedToken);
+            cleanupVerified =
+                store.authGeneration != owner.generation ||
+                store.credentialEpoch != owner.epoch ||
+                store.serverUrl != owner.server ||
+                await store.token != issuedToken;
           }
           if (store.authGeneration == owner.generation &&
               store.credentialEpoch == owner.epoch &&
@@ -329,16 +352,47 @@ class _PairScreenState extends ConsumerState<PairScreen> {
               controllerGeneration,
               owner.server,
             );
-            if (codeWasRedeemed && attemptStillCurrent()) {
+            if (cleanupVerified && codeWasRedeemed && attemptStillCurrent()) {
               _retryOwnership = store.pairingOwnership(attemptServer);
               _issuedTokenForRetry = issuedToken;
               _issuedServerForRetry = attemptServer;
               _issuedCodeForRetry = attemptCode;
             }
           }
+          if (!cleanupVerified) {
+            controller.pairingPersistenceFailedForCredentialOwner(
+              controllerGeneration,
+              owner.server,
+            );
+            if (mounted) {
+              setState(() {
+                _error =
+                    'Pairing was issued, but credential restoration could not be verified. Pairing remains closed and no cached retry is available. Details: $e';
+                _issuedTokenForRetry = null;
+                _issuedServerForRetry = null;
+                _issuedCodeForRetry = null;
+                _retryOwnership = null;
+              });
+            }
+            return;
+          }
           _persistenceReceipt = null;
-        } catch (_) {
-          // Keep all cleanup fenced to this immutable attempt owner.
+        } catch (cleanupError) {
+          controller.pairingPersistenceFailedForCredentialOwner(
+            controllerGeneration,
+            owner.server,
+          );
+          if (mounted) {
+            setState(() {
+              _error =
+                  'Pairing was issued, but local cleanup could not be verified. Pairing remains unavailable in this screen. Verify server credentials before retrying. Details: $e; cleanup: $cleanupError';
+              _issuedTokenForRetry = null;
+              _issuedServerForRetry = null;
+              _issuedCodeForRetry = null;
+              _retryOwnership = null;
+            });
+          }
+          return;
         }
       }
       if (mounted) {

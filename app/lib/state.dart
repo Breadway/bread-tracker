@@ -179,7 +179,8 @@ class AppController {
   bool _pairedCredentialAccepted = false;
   bool get pairedCredentialAccepted => _pairedCredentialAccepted;
   bool _hasEstablishedPairing = false;
-  bool get isSignedOutForPairing => _signedOut || _pairingPending;
+  bool get isSignedOutForPairing =>
+      _signedOut || _pairingPending || _signOutCleanupPending;
   Completer<void>? _wipeCommitCompletion;
   bool _wipeCommitFailed = false;
   bool get isWipeRecoveryPending => _wipeCommitFailed;
@@ -354,7 +355,16 @@ class AppController {
     try {
       await store.resetSync();
     } catch (_) {
-      await store.setCursor(cursorBeforeCleanup);
+      var restored = false;
+      try {
+        await store.setCursor(cursorBeforeCleanup);
+        restored = store.cursor == cursorBeforeCleanup;
+      } catch (_) {
+        restored = false;
+      }
+      if (!restored) {
+        store.markPreferencesUnreliable();
+      }
       rethrow;
     }
     if (generation != _authGeneration ||
@@ -369,7 +379,16 @@ class AppController {
           await store.setCursor(cursorBeforeCleanup);
         }
       } catch (_) {
-        await store.setCursor(cursorBeforeCleanup);
+        var restored = false;
+        try {
+          await store.setCursor(cursorBeforeCleanup);
+          restored = store.cursor == cursorBeforeCleanup;
+        } catch (_) {
+          restored = false;
+        }
+        if (!restored) {
+          store.markPreferencesUnreliable();
+        }
         rethrow;
       }
     }
@@ -492,6 +511,30 @@ class AppController {
     ref.read(storeProvider).claimPairingOwnership();
     _pairingPending = true;
     ref.read(syncEngineProvider).invalidate();
+    return true;
+  }
+
+  Future<bool> restoreEstablishedPairing(
+    int storeGeneration,
+    String server,
+  ) async {
+    if (_hasEstablishedPairing || _signedOut || _pairingPending) return false;
+    final store = ref.read(storeProvider);
+    final token = await store.readTokenForGeneration(storeGeneration);
+    if (token == null ||
+        _hasEstablishedPairing ||
+        _signedOut ||
+        _pairingPending ||
+        _signOutCleanupPending ||
+        store.authGeneration != storeGeneration ||
+        store.serverUrl != server) {
+      return false;
+    }
+    _pairedCredentialAccepted = true;
+    _pairedGeneration = _authGeneration;
+    _pairedStoreGeneration = storeGeneration;
+    _pairedServer = server;
+    _hasEstablishedPairing = true;
     return true;
   }
 

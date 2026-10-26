@@ -13,13 +13,28 @@ use serde::{Deserialize, Serialize};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::auth::{self, DeviceId};
+use crate::auth::{self, DeviceId, UserId};
 use crate::error::{ApiError, ApiResult};
 use crate::model::{SyncRequest, SyncResponse};
 use crate::push::{Message, SendOutcome};
+use crate::store::{PushError, UserDb};
 use crate::{store, xp, AppState};
 
 const MAX_BATCH: usize = 5000;
+
+/// Revoke only the authenticated caller's device within its owner scope.
+async fn sign_out(
+    State(st): State<AppState>,
+    Extension(DeviceId(id)): Extension<DeviceId>,
+    Extension(UserId(user_id)): Extension<UserId>,
+) -> ApiResult<Json<serde_json::Value>> {
+    sqlx::query("DELETE FROM devices WHERE id = ? AND user_id = ?")
+        .bind(id)
+        .bind(user_id)
+        .execute(&st.db)
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
 
 pub fn router(state: AppState) -> Router {
     let authed = Router::new()
@@ -79,14 +94,16 @@ struct PullQuery {
 
 async fn pull(
     State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
     Query(q): Query<PullQuery>,
 ) -> ApiResult<Json<SyncResponse>> {
-    Ok(Json(store::pull(&st.db, q.since).await?))
+    Ok(Json(UserDb::new(&st.db, uid).pull(q.since).await?))
 }
 
 /// Push local changes, then return everything changed since `since` (one round trip).
 async fn sync(
     State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
     Json(req): Json<SyncRequest>,
 ) -> ApiResult<Json<SyncResponse>> {
     if req.items.len() + req.completions.len() > MAX_BATCH {
@@ -101,26 +118,21 @@ async fn sync(
     for c in &req.completions {
         c.validate(today).map_err(ApiError::BadRequest)?;
     }
-    let incoming: std::collections::HashSet<&str> =
-        req.items.iter().map(|i| i.id.as_str()).collect();
-    let mut referenced: Vec<String> = req.completions.iter().map(|c| c.item_id.clone()).collect();
-    referenced.extend(req.items.iter().map(|i| i.id.clone()));
-    let existing = store::item_ids(&st.db, &referenced).await?;
-    // A batch may carry a new item and its completion together. Validate references against
-    // the union before any write, so malformed rows cannot partially apply.
-    for c in &req.completions {
-        // Tombstoned references are legitimate from offline old clients: a sibling
-        // device may have deleted the item after this completion was recorded.
-        let referenced_by_live_or_deleted =
-            existing.contains(&c.item_id) || incoming.contains(c.item_id.as_str());
-        if !referenced_by_live_or_deleted {
+    // Completion references are validated against the caller's own items inside the write
+    // transaction (tombstoned items count, so an old offline client still syncs after another
+    // device deleted the item). An unknown reference, or one that only another user holds,
+    // rejects the whole batch with nothing written.
+    let user = UserDb::new(&st.db, uid);
+    match user.apply_push(&req.items, &req.completions).await {
+        Ok(()) => {}
+        Err(PushError::UnknownItem) => {
             return Err(ApiError::BadRequest(
                 "completion references an unknown item".into(),
-            ));
+            ))
         }
+        Err(PushError::Db(e)) => return Err(e.into()),
     }
-    store::apply_push(&st.db, &req.items, &req.completions).await?;
-    Ok(Json(store::pull(&st.db, req.since).await?))
+    Ok(Json(user.pull(req.since).await?))
 }
 
 #[derive(Deserialize)]
@@ -128,9 +140,17 @@ struct DeviceReq {
     fcm_token: Option<String>,
 }
 
+/// Register (or clear) the calling device's FCM token.
+///
+/// A token identifies one app install, so it belongs to exactly one device across all users:
+/// registering a token another device holds takes it over, and only that column of the previous
+/// holder is cleared. The caller recheck, the takeover and the assignment run in one write
+/// transaction, so a failure anywhere leaves both devices exactly as they were, and two
+/// concurrent registrations of the same token end with one holder.
 async fn set_device(
     State(st): State<AppState>,
     Extension(DeviceId(id)): Extension<DeviceId>,
+    Extension(UserId(uid)): Extension<UserId>,
     Json(req): Json<DeviceReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let token = req.fcm_token.filter(|t| !t.is_empty());
@@ -138,27 +158,45 @@ async fn set_device(
         if t.len() > 4096 {
             return Err(ApiError::BadRequest("fcm_token too long".into()));
         }
-        // A token belongs to one device; a reinstall re-pairs and takes it over.
-        sqlx::query("UPDATE devices SET fcm_token = NULL WHERE fcm_token = ? AND id != ?")
-            .bind(t)
-            .bind(&id)
-            .execute(&st.db)
-            .await?;
     }
-    sqlx::query("UPDATE devices SET fcm_token = ? WHERE id = ?")
+    let mut tx = st.db.begin_with("BEGIN IMMEDIATE").await?;
+    // The device authenticated a moment ago; it may have signed out or been revoked since.
+    // Recheck it still exists and still belongs to this user before touching anyone else.
+    // This early check is defence in depth: the `assigned != 1` check below also refuses and rolls
+    // the transaction back, so removing it is not observable (an equivalent mutation). It stops the
+    // takeover before any row is changed.
+    let caller: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM devices WHERE id = ? AND user_id = ?")
+            .bind(&id)
+            .bind(uid)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if caller.is_none() {
+        return Err(ApiError::Unauthorized);
+    }
+    if let Some(t) = &token {
+        let taken =
+            sqlx::query("UPDATE devices SET fcm_token = NULL WHERE fcm_token = ? AND id != ?")
+                .bind(t)
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        if taken > 0 {
+            tracing::info!(user = uid, device = %id, taken, "fcm token moved to this device");
+        }
+    }
+    let assigned = sqlx::query("UPDATE devices SET fcm_token = ? WHERE id = ? AND user_id = ?")
         .bind(&token)
         .bind(&id)
-        .execute(&st.db)
-        .await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
-}
-
-/// Sign out: revoke the calling device. Its token stops working immediately.
-async fn sign_out(
-    State(st): State<AppState>,
-    Extension(DeviceId(id)): Extension<DeviceId>,
-) -> ApiResult<Json<serde_json::Value>> {
-    crate::devices::revoke_self(&st.db, &id).await?;
+        .bind(uid)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if assigned != 1 {
+        return Err(ApiError::Unauthorized);
+    }
+    tx.commit().await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -174,6 +212,7 @@ async fn timezone(st: &AppState) -> ApiResult<Tz> {
 
 async fn stats(
     State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
     Query(q): Query<StatsQuery>,
 ) -> ApiResult<Json<xp::Stats>> {
     let today = match q.date {
@@ -181,8 +220,9 @@ async fn stats(
             .map_err(|_| ApiError::BadRequest("date must be YYYY-MM-DD".into()))?,
         None => Utc::now().with_timezone(&timezone(&st).await?).date_naive(),
     };
-    let items = store::all_items(&st.db).await?;
-    let completions = store::all_completions(&st.db).await?;
+    let user = UserDb::new(&st.db, uid);
+    let items = user.all_items().await?;
+    let completions = user.all_completions().await?;
     Ok(Json(xp::compute(&items, &completions, today)))
 }
 
@@ -293,23 +333,26 @@ async fn put_settings(
 async fn push_test(
     State(st): State<AppState>,
     Extension(DeviceId(id)): Extension<DeviceId>,
+    Extension(UserId(uid)): Extension<UserId>,
 ) -> ApiResult<Json<serde_json::Value>> {
     if !st.push.enabled() {
         return Err(ApiError::BadRequest(
             "push is not configured on the server".into(),
         ));
     }
-    let token: Option<String> = sqlx::query_scalar("SELECT fcm_token FROM devices WHERE id = ?")
-        .bind(&id)
-        .fetch_one(&st.db)
-        .await?;
+    let token: Option<String> =
+        sqlx::query_scalar("SELECT fcm_token FROM devices WHERE id = ? AND user_id = ?")
+            .bind(&id)
+            .bind(uid)
+            .fetch_one(&st.db)
+            .await?;
     let Some(token) = token.filter(|t| !t.is_empty()) else {
         return Err(ApiError::BadRequest(
             "this device has no fcm token registered".into(),
         ));
     };
     let msg = Message {
-        token,
+        token: token.clone(),
         title: "Bread Tracker".into(),
         body: "Test notification".into(),
         data: HashMap::from([("kind".to_string(), "test".to_string())]),
@@ -317,10 +360,16 @@ async fn push_test(
     match st.push.send(&msg).await? {
         SendOutcome::Sent => Ok(Json(serde_json::json!({ "sent": true }))),
         SendOutcome::Unregistered => {
-            sqlx::query("UPDATE devices SET fcm_token = NULL WHERE id = ?")
-                .bind(&id)
-                .execute(&st.db)
-                .await?;
+            // Clear only the token that FCM just rejected. If the device registered a new one
+            // while the send was in flight, that newer token stays.
+            sqlx::query(
+                "UPDATE devices SET fcm_token = NULL WHERE id = ? AND user_id = ? AND fcm_token = ?",
+            )
+            .bind(&id)
+            .bind(uid)
+            .bind(&token)
+            .execute(&st.db)
+            .await?;
             Err(ApiError::BadRequest(
                 "fcm token is no longer valid; re-register".into(),
             ))

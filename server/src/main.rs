@@ -30,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
     {
         std::fs::create_dir_all(parent).ok();
     }
-    let db = db::connect(&config.database_url())
+    let db = db::connect_with_admin(&config.database_url(), config.admin_name.as_deref())
         .await
         .context("opening database")?;
 

@@ -8,6 +8,25 @@ use sqlx::SqlitePool;
 pub type Db = SqlitePool;
 
 pub async fn connect(database_url: &str) -> anyhow::Result<Db> {
+    connect_with_admin(database_url, None).await
+}
+
+/// Like [`connect`], and names the first (admin) user once if that has not happened yet.
+pub async fn connect_with_admin(
+    database_url: &str,
+    admin_name: Option<&str>,
+) -> anyhow::Result<Db> {
+    connect_with_migrator(database_url, admin_name, &sqlx::migrate!("../migrations")).await
+}
+
+/// [`connect_with_admin`] with an explicit migration set. The server always passes the embedded
+/// one; tests pass the set another branch of the stack will have (for example with the durable
+/// pairing limiter's version 0004 present) to prove the upgrade path on that ledger.
+pub async fn connect_with_migrator(
+    database_url: &str,
+    admin_name: Option<&str>,
+    migrator: &sqlx::migrate::Migrator,
+) -> anyhow::Result<Db> {
     let opts = SqliteConnectOptions::from_str(database_url)?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
@@ -19,7 +38,11 @@ pub async fn connect(database_url: &str) -> anyhow::Result<Db> {
         .connect_with(opts)
         .await?;
 
-    sqlx::migrate!("../migrations").run(&pool).await?;
+    migrator.run(&pool).await?;
+    crate::users::reconcile_name_keys(&pool).await?;
+    if let Some(name) = admin_name {
+        crate::users::apply_admin_name(&pool, name).await?;
+    }
     Ok(pool)
 }
 

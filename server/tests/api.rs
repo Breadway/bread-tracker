@@ -1111,11 +1111,11 @@ async fn prune_removes_only_what_can_never_matter_again() {
         "items": [item(C1, "chore", "Old gone", 127, None, old), gone, fresh_gone, item(H1, "habit", "Kept", 127, None, now)],
         "completions": [comp(C1, "2026-01-01", old, Some(old)), comp(C2, "2026-10-01", recent, Some(recent)), comp(H1, "2026-10-19", now, None)]
     }))).await;
-    sqlx::query("INSERT INTO reminders_sent (item_id, date, sent_at) VALUES (?, '2020-01-01', 0), (?, ?, 0)")
+    sqlx::query("INSERT INTO reminders_sent (user_id, item_id, date, sent_at) VALUES (1, ?, '2020-01-01', 0), (1, ?, ?, 0)")
         .bind(H1).bind(H1).bind(Utc::now().format("%Y-%m-%d").to_string())
         .execute(&h.state.db).await.unwrap();
     sqlx::query(
-        "INSERT INTO pairing_codes (code_hash, expires_at) VALUES ('expired', ?), ('live', ?)",
+        "INSERT INTO pairing_codes (code_hash, user_id, expires_at) VALUES ('expired', 1, ?), ('live', 1, ?)",
     )
     .bind(now - 1000)
     .bind(now + 600_000)

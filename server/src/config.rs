@@ -10,6 +10,8 @@ pub struct Config {
     pub fcm_service_account: Option<PathBuf>,
     /// Reminders older than this are dropped instead of sent late (server downtime guard).
     pub reminder_grace_mins: i64,
+    /// Name for the first (admin) user, who owns all data that existed before multi-user.
+    pub admin_name: Option<String>,
 }
 
 impl Config {
@@ -24,6 +26,7 @@ impl Config {
             reminder_grace_mins: get("BREADTRACKER_REMINDER_GRACE_MINS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(360),
+            admin_name: get("BREADTRACKER_ADMIN_NAME"),
         }
     }
 

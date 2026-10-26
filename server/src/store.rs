@@ -4,6 +4,7 @@ use sqlx::SqliteConnection;
 
 use crate::db::Db;
 use crate::model::{Completion, Item, SyncResponse};
+use crate::users::ADMIN_ID;
 
 const DAY_MS: i64 = 86_400_000;
 
@@ -29,23 +30,26 @@ pub async fn apply_push(
 
     for it in items {
         let updated = it.updated_at.min(ceiling);
-        let existing: Option<i64> = sqlx::query_scalar("SELECT updated_at FROM items WHERE id = ?")
-            .bind(&it.id)
-            .fetch_optional(&mut *tx)
-            .await?;
+        let existing: Option<i64> =
+            sqlx::query_scalar("SELECT updated_at FROM items WHERE user_id = ? AND id = ?")
+                .bind(ADMIN_ID)
+                .bind(&it.id)
+                .fetch_optional(&mut *tx)
+                .await?;
         if existing.is_some_and(|e| e >= updated) {
             continue;
         }
         let seq = next_seq(&mut tx).await?;
         sqlx::query(
-            "INSERT INTO items (id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, seq)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(id) DO UPDATE SET
+            "INSERT INTO items (user_id, id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, seq)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(user_id, id) DO UPDATE SET
                kind = excluded.kind, name = excluded.name, weekdays = excluded.weekdays,
                remind_time = excluded.remind_time, points = excluded.points, due_date = excluded.due_date,
                sort = excluded.sort, active = excluded.active, updated_at = excluded.updated_at,
                deleted_at = excluded.deleted_at, seq = excluded.seq",
         )
+        .bind(ADMIN_ID)
         .bind(&it.id)
         .bind(&it.kind)
         .bind(it.name.trim())
@@ -64,23 +68,26 @@ pub async fn apply_push(
 
     for c in completions {
         let updated = c.updated_at.min(ceiling);
-        let existing: Option<i64> =
-            sqlx::query_scalar("SELECT updated_at FROM completions WHERE item_id = ? AND date = ?")
-                .bind(&c.item_id)
-                .bind(&c.date)
-                .fetch_optional(&mut *tx)
-                .await?;
+        let existing: Option<i64> = sqlx::query_scalar(
+            "SELECT updated_at FROM completions WHERE user_id = ? AND item_id = ? AND date = ?",
+        )
+        .bind(ADMIN_ID)
+        .bind(&c.item_id)
+        .bind(&c.date)
+        .fetch_optional(&mut *tx)
+        .await?;
         if existing.is_some_and(|e| e >= updated) {
             continue;
         }
         let seq = next_seq(&mut tx).await?;
         sqlx::query(
-            "INSERT INTO completions (item_id, date, completed_at, updated_at, deleted_at, seq)
-             VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(item_id, date) DO UPDATE SET
+            "INSERT INTO completions (user_id, item_id, date, completed_at, updated_at, deleted_at, seq)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(user_id, item_id, date) DO UPDATE SET
                completed_at = excluded.completed_at, updated_at = excluded.updated_at,
                deleted_at = excluded.deleted_at, seq = excluded.seq",
         )
+        .bind(ADMIN_ID)
         .bind(&c.item_id)
         .bind(&c.date)
         .bind(c.completed_at.min(ceiling))
@@ -98,26 +105,29 @@ const ITEM_COLS: &str =
     "id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, seq";
 const COMPLETION_COLS: &str = "item_id, date, completed_at, updated_at, deleted_at, seq";
 
-/// Rows changed after `since`, read from one snapshot together with the new cursor.
+fn pull_sql(table: &str, cols: &str) -> String {
+    format!("SELECT {cols} FROM {table} WHERE user_id = ? AND seq > ? AND seq <= ? ORDER BY seq")
+}
+
+/// Rows of the first user changed after `since`, read from one snapshot together with the new
+/// cursor. Both reads search the `(user_id, seq)` index; see [`pull_query_plans`].
 pub async fn pull(db: &Db, since: i64) -> Result<SyncResponse, sqlx::Error> {
     let mut tx = db.begin().await?;
     let cursor: i64 = sqlx::query_scalar("SELECT val FROM meta WHERE key = 'seq'")
         .fetch_one(&mut *tx)
         .await?;
-    let items = sqlx::query_as::<_, Item>(&format!(
-        "SELECT {ITEM_COLS} FROM items WHERE seq > ? AND seq <= ? ORDER BY seq"
-    ))
-    .bind(since)
-    .bind(cursor)
-    .fetch_all(&mut *tx)
-    .await?;
-    let completions = sqlx::query_as::<_, Completion>(&format!(
-        "SELECT {COMPLETION_COLS} FROM completions WHERE seq > ? AND seq <= ? ORDER BY seq"
-    ))
-    .bind(since)
-    .bind(cursor)
-    .fetch_all(&mut *tx)
-    .await?;
+    let items = sqlx::query_as::<_, Item>(&pull_sql("items", ITEM_COLS))
+        .bind(ADMIN_ID)
+        .bind(since)
+        .bind(cursor)
+        .fetch_all(&mut *tx)
+        .await?;
+    let completions = sqlx::query_as::<_, Completion>(&pull_sql("completions", COMPLETION_COLS))
+        .bind(ADMIN_ID)
+        .bind(since)
+        .bind(cursor)
+        .fetch_all(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(SyncResponse {
         cursor,
@@ -127,23 +137,53 @@ pub async fn pull(db: &Db, since: i64) -> Result<SyncResponse, sqlx::Error> {
     })
 }
 
+/// Query plans of the two statements `pull` runs, so a test can prove they use the per-user
+/// sequence indexes instead of scanning and sorting every user's rows.
+pub async fn pull_query_plans(db: &Db) -> Result<Vec<String>, sqlx::Error> {
+    let mut plans = Vec::new();
+    for (table, cols) in [("items", ITEM_COLS), ("completions", COMPLETION_COLS)] {
+        let rows: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(&format!("EXPLAIN QUERY PLAN {}", pull_sql(table, cols)))
+                .bind(ADMIN_ID)
+                .bind(0_i64)
+                .bind(i64::MAX)
+                .fetch_all(db)
+                .await?;
+        plans.extend(rows.into_iter().map(|r| r.3));
+    }
+    Ok(plans)
+}
+
 pub async fn all_items(db: &Db) -> Result<Vec<Item>, sqlx::Error> {
-    sqlx::query_as::<_, Item>(&format!("SELECT {ITEM_COLS} FROM items"))
+    sqlx::query_as::<_, Item>(&format!("SELECT {ITEM_COLS} FROM items WHERE user_id = ?"))
+        .bind(ADMIN_ID)
         .fetch_all(db)
         .await
 }
 
 pub async fn all_completions(db: &Db) -> Result<Vec<Completion>, sqlx::Error> {
-    sqlx::query_as::<_, Completion>(&format!("SELECT {COMPLETION_COLS} FROM completions"))
-        .fetch_all(db)
-        .await
+    sqlx::query_as::<_, Completion>(&format!(
+        "SELECT {COMPLETION_COLS} FROM completions WHERE user_id = ?"
+    ))
+    .bind(ADMIN_ID)
+    .fetch_all(db)
+    .await
 }
 
-/// Items the scheduler can remind about, instead of loading every row each tick.
+/// Items the scheduler can remind about, instead of loading every row each tick. Only the
+/// first user's: the background scheduler is single owner until per-user scheduling exists, so
+/// nobody else's item can be turned into a notification on someone else's device.
+///
+/// `INDEXED BY` keeps the partial index from migration 0003 (restored by 0005 after the users
+/// rebuild) in use. Without it the extra `user_id` filter makes SQLite prefer `items_user_seq`
+/// and walk every row of the user on each tick. The index holds only reminder candidates and
+/// `user_id` is applied to those rows.
 pub async fn reminder_items(db: &Db) -> Result<Vec<Item>, sqlx::Error> {
     sqlx::query_as::<_, Item>(&format!(
-        "SELECT {ITEM_COLS} FROM items WHERE active = 1 AND deleted_at IS NULL AND remind_time IS NOT NULL"
+        "SELECT {ITEM_COLS} FROM items INDEXED BY items_reminder_candidates
+         WHERE user_id = ? AND active = 1 AND deleted_at IS NULL AND remind_time IS NOT NULL"
     ))
+    .bind(ADMIN_ID)
     .fetch_all(db)
     .await
 }
@@ -154,25 +194,61 @@ pub async fn reminder_items_query_plan(
     db: &Db,
 ) -> Result<Vec<(i64, i64, i64, String)>, sqlx::Error> {
     sqlx::query_as(
-        "EXPLAIN QUERY PLAN SELECT id FROM items WHERE active = 1 AND deleted_at IS NULL AND remind_time IS NOT NULL",
+        "EXPLAIN QUERY PLAN SELECT id FROM items INDEXED BY items_reminder_candidates
+         WHERE user_id = ? AND active = 1 AND deleted_at IS NULL AND remind_time IS NOT NULL",
     )
+    .bind(ADMIN_ID)
     .fetch_all(db)
     .await
 }
 
+/// Completions the scheduler needs, first user only (see [`reminder_items`]): everything dated
+/// `date` or `yesterday`, plus every completion of a to-do.
 pub async fn reminder_completions(
     db: &Db,
     date: &str,
     yesterday: &str,
 ) -> Result<Vec<Completion>, sqlx::Error> {
     sqlx::query_as::<_, Completion>(&format!(
-        "SELECT {COMPLETION_COLS} FROM completions WHERE date IN (?, ?)
+        "SELECT {COMPLETION_COLS} FROM completions WHERE user_id = ? AND date IN (?, ?)
          UNION
          SELECT {COMPLETION_COLS} FROM completions
-         WHERE item_id IN (SELECT id FROM items WHERE kind = 'todo')"
+         WHERE user_id = ? AND item_id IN (SELECT id FROM items WHERE user_id = ? AND kind = 'todo')"
     ))
+    .bind(ADMIN_ID)
     .bind(date)
     .bind(yesterday)
+    .bind(ADMIN_ID)
+    .bind(ADMIN_ID)
+    .fetch_all(db)
+    .await
+}
+
+/// (item_id, date) of reminders already sent to the first user on either date.
+pub async fn sent_reminders(
+    db: &Db,
+    d1: &str,
+    d2: &str,
+) -> Result<std::collections::HashSet<(String, String)>, sqlx::Error> {
+    Ok(sqlx::query_as::<_, (String, String)>(
+        "SELECT item_id, date FROM reminders_sent WHERE user_id = ? AND date IN (?, ?)",
+    )
+    .bind(ADMIN_ID)
+    .bind(d1)
+    .bind(d2)
+    .fetch_all(db)
+    .await?
+    .into_iter()
+    .collect())
+}
+
+/// FCM devices of the first user: the only destination a scheduled reminder may have.
+pub async fn reminder_devices(db: &Db) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, fcm_token FROM devices
+         WHERE user_id = ? AND fcm_token IS NOT NULL AND fcm_token != ''",
+    )
+    .bind(ADMIN_ID)
     .fetch_all(db)
     .await
 }
@@ -185,8 +261,8 @@ pub async fn item_ids(
         return Ok(Default::default());
     }
     let placeholders = vec!["?"; ids.len()].join(",");
-    let sql = format!("SELECT id FROM items WHERE id IN ({placeholders})");
-    let mut q = sqlx::query_scalar::<_, String>(&sql);
+    let sql = format!("SELECT id FROM items WHERE user_id = ? AND id IN ({placeholders})");
+    let mut q = sqlx::query_scalar::<_, String>(&sql).bind(ADMIN_ID);
     for id in ids {
         q = q.bind(id);
     }

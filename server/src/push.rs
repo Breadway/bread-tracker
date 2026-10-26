@@ -330,6 +330,11 @@ fn parse_quiet(start: &str, end: &str) -> Option<(NaiveTime, NaiveTime)> {
 }
 
 /// One scheduler pass. Returns the number of reminders sent.
+///
+/// Single owner on purpose: items, completions, sent markers and destination devices are all
+/// the first user's (`users::ADMIN_ID`), so a reminder can never carry one user's item to
+/// another user's device, and another user's completion cannot suppress it. Other users get no
+/// background work until per-user scheduling exists (TRACK-18/19), which fails closed.
 pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize> {
     if !st.push.enabled() || store::get_setting(&st.db, "reminders_enabled").await? != "1" {
         return Ok(0);
@@ -348,15 +353,7 @@ pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize
 
     let items = store::reminder_items(&st.db).await?;
     let completions = store::reminder_completions(&st.db, &date, &yesterday).await?;
-    let sent: HashSet<(String, String)> = sqlx::query_as::<_, (String, String)>(
-        "SELECT item_id, date FROM reminders_sent WHERE date IN (?, ?)",
-    )
-    .bind(&date)
-    .bind(&yesterday)
-    .fetch_all(&st.db)
-    .await?
-    .into_iter()
-    .collect();
+    let sent = store::sent_reminders(&st.db, &date, &yesterday).await?;
 
     let due = due_reminders(
         now,
@@ -369,11 +366,7 @@ pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize
     if due.is_empty() {
         return Ok(0);
     }
-    let devices: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, fcm_token FROM devices WHERE fcm_token IS NOT NULL AND fcm_token != ''",
-    )
-    .fetch_all(&st.db)
-    .await?;
+    let devices = store::reminder_devices(&st.db).await?;
     if devices.is_empty() {
         return Ok(0); // not marked sent, so it can still go out after a device registers
     }
@@ -406,8 +399,9 @@ pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize
         }
         if delivered {
             sqlx::query(
-                "INSERT OR IGNORE INTO reminders_sent (item_id, date, sent_at) VALUES (?, ?, ?)",
+                "INSERT OR IGNORE INTO reminders_sent (user_id, item_id, date, sent_at) VALUES (?, ?, ?, ?)",
             )
+            .bind(crate::users::ADMIN_ID)
             .bind(&d.item_id)
             .bind(&d.date)
             .bind(now_ms())

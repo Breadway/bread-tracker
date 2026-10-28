@@ -81,17 +81,6 @@ class SettingsScreen extends ConsumerWidget {
               },
             ),
           if (paired) const Spacer8(),
-          if (paired)
-            PanelButton(
-              icon: Icons.devices_other_rounded,
-              title: 'Add another device',
-              subtitle: 'Get a code to sign in to this account on a second phone',
-              onTap: () => showDialog<void>(
-                context: context,
-                builder: (_) => const _AddDeviceDialog(),
-              ),
-            ),
-          if (paired) const Spacer8(),
           PanelButton(
             icon: Icons.link_rounded,
             title: paired ? 'Switch account or pair again' : 'Join or pair',
@@ -114,16 +103,69 @@ class SettingsScreen extends ConsumerWidget {
                   builder: (_) => const _SignOutDialog(),
                 );
                 if (choice == null) return;
-                final revoked = await ctl.signOut(
-                  wipeLocal: choice == _SignOut.wipe,
-                );
-                toast(
-                  revoked
-                      ? 'Signed out'
-                      : 'Signed out here, but the server could not be reached. '
-                            'Revoke this device from the server to be sure.',
-                );
+                var ownerGeneration = ctl.currentAuthGeneration;
+                var ownerStoreGeneration = store.authGeneration;
+                final ownerServer = store.serverUrl;
+                Future<void> finishSignOut() async {
+                  if (ctl.currentAuthGeneration != ownerGeneration ||
+                      store.authGeneration != ownerStoreGeneration ||
+                      store.serverUrl != ownerServer) {
+                    return;
+                  }
+                  try {
+                    final pending = ctl.signOut(
+                      wipeLocal: choice == _SignOut.wipe,
+                      expectedAuthGeneration: ownerGeneration,
+                      expectedStoreGeneration: ownerStoreGeneration,
+                      expectedServer: ownerServer,
+                    );
+                    // signOut claims ownership synchronously before its first
+                    // await. Retain that attempt's identity, not the identity
+                    // that happens to exist when a later failure is handled.
+                    ownerGeneration = ctl.currentAuthGeneration;
+                    ownerStoreGeneration = store.authGeneration;
+                    final revoked = await pending;
+                    toast(
+                      revoked
+                          ? 'Signed out'
+                          : 'Signed out here, but the server could not be reached. '
+                                'Revoke this device from the server to be sure.',
+                    );
+                  } catch (_) {
+                    if (!context.mounted) return;
+                    if (ctl.currentAuthGeneration != ownerGeneration ||
+                        store.authGeneration != ownerStoreGeneration ||
+                        store.serverUrl != ownerServer) {
+                      return;
+                    }
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: const Text(
+                          'Sign-out cleanup failed on this phone. '
+                          'Sync is paused. Retry local cleanup.',
+                        ),
+                        action: SnackBarAction(
+                          label: 'Retry',
+                          onPressed: finishSignOut,
+                        ),
+                      ),
+                    );
+                  }
+                }
+
+                await finishSignOut();
               },
+            ),
+          if (paired) const Spacer8(),
+          if (paired)
+            PanelButton(
+              icon: Icons.devices_rounded,
+              title: 'Add another device',
+              subtitle: 'Create a short-lived code for your own account',
+              onTap: () => showDialog<void>(
+                context: context,
+                builder: (_) => const _PairCodeDialog(),
+              ),
             ),
           const SectionHeader('Your list'),
           PanelButton(
@@ -137,9 +179,8 @@ class SettingsScreen extends ConsumerWidget {
           const Spacer8(),
           PanelButton(
             icon: Icons.playlist_add_rounded,
-            title: 'Add starter chores',
-            subtitle:
-                'The weekly household schedule, skipping any already added',
+            title: 'Add example chores',
+            subtitle: 'A few generic weekly chores, skipping any already added',
             onTap: () async =>
                 toast('Added ${await ctl.addStarterChores()} chores'),
           ),
@@ -156,9 +197,20 @@ class SettingsScreen extends ConsumerWidget {
                       title: const Text('Sound effects'),
                       value: sfx.sound,
                       onChanged: (v) async {
-                        sfx.sound = v;
-                        await store.setSound(v);
-                        set(() {});
+                        try {
+                          await store.setSound(v);
+                          sfx.sound = v;
+                          set(() {});
+                        } catch (error) {
+                          if (!context.mounted) return;
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                'Could not save sound preference: $error',
+                              ),
+                            ),
+                          );
+                        }
                       },
                     ),
                   ),
@@ -168,9 +220,20 @@ class SettingsScreen extends ConsumerWidget {
                       title: const Text('Vibration'),
                       value: sfx.haptics,
                       onChanged: (v) async {
-                        sfx.haptics = v;
-                        await store.setHaptics(v);
-                        set(() {});
+                        try {
+                          await store.setHaptics(v);
+                          sfx.haptics = v;
+                          set(() {});
+                        } catch (error) {
+                          if (!context.mounted) return;
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                'Could not save vibration preference: $error',
+                              ),
+                            ),
+                          );
+                        }
                       },
                     ),
                   ),
@@ -204,8 +267,14 @@ class SettingsScreen extends ConsumerWidget {
             title: 'Send a test notification',
             subtitle: 'Checks that the server can reach this phone',
             onTap: () async {
-              final token = await store.token;
-              if (token == null) return toast('Pair with the server first.');
+              final generation = store.authGeneration;
+              final server = store.serverUrl;
+              final token = await store.readTokenForGeneration(generation);
+              if (token == null ||
+                  store.authGeneration != generation ||
+                  store.serverUrl != server) {
+                return toast('Pair with the server first.');
+              }
               try {
                 final push = ref.read(pushProvider);
                 await push.register(requestPermission: true);
@@ -213,11 +282,19 @@ class SettingsScreen extends ConsumerWidget {
                   toast('Enable notifications and register this phone first.');
                   return;
                 }
-                await Api(store.serverUrl, token: token).pushTest();
+                await ref.read(apiFactoryProvider)(server, token).pushTest();
                 toast('Sent. It should arrive in a moment.');
               } on ApiException catch (e) {
                 toast(e.message);
               } on AuthLost catch (e) {
+                if (await store.clearTokenIfCurrentForGeneration(
+                  token,
+                  generation,
+                  expectedServer: server,
+                )) {
+                  ref.read(pairedStateRevisionProvider.notifier).refresh();
+                  await ref.read(pushProvider).register();
+                }
                 toast(e.toString());
               }
             },
@@ -228,74 +305,117 @@ class SettingsScreen extends ConsumerWidget {
   }
 }
 
-/// Asks the server for a code that adds another device to this account and shows it.
-class _AddDeviceDialog extends ConsumerStatefulWidget {
-  const _AddDeviceDialog();
+enum _SignOut { keep, wipe }
+
+class _PairCodeDialog extends ConsumerStatefulWidget {
+  const _PairCodeDialog();
+
   @override
-  ConsumerState<_AddDeviceDialog> createState() => _AddDeviceDialogState();
+  ConsumerState<_PairCodeDialog> createState() => _PairCodeDialogState();
 }
 
-class _AddDeviceDialogState extends ConsumerState<_AddDeviceDialog> {
-  late Future<PairCode> _code = _fetch();
+class _PairCodeDialogState extends ConsumerState<_PairCodeDialog> {
+  String? _code;
+  DateTime? _expiresAt;
+  String? _error;
+  bool _busy = false;
+  int? _ownerGeneration;
+  int? _ownerAppGeneration;
+  String? _ownerServer;
 
-  Future<PairCode> _fetch() async {
+  @override
+  void initState() {
+    super.initState();
+    Future.microtask(_load);
+  }
+
+  Future<void> _load() async {
+    if (!mounted || _busy) return;
     final store = ref.read(storeProvider);
-    final token = await store.token;
-    if (token == null) throw ApiException('Not paired');
-    return ref.read(apiFactoryProvider)(store.serverUrl, token).newPairCode();
+    final controller = ref.read(controllerProvider);
+    final generation = store.authGeneration;
+    final appGeneration = controller.currentAuthGeneration;
+    final server = store.serverUrl;
+    bool ownsRequest() =>
+        mounted &&
+        store.authGeneration == generation &&
+        controller.currentAuthGeneration == appGeneration &&
+        store.serverUrl == server;
+    setState(() {
+      _busy = true;
+      _code = null;
+      _error = null;
+      _ownerGeneration = generation;
+      _ownerAppGeneration = appGeneration;
+      _ownerServer = server;
+    });
+    try {
+      final token = await store.readTokenForGeneration(generation);
+      if (!ownsRequest()) return;
+      if (token == null) throw ApiException('Pair this phone first.');
+      final result = await ref
+          .read(apiFactoryProvider)(server, token)
+          .createPairCode();
+      if (!ownsRequest()) return;
+      final code = result['code'];
+      final ttl = result['expires_in_secs'];
+      if (code is! String || code.isEmpty || ttl is! int || ttl <= 0) {
+        throw ApiException('Invalid pairing-code response.');
+      }
+      setState(() {
+        _code = code;
+        _expiresAt = DateTime.now().add(Duration(seconds: ttl));
+      });
+    } catch (error) {
+      if (ownsRequest()) setState(() => _error = error.toString());
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   @override
-  Widget build(BuildContext context) => AlertDialog(
-    title: const Text('Add another device'),
-    content: FutureBuilder<PairCode>(
-      future: _code,
-      builder: (context, snap) {
-        if (snap.hasError) {
-          final e = snap.error;
-          return Text(
-            e is ApiException
-                ? e.message
-                : e is AuthLost
-                ? e.toString()
-                : 'Could not get a code.',
-          );
-        }
-        if (!snap.hasData) {
-          return const SizedBox(height: 48, child: Center(child: CircularProgressIndicator()));
-        }
-        final c = snap.data!;
-        return Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('On the other phone, choose "Pair with a code" and enter:'),
-            const SizedBox(height: 12),
-            Center(
-              child: SelectableText(
-                c.code,
-                style: const TextStyle(fontSize: 28, fontWeight: FontWeight.w700, letterSpacing: 2),
-              ),
-            ),
-            const SizedBox(height: 12),
-            Text('It works once and expires in ${c.expiresInSecs ~/ 60} minutes.'),
-          ],
-        );
-      },
-    ),
-    actions: [
-      TextButton(
-        onPressed: () => setState(() {
-          _code = _fetch();
-        }),
-        child: const Text('New code'),
+  Widget build(BuildContext context) {
+    // A code is account-sensitive: hide it as soon as the owning session changes.
+    ref.watch(pairedStateRevisionProvider);
+    final paired = ref.watch(pairedProvider).value ?? false;
+    final store = ref.watch(storeProvider);
+    final sameOwner =
+        store.authGeneration == _ownerGeneration &&
+        ref.read(controllerProvider).currentAuthGeneration ==
+            _ownerAppGeneration &&
+        store.serverUrl == _ownerServer;
+    return AlertDialog(
+      title: const Text('Add another device'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (!paired)
+            const Text('Pair this phone first.')
+          else if (_busy)
+            const CircularProgressIndicator()
+          else if (_error != null)
+            Text(_error!)
+          else if (_code != null && sameOwner) ...[
+            SelectableText(_code!),
+            Text('Expires at ${_expiresAt!.toLocal()}. Single use.'),
+          ] else if (!sameOwner)
+            const Text('Account changed. Request a new code.'),
+        ],
       ),
-      FilledButton(onPressed: () => Navigator.pop(context), child: const Text('Done')),
-    ],
-  );
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Close'),
+        ),
+        if (paired)
+          FilledButton(
+            onPressed: _busy ? null : _load,
+            child: const Text('New code'),
+          ),
+      ],
+    );
+  }
 }
-
-enum _SignOut { keep, wipe }
 
 class _SignOutDialog extends StatelessWidget {
   const _SignOutDialog();

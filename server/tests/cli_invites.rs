@@ -38,10 +38,21 @@ fn create_list_and_revoke() {
     assert!(run(&db, &["invite", "revoke", "1"]).status.success());
     let list = out(&run(&db, &["invite", "list"]));
     assert!(list.lines().next().unwrap().contains("revoked"), "{list}");
-    assert!(!run(&db, &["invite", "revoke", "1"]).status.success(), "already revoked");
-    assert!(!run(&db, &["invite", "revoke", "99"]).status.success(), "unknown id");
+    assert!(
+        !run(&db, &["invite", "revoke", "1"]).status.success(),
+        "already revoked"
+    );
+    assert!(
+        !run(&db, &["invite", "revoke", "99"]).status.success(),
+        "unknown id"
+    );
 
-    for bad in [&["invite", "create", "--ttl", "soon"][..], &["invite", "create", "--ttl"], &["invite"], &["invite", "revoke", "x"]] {
+    for bad in [
+        &["invite", "create", "--ttl", "soon"][..],
+        &["invite", "create", "--ttl"],
+        &["invite"],
+        &["invite", "revoke", "x"],
+    ] {
         assert!(!run(&db, bad).status.success(), "{bad:?}");
     }
 }

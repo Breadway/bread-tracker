@@ -50,6 +50,8 @@ dependencies:
   flutter_timezone: ^5.1.1
 
 dev_dependencies:
+  flutter_secure_storage_platform_interface: ^2.1.1
+  shared_preferences_platform_interface: ^2.4.1
   flutter_test:
     sdk: flutter
 

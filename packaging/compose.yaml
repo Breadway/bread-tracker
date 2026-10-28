@@ -1,11 +1,11 @@
-# bread-tracker as a container on Hestia (build runs in the Containerfile, no host toolchain).
+# bread-tracker as a container (build runs in the Containerfile, no host toolchain).
 #
 #   docker compose -f packaging/compose.yaml --project-directory . up -d --build
 #
 # Optional secrets/settings go in .env (NOT committed):
-#   BREADTRACKER_BIND=127.0.0.1:7290            host bind (Aegis reaches it over Tailscale, see DEPLOY.md)
+#   BREADTRACKER_BIND=127.0.0.1:7290            host bind; configure your reverse proxy separately
 #   BREADTRACKER_BACKUP_DIR=/var/backups/bread-tracker
-#   BREADTRACKER_FCM_KEY_FILE=/home/breadway/secrets/bread-tracker-fcm.json   Firebase service account
+#   BREADTRACKER_FCM_KEY_FILE=/path/to/secrets/bread-tracker-fcm.json   Firebase service account
 #
 # Pair a phone:  docker exec bread-tracker bread-tracker-server pair
 
@@ -21,10 +21,9 @@ services:
       - "${BREADTRACKER_BIND:-127.0.0.1:7290}:7290"
     environment:
       BREADTRACKER_FCM_SERVICE_ACCOUNT: ${BREADTRACKER_FCM_SERVICE_ACCOUNT:-}
-      BREADTRACKER_TRUSTED_PROXIES: ${BREADTRACKER_TRUSTED_PROXIES:-}
-      BREADTRACKER_PUSH_MODE: ${BREADTRACKER_PUSH_MODE:-notification}
       BREADTRACKER_ADMIN_NAME: ${BREADTRACKER_ADMIN_NAME:-}
       BREADTRACKER_INVITE_TTL_DAYS: ${BREADTRACKER_INVITE_TTL_DAYS:-7}
+      BREADTRACKER_TRUSTED_PROXIES: ${BREADTRACKER_TRUSTED_PROXIES:-}
     volumes:
       - bread-tracker-data:/var/lib/bread-tracker
       # FCM service account, mounted read-only when BREADTRACKER_FCM_KEY_FILE is set.

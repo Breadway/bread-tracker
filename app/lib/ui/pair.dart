@@ -8,15 +8,44 @@ import '../theme.dart';
 import 'widgets.dart';
 
 /// Whether the device holds a token. Invalidate after pairing or unpairing.
-final pairedProvider = FutureProvider<bool>(
-  (ref) async => (await ref.watch(storeProvider).token) != null,
-);
+final pairedProvider = FutureProvider<bool>((ref) async {
+  ref.watch(pairedStateRevisionProvider);
+  final controller = ref.watch(controllerProvider);
+  final store = ref.watch(storeProvider);
+  final generation = store.authGeneration;
+  final appGeneration = controller.currentAuthGeneration;
+  final token = await store.readTokenForGeneration(generation);
+  final server = store.serverUrl;
+  if (token != null &&
+      !controller.hasEstablishedPairing &&
+      !controller.isSignedOutForPairing) {
+    await controller.restoreEstablishedPairing(generation, server);
+  }
+  final acceptedPairing = controller.hasEstablishedPairing
+      ? controller.pairedCredentialAccepted &&
+            controller.acceptedPairingGeneration == appGeneration &&
+            controller.acceptedStoreGeneration == generation &&
+            controller.acceptedPairingServer == server
+      : controller.pairedCredentialAccepted &&
+            !controller.isSignedOutForPairing;
+  return token != null &&
+      acceptedPairing &&
+      store.preferencesReliable &&
+      store.authGeneration == generation &&
+      store.serverUrl == server &&
+      controller.currentAuthGeneration == appGeneration &&
+      (!controller.hasEstablishedPairing ||
+          (controller.acceptedPairingGeneration == appGeneration &&
+              controller.acceptedStoreGeneration == generation &&
+              controller.acceptedPairingServer == store.serverUrl));
+});
 
 enum _Mode { join, pair }
 
 class PairScreen extends ConsumerStatefulWidget {
-  const PairScreen({super.key, this.onSkip});
+  const PairScreen({super.key, this.onSkip, this.joinInitially = true});
   final VoidCallback? onSkip;
+  final bool joinInitially;
   @override
   ConsumerState<PairScreen> createState() => _PairScreenState();
 }
@@ -30,9 +59,89 @@ class _PairScreenState extends ConsumerState<PairScreen> {
   _Mode _mode = _Mode.join;
   bool _busy = false;
   String? _error;
+  String? _issuedTokenForRetry;
+  String? _issuedServerForRetry;
+  String? _issuedCodeForRetry;
+  AccountInfo? _issuedAccountForRetry;
+  PairingOwnership? _retryOwnership;
+  PairingPersistenceReceipt? _persistenceReceipt;
+  int _pairAttemptGeneration = 0;
+  bool _disposed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _mode = widget.joinInitially ? _Mode.join : _Mode.pair;
+    _server.addListener(_onPairInputChanged);
+    _code.addListener(_onPairInputChanged);
+    _name.addListener(_onPairInputChanged);
+  }
+
+  void _onPairInputChanged() {
+    if (_issuedTokenForRetry != null || _retryOwnership != null) {
+      _invalidatePendingPairingResult();
+    } else {
+      _pairAttemptGeneration++;
+    }
+  }
+
+  void _invalidatePendingPairingResult() {
+    _pairAttemptGeneration++;
+    _issuedTokenForRetry = null;
+    _issuedAccountForRetry = null;
+    _issuedServerForRetry = null;
+    _issuedCodeForRetry = null;
+    _retryOwnership = null;
+    _persistenceReceipt = null;
+  }
+
+  Future<void> _recoverKeepingData() async {
+    final controller = ref.read(controllerProvider);
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final recovered = await controller.signOut(wipeLocal: false);
+      if (!mounted) return;
+      if (!recovered || controller.isWipeRecoveryPending) {
+        setState(
+          () => _error = 'Local recovery could not be verified. Your data and pairing result remain preserved. Try again.',
+        );
+        return;
+      }
+      final pendingToken = _issuedTokenForRetry;
+      final pendingServer = _issuedServerForRetry;
+      if (pendingToken != null && pendingServer != null) {
+        // The explicit local keep-data transition changed Store generation.
+        // Rebind the live widget's cached exchange result to that new owner.
+        // The token itself remains widget-scoped and is not written here.
+        _retryOwnership = ref
+            .read(storeProvider)
+            .pairingOwnership(pendingServer);
+      }
+      setState(
+        () => _error = 'Retained data is verified and kept. Tap Pair to finish using the already-issued pairing result.',
+      );
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _error =
+              'Local recovery failed. Your data and pairing result remain preserved. Details: $e',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
 
   @override
   void dispose() {
+    _disposed = true;
+    _invalidatePendingPairingResult();
+    _server.removeListener(_onPairInputChanged);
+    _code.removeListener(_onPairInputChanged);
+    _name.removeListener(_onPairInputChanged);
     _server.dispose();
     _code.dispose();
     _name.dispose();
@@ -93,36 +202,292 @@ class _PairScreenState extends ConsumerState<PairScreen> {
             : 'Enter the 8 character pairing code.',
       );
     }
-    if (!await _confirmReplace() || !mounted) return;
+    final recoveringIssuedWipe = ref
+        .read(controllerProvider)
+        .isWipeRecoveryPending;
+    if ((!recoveringIssuedWipe &&
+            _issuedTokenForRetry == null &&
+            !await _confirmReplace()) ||
+        !mounted) {
+      return;
+    }
     setState(() {
       _busy = true;
       _error = null;
     });
+    final attemptServer = server;
+    final attemptCode = _code.text.trim();
+    final attemptGeneration = ++_pairAttemptGeneration;
+    bool attemptStillCurrent() =>
+        !_disposed &&
+        mounted &&
+        attemptGeneration == _pairAttemptGeneration &&
+        _server.text.trim().replaceAll(RegExp(r'/+$'), '') == attemptServer &&
+        _code.text.trim() == attemptCode;
+    final controller = ref.read(controllerProvider);
+    final store = ref.read(storeProvider);
+    final controllerGeneration = controller.currentAuthGeneration;
+    final appServerBeforeAttempt = store.serverUrl;
+    final matchingPendingResult =
+        _issuedTokenForRetry != null &&
+        _issuedServerForRetry == attemptServer &&
+        _issuedCodeForRetry == attemptCode;
+    final cachedOwnership = _retryOwnership;
+    final retryingIssuedToken =
+        matchingPendingResult &&
+        cachedOwnership != null &&
+        store.ownsPairing(cachedOwnership);
+    var codeWasRedeemed = false;
+    String? issuedToken;
+    PairingOwnership? attemptOwnership;
+    PairingOwnership? cleanupOwnership;
+    var persistenceStarted = false;
     try {
-      final api = ref.read(apiFactoryProvider)(server, null);
-      final AccountInfo account;
-      if (join) {
-        account = await api.signup(
-          invite: _code.text.trim(),
-          name: name,
-          deviceName: 'Android',
-          timezone: await ref.read(phoneTimezoneProvider)(),
+      if (matchingPendingResult && !retryingIssuedToken) {
+        _invalidatePendingPairingResult();
+      }
+      String? token = retryingIssuedToken ? _issuedTokenForRetry : null;
+      if (!retryingIssuedToken) {
+        final api = ref.read(apiFactoryProvider)(attemptServer, null);
+        final AccountInfo account;
+        if (join) {
+          account = await api.signup(
+            invite: attemptCode,
+            name: name,
+            deviceName: 'Android',
+            timezone: await ref.read(phoneTimezoneProvider)(),
+          );
+        } else {
+          account = await api.pair(attemptCode, 'Android');
+        }
+        if (!attemptStillCurrent()) return;
+        codeWasRedeemed = true;
+        issuedToken = account.token;
+        _issuedAccountForRetry = account;
+        token = account.token;
+      }
+      final pairedToken = token!;
+      issuedToken = pairedToken;
+      if (!attemptStillCurrent()) {
+        _invalidatePendingPairingResult();
+        return;
+      }
+      // Claim the new auth generation before any credential/cursor write awaits,
+      // so a pending sign-out cannot wipe data belonging to this pairing.
+      try {
+        if (retryingIssuedToken) {
+          final pendingOwnership = _retryOwnership;
+          if (pendingOwnership == null ||
+              !store.ownsPairing(pendingOwnership)) {
+            throw StateError(
+              'The cached pairing result no longer owns the current credential state. Verify recovery again.',
+            );
+          }
+          attemptOwnership = pendingOwnership;
+          cleanupOwnership = pendingOwnership;
+          if (!await controller.claimPairingAfterRecovery()) {
+            throw StateError(
+              'Retained data recovery verification did not pass.',
+            );
+          }
+          attemptOwnership = store.pairingOwnership(attemptServer);
+          cleanupOwnership = attemptOwnership;
+        } else {
+          await controller.pairedAgain();
+          attemptOwnership = store.pairingOwnership(attemptServer);
+          cleanupOwnership = attemptOwnership;
+        }
+      } on Exception catch (e) {
+        if (!attemptStillCurrent()) {
+          final owner = cleanupOwnership;
+          if (owner != null) {
+            await store.abandonPairingAttempt(owner, pairedToken);
+            if (store.authGeneration == owner.generation &&
+                store.credentialEpoch == owner.epoch &&
+                store.serverUrl == owner.server) {
+              controller.pairingPersistenceFailedForCredentialOwner(
+                controllerGeneration,
+                owner.server,
+              );
+            }
+          }
+          _invalidatePendingPairingResult();
+          return;
+        }
+        if (codeWasRedeemed && cleanupOwnership != null) {
+          await store.abandonPairingAttempt(cleanupOwnership, pairedToken);
+          if (store.authGeneration == cleanupOwnership.generation &&
+              store.serverUrl == cleanupOwnership.server &&
+              store.credentialEpoch == cleanupOwnership.epoch) {
+            controller.pairingPersistenceFailedForCredentialOwner(
+              controllerGeneration,
+              cleanupOwnership.server,
+            );
+          }
+        }
+        _issuedTokenForRetry = pairedToken;
+        _issuedServerForRetry = attemptServer;
+        _issuedCodeForRetry = attemptCode;
+        if (codeWasRedeemed && cleanupOwnership != null) {
+          _retryOwnership = cleanupOwnership;
+        }
+        setState(
+          () => _error =
+              'Local recovery is incomplete. Existing data was preserved. Retry pairing to recover without redeeming the one-time code again. Details: $e',
+        );
+        return;
+      }
+      final owner = attemptOwnership;
+      if (!attemptStillCurrent()) {
+        await store.abandonPairingAttempt(owner, pairedToken);
+        if (store.authGeneration == owner.generation &&
+            store.credentialEpoch == owner.epoch &&
+            store.serverUrl == owner.server) {
+          controller.pairingPersistenceFailedForCredentialOwner(
+            controllerGeneration,
+            owner.server,
+          );
+        }
+        return;
+      }
+      persistenceStarted = true;
+      final account = _issuedAccountForRetry;
+      if (account != null) {
+        await controller.adoptAccount(
+          server: attemptServer,
+          token: pairedToken,
+          account: account,
+          ownership: owner,
+          stillCurrent: attemptStillCurrent,
         );
       } else {
-        account = await api.pair(_code.text.trim(), 'Android');
+        _persistenceReceipt = await store.persistPairing(
+          owner,
+          attemptServer,
+          pairedToken,
+        );
       }
-      await ref.read(controllerProvider).adoptAccount(
-        server: server,
-        token: account.token!,
-        account: account,
-      );
+      if (!attemptStillCurrent()) {
+        if (_persistenceReceipt != null) {
+          await store.rollbackPairing(_persistenceReceipt!);
+        }
+        if (store.authGeneration == owner.generation &&
+            store.credentialEpoch == owner.epoch &&
+            store.serverUrl == owner.server) {
+          controller.pairingPersistenceFailedForCredentialOwner(
+            controllerGeneration,
+            owner.server,
+          );
+        }
+        _invalidatePendingPairingResult();
+        return;
+      }
+      controller.pairingPersisted();
+      _invalidatePendingPairingResult();
+      ref.read(pairedStateRevisionProvider.notifier).refresh();
+      controller.syncNow();
+      ref.read(pushProvider).register(requestPermission: true);
       if (mounted && Navigator.canPop(context)) Navigator.pop(context);
     } on ApiException catch (e) {
-      setState(() => _error = _friendly(e.message, join));
+      if (mounted) {
+        setState(() => _error = _friendly(e.message, join));
+      }
     } on AuthLost catch (e) {
-      setState(() => _error = e.toString());
+      if (mounted) setState(() => _error = e.toString());
+    } catch (e) {
+      final receipt = _persistenceReceipt;
+      final owner = attemptOwnership;
+      final storeRollbackVerified =
+          e is PairingPersistenceFailure && e.restored;
+      if (owner == null &&
+          codeWasRedeemed &&
+          issuedToken != null &&
+          !persistenceStarted) {
+        if (store.authGeneration == controllerGeneration &&
+            store.serverUrl == appServerBeforeAttempt) {
+          await store.abandonPairingAttempt(
+            PairingOwnership(
+              generation: store.authGeneration,
+              epoch: store.credentialEpoch,
+              server: store.serverUrl,
+            ),
+            issuedToken,
+          );
+        }
+      }
+      if (owner != null && issuedToken != null) {
+        try {
+          var cleanupVerified = false;
+          if (receipt != null) {
+            cleanupVerified = await store.rollbackPairing(receipt);
+          } else if (persistenceStarted) {
+            cleanupVerified = storeRollbackVerified;
+          } else if (!persistenceStarted) {
+            await store.abandonPairingAttempt(owner, issuedToken);
+            cleanupVerified =
+                store.authGeneration != owner.generation ||
+                store.credentialEpoch != owner.epoch ||
+                store.serverUrl != owner.server ||
+                await store.token != issuedToken;
+          }
+          if (store.authGeneration == owner.generation &&
+              store.credentialEpoch == owner.epoch &&
+              store.serverUrl == owner.server) {
+            controller.pairingPersistenceFailedForCredentialOwner(
+              controllerGeneration,
+              owner.server,
+            );
+            if (cleanupVerified && codeWasRedeemed && attemptStillCurrent()) {
+              _retryOwnership = store.pairingOwnership(attemptServer);
+              _issuedTokenForRetry = issuedToken;
+              _issuedServerForRetry = attemptServer;
+              _issuedCodeForRetry = attemptCode;
+            }
+          }
+          if (!cleanupVerified) {
+            controller.pairingPersistenceFailedForCredentialOwner(
+              controllerGeneration,
+              owner.server,
+            );
+            if (mounted) {
+              setState(() {
+                _error =
+                    'Pairing was issued, but credential restoration could not be verified. Pairing remains closed and no cached retry is available. Details: $e';
+                _issuedTokenForRetry = null;
+                _issuedServerForRetry = null;
+                _issuedCodeForRetry = null;
+                _retryOwnership = null;
+              });
+            }
+            return;
+          }
+          _persistenceReceipt = null;
+        } catch (cleanupError) {
+          controller.pairingPersistenceFailedForCredentialOwner(
+            controllerGeneration,
+            owner.server,
+          );
+          if (mounted) {
+            setState(() {
+              _error =
+                  'Pairing was issued, but local cleanup could not be verified. Pairing remains unavailable in this screen. Verify server credentials before retrying. Details: $e; cleanup: $cleanupError';
+              _issuedTokenForRetry = null;
+              _issuedServerForRetry = null;
+              _issuedCodeForRetry = null;
+              _retryOwnership = null;
+            });
+          }
+          return;
+        }
+      }
+      if (mounted) {
+        setState(() {
+          _error =
+              'Pairing was issued, but local recovery failed. Existing data was preserved. Retry pairing to finish locally without redeeming the code again. Details: $e';
+        });
+      }
     } finally {
-      if (mounted) setState(() => _busy = false);
+      if (mounted && !_disposed) setState(() => _busy = false);
     }
   }
 
@@ -170,8 +535,14 @@ class _PairScreenState extends ConsumerState<PairScreen> {
             const SizedBox(height: 16),
             SegmentedButton<_Mode>(
               segments: const [
-                ButtonSegment(value: _Mode.join, label: Text('Join with an invite')),
-                ButtonSegment(value: _Mode.pair, label: Text('Pair with a code')),
+                ButtonSegment(
+                  value: _Mode.join,
+                  label: Text('Join with an invite'),
+                ),
+                ButtonSegment(
+                  value: _Mode.pair,
+                  label: Text('Pair with a code'),
+                ),
               ],
               selected: {_mode},
               onSelectionChanged: _busy
@@ -220,11 +591,18 @@ class _PairScreenState extends ConsumerState<PairScreen> {
                 padding: const EdgeInsets.only(top: 12),
                 child: Text(_error!, style: TextStyle(color: p.pink)),
               ),
+            if (_issuedTokenForRetry != null && _error != null)
+              TextButton(
+                onPressed: _busy ? null : _recoverKeepingData,
+                child: const Text('Verify recovery and keep data'),
+              ),
             const SizedBox(height: 20),
             FilledButton(
               onPressed: _busy ? null : _submit,
               child: Text(
-                _busy ? (join ? 'Joining...' : 'Pairing...') : (join ? 'Join' : 'Pair'),
+                _busy
+                    ? (join ? 'Joining...' : 'Pairing...')
+                    : (join ? 'Join' : 'Pair'),
               ),
             ),
             if (widget.onSkip != null) ...[

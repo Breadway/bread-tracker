@@ -17,36 +17,58 @@ import 'fx/sfx.dart';
 import 'push.dart';
 import 'rules.dart';
 import 'theme.dart';
-import 'ui/pair.dart' show pairedProvider;
 
 final prefsProvider = Provider<SharedPreferences>(
   (ref) => throw UnimplementedError('override in main'),
 );
 final storeProvider = Provider<Store>((ref) => Store(ref.watch(prefsProvider)));
+final appStoreProvider = storeProvider;
 final dbProvider = Provider<AppDb>((ref) {
   final db = AppDb();
   ref.onDispose(db.close);
   return db;
 });
 final syncEngineProvider = Provider<SyncEngine>(
-  (ref) => SyncEngine(ref.watch(dbProvider), ref.watch(storeProvider)),
+  (ref) => SyncEngine(
+    ref.watch(dbProvider),
+    ref.watch(storeProvider),
+    apiFactory: ref.watch(apiFactoryProvider),
+  ),
 );
+
 /// How the app builds an [Api] for one-off calls (settings, sign out). Tests override it.
 final apiFactoryProvider = Provider<Api Function(String base, String? token)>(
-  (ref) => (base, token) => Api(base, token: token),
+  (ref) =>
+      (base, token) => Api(base, token: token),
 );
 
 /// The phone's IANA timezone name (for example `Europe/Berlin`), or null when unknown.
 /// Tests override it; failures must never block signing up.
-final phoneTimezoneProvider = Provider<Future<String?> Function()>((ref) => () async {
-  try {
-    return (await FlutterTimezone.getLocalTimezone()).identifier;
-  } catch (_) {
-    return null;
-  }
-});
+final phoneTimezoneProvider = Provider<Future<String?> Function()>(
+  (ref) => () async {
+    try {
+      return (await FlutterTimezone.getLocalTimezone()).identifier;
+    } catch (_) {
+      return null;
+    }
+  },
+);
 final sfxProvider = Provider<Sfx>((ref) => NoSfx());
 final pushProvider = Provider<PushService>((ref) => NoPushService());
+
+ProviderContainer createAppContainer({
+  required SharedPreferences prefs,
+  required Store store,
+  required Sfx sfx,
+  required PushService push,
+}) => ProviderContainer(
+  overrides: [
+    prefsProvider.overrideWithValue(prefs),
+    storeProvider.overrideWithValue(store),
+    sfxProvider.overrideWithValue(sfx),
+    pushProvider.overrideWithValue(push),
+  ],
+);
 final fxProvider = Provider<FxController>((ref) {
   final c = FxController();
   ref.onDispose(c.dispose);
@@ -89,24 +111,6 @@ final selectedDayProvider = NotifierProvider<SelectedDayNotifier, DateTime>(
   SelectedDayNotifier.new,
 );
 
-/// A request to show the Today screen on a given day, from a tapped notification.
-class OpenTodayRequest {
-  const OpenTodayRequest(this.date, this.serial);
-  final String? date;
-  final int serial;
-}
-
-class OpenTodayNotifier extends Notifier<OpenTodayRequest?> {
-  int _n = 0;
-  @override
-  OpenTodayRequest? build() => null;
-  void request(String? date) => state = OpenTodayRequest(date, ++_n);
-}
-
-final openTodayProvider = NotifierProvider<OpenTodayNotifier, OpenTodayRequest?>(
-  OpenTodayNotifier.new,
-);
-
 class SyncStatusNotifier extends Notifier<SyncStatus> {
   @override
   SyncStatus build() => SyncStatus.idle;
@@ -115,6 +119,19 @@ class SyncStatusNotifier extends Notifier<SyncStatus> {
 
 final syncStatusProvider = NotifierProvider<SyncStatusNotifier, SyncStatus>(
   SyncStatusNotifier.new,
+);
+
+/// Revision for consumers of the persisted pairing state. Auth transitions bump
+/// this dependency without coupling the controller to a UI-owned provider.
+class PairedStateRevision extends Notifier<int> {
+  @override
+  int build() => 0;
+
+  void refresh() => state++;
+}
+
+final pairedStateRevisionProvider = NotifierProvider<PairedStateRevision, int>(
+  PairedStateRevision.new,
 );
 
 List<RItem> toRItems(List<ItemRow> rows) => [
@@ -155,6 +172,14 @@ class StarterChore {
   final int weekdays;
 }
 
+class _AuthTransitionSuperseded implements Exception {
+  const _AuthTransitionSuperseded();
+}
+
+class _LocalWipeFailed implements Exception {
+  const _LocalWipeFailed();
+}
+
 const starterChores = [
   StarterChore('Take out the bins', 1, '18:00'),
   StarterChore('Water the plants', 4, '17:00'),
@@ -169,31 +194,56 @@ class AppController {
   AppController(this.ref);
   final Ref ref;
   Timer? _syncTimer;
+  int _authGeneration = 0;
+  int _pairedGeneration = 0;
+  int? _pairedStoreGeneration;
+  String? _pairedServer;
+  bool _signedOut = false;
+  bool _signOutCleanupPending = false;
+  bool _pairingPending = false;
+  bool _pairedCredentialAccepted = false;
+  bool get pairedCredentialAccepted => _pairedCredentialAccepted;
+  bool _hasEstablishedPairing = false;
+  bool get isSignedOutForPairing =>
+      _signedOut || _pairingPending || _signOutCleanupPending;
+  Completer<void>? _wipeCommitCompletion;
+  bool _wipeCommitFailed = false;
+  bool get isWipeRecoveryPending => _wipeCommitFailed;
+  Future<bool>? _wipeRecovery;
   int _combo = 0;
   DateTime _lastTick = DateTime.fromMillisecondsSinceEpoch(0);
 
   AppDb get _db => ref.read(dbProvider);
+  int get currentAuthGeneration => _authGeneration;
+  int get acceptedPairingGeneration => _pairedGeneration;
+  int? get acceptedStoreGeneration => _pairedStoreGeneration;
+  String? get acceptedPairingServer => _pairedServer;
+  bool get hasEstablishedPairing => _hasEstablishedPairing;
 
   static int nowMs() => DateTime.now().millisecondsSinceEpoch;
 
   void scheduleSync() {
+    if (_signedOut) return;
     _syncTimer?.cancel();
     _syncTimer = Timer(const Duration(milliseconds: 1500), syncNow);
   }
 
   Future<void> syncNow() async {
+    if (_signedOut || _signOutCleanupPending || _pairingPending) return;
+    final generation = _authGeneration;
     SyncStatus status;
     try {
       status = await ref.read(syncEngineProvider).sync();
     } catch (_) {
-      // A sync failure must never escape as an unhandled async error from a timer.
+      // Timer-driven sync errors are reported as offline, not unhandled async errors.
       status = SyncStatus.offline;
     }
+    if (generation != _authGeneration || _signedOut) return;
     if (status != SyncStatus.syncing) {
       ref.read(syncStatusProvider.notifier).set(status);
     }
     if (status == SyncStatus.unpaired) {
-      ref.invalidate(pairedProvider);
+      ref.read(pairedStateRevisionProvider.notifier).refresh();
       unawaited(ref.read(pushProvider).register());
     }
   }
@@ -206,7 +256,11 @@ class AppController {
   Future<bool> localDataAtRisk() async {
     final store = ref.read(storeProvider);
     await ensureAccount();
-    if (store.account == null && await store.token == null) return false;
+    if (store.account == null &&
+        await store.token == null &&
+        !store.prefs.containsKey('account_owner_unknown')) {
+      return false;
+    }
     return await _db.hasLocalData();
   }
 
@@ -215,28 +269,76 @@ class AppController {
   /// The local database is one store shared by whoever signs in, so rows from a previous
   /// account must never be mixed into the new one or pushed to it. If the account or server
   /// differs from the recorded one, or the phone has a token from before accounts were
-  /// recorded (so the owner is unknown), the local items and ticks are deleted first. The same
+  /// recorded (so the owner is unknown), local rows are deleted only after new credentials
+  /// persist successfully, inside a database transaction. The same
   /// account again keeps its data and offers it to the server, and a phone with no history
   /// (offline use only) keeps its data and uploads it. Returns whether local data was deleted.
   Future<bool> adoptAccount({
     required String server,
     required String token,
     required AccountInfo account,
+    PairingOwnership? ownership,
+    bool Function()? stillCurrent,
   }) async {
     final store = ref.read(storeProvider);
-    await ensureAccount(); // a pre-accounts phone learns whose data it holds before we decide
+    await ensureAccount();
+    server = server.trim().replaceAll(RegExp(r'/+$'), '');
     final prev = store.account;
     final hadToken = await store.token != null;
     final same = prev != null && prev.sameAs(server, account.userId);
-    final wipe = !same && (prev != null || hadToken);
-    if (wipe) await _db.clearAll();
-    await store.setServerUrl(server);
-    await store.saveToken(token);
-    await store.setAccount(Account(server, account.userId, account.name));
-    await store.resetSync();
-    // A new or rebuilt server may be empty, so offer it everything we keep.
-    if (!wipe) await _db.markAllDirty();
-    ref.invalidate(pairedProvider);
+    final wipe =
+        !same &&
+        (prev != null ||
+            hadToken ||
+            store.prefs.containsKey('account_owner_unknown'));
+    if (ownership == null) await pairedAgain();
+    final generation = _authGeneration;
+    final owner = ownership ?? store.pairingOwnership(server);
+    PairingPersistenceReceipt? receipt;
+    final previousAccount = store.account;
+    final completion = Completer<void>();
+    try {
+      await _db.transaction(() async {
+        // Persist credentials before deleting rows. A storage failure must never
+        // irreversibly erase the previous account's local data.
+        receipt = await store.persistPairing(owner, server, token);
+        await store.setAccount(Account(server, account.userId, account.name));
+        if (generation != _authGeneration || !(stillCurrent?.call() ?? true)) {
+          throw const _AuthTransitionSuperseded();
+        }
+        // Fence claims only at the destructive transaction boundary. While
+        // credential I/O is pending, a newer claim must be able to supersede it.
+        _wipeCommitCompletion = completion;
+        if (wipe) {
+          await _db.delete(_db.completions).go();
+          await _db.delete(_db.items).go();
+        } else {
+          await _db.markAllDirty();
+        }
+        if (!(stillCurrent?.call() ?? true)) {
+          throw const _AuthTransitionSuperseded();
+        }
+      });
+      pairingPersisted();
+    } catch (_) {
+      final saved = receipt;
+      if (saved != null) await store.rollbackPairing(saved);
+      if (store.authGeneration == owner.generation) {
+        if (previousAccount != null) {
+          await store.setAccount(previousAccount);
+        } else {
+          await store.clearAccount();
+        }
+        pairingPersistenceFailed();
+      }
+      rethrow;
+    } finally {
+      if (identical(_wipeCommitCompletion, completion)) {
+        _wipeCommitCompletion = null;
+      }
+      if (!completion.isCompleted) completion.complete();
+    }
+    ref.read(pairedStateRevisionProvider.notifier).refresh();
     unawaited(syncNow());
     unawaited(ref.read(pushProvider).register(requestPermission: true));
     return wipe;
@@ -248,11 +350,22 @@ class AppController {
   Future<void> ensureAccount() async {
     final store = ref.read(storeProvider);
     if (store.account != null) return;
-    final token = await store.token;
+    final generation = store.authGeneration;
+    final server = store.serverUrl;
+    final token = await store.readTokenForGeneration(generation);
     if (token == null) return;
+    // Preserve unknown legacy provenance even after keep-data signout. Offline
+    // owner discovery must not relabel those rows as never-paired local data.
+    if (!await store.prefs.setBool('account_owner_unknown', true)) {
+      throw StateError('Could not preserve local account ownership.');
+    }
+    if (store.authGeneration != generation || store.serverUrl != server) return;
     try {
-      final me = await ref.read(apiFactoryProvider)(store.serverUrl, token).me();
-      await store.setAccount(Account(store.serverUrl, me.userId, me.name));
+      final me = await ref.read(apiFactoryProvider)(server, token).me();
+      await store.runIfTokenCurrent(token, generation, () async {
+        if (store.serverUrl != server) return;
+        await store.setAccount(Account(server, me.userId, me.name));
+      });
     } catch (_) {}
   }
 
@@ -260,30 +373,383 @@ class AppController {
   /// offline), forget the token and sync cursor, and optionally delete the local data.
   /// Returns false when the server could not be told, so the caller can say the token may
   /// still be valid until revoked from the server.
-  Future<bool> signOut({bool wipeLocal = false}) async {
+  Future<bool> signOut({
+    bool wipeLocal = false,
+    int? expectedAuthGeneration,
+    int? expectedStoreGeneration,
+    String? expectedServer,
+  }) async {
+    final pendingWipe = _wipeCommitCompletion;
+    if (pendingWipe != null) await pendingWipe.future;
     final store = ref.read(storeProvider);
-    await ensureAccount(); // remember whose data stays on the phone if it is kept
-    final token = await store.token;
+    if ((expectedAuthGeneration != null &&
+            _authGeneration != expectedAuthGeneration) ||
+        (expectedStoreGeneration != null &&
+            store.authGeneration != expectedStoreGeneration) ||
+        (expectedServer != null && store.serverUrl != expectedServer)) {
+      return false;
+    }
+    store.claimAuthGeneration();
+    final storeGeneration = store.authGeneration;
+    final wipeRecoveryRetry = !wipeLocal && _wipeCommitFailed;
+    final generation = ++_authGeneration;
+    _signedOut = true;
+    _pairedCredentialAccepted = false;
+    _signOutCleanupPending = true;
+    _pairingPending = false;
+    _syncTimer?.cancel();
+    ref.read(syncEngineProvider).beginSignOut();
+    final epoch = store.credentialEpoch;
+    final cursorBeforeCleanup = store.cursor;
+    final token = await store.readTokenForGeneration(storeGeneration);
+    if (token != null && store.account == null) {
+      if (!await store.prefs.setBool('account_owner_unknown', true)) {
+        throw StateError('Could not preserve local account ownership.');
+      }
+    }
+    if (generation != _authGeneration ||
+        (!_signedOut && !wipeRecoveryRetry) ||
+        store.credentialEpoch != epoch ||
+        store.authGeneration != storeGeneration) {
+      return false;
+    }
+    if (wipeRecoveryRetry && _wipeCommitFailed) {
+      return store.runIfCredentialCurrentForRecovery(
+        token,
+        storeGeneration,
+        store.serverUrl,
+        () async {
+          try {
+            await _db.select(_db.items).get();
+            await _db.select(_db.completions).get();
+            await store.resetSync();
+            _wipeCommitFailed = false;
+            _signOutCleanupPending = false;
+            return true;
+          } catch (_) {
+            return false;
+          }
+        },
+      );
+    }
+    final server = store.serverUrl;
     var revoked = true;
     if (token != null) {
       try {
-        await ref.read(apiFactoryProvider)(store.serverUrl, token).signOut();
+        await ref.read(apiFactoryProvider)(server, token).signOut();
       } on AuthLost {
         // Already revoked on the server.
       } catch (_) {
         revoked = false;
       }
     }
-    await store.clearToken();
-    await store.resetSync();
-    if (wipeLocal) {
-      await _db.clearAll();
-      await store.clearAccount();
+    // DELETE can be slow. Pairing a replacement credential while it is in-flight
+    // transfers ownership to the new generation, so the old sign-out must not
+    // clear that credential, cursor, or the replacement device's local data.
+    if (generation != _authGeneration ||
+        (!_signedOut && !wipeRecoveryRetry) ||
+        store.authGeneration != storeGeneration) {
+      return revoked;
     }
-    ref.read(syncStatusProvider.notifier).set(SyncStatus.unpaired);
-    ref.invalidate(pairedProvider);
-    unawaited(ref.read(pushProvider).register());
+    final cleanup = token == null
+        ? await store.runIfTokenlessAndEpochCurrent(
+            epoch,
+            () async {
+              if (generation != _authGeneration || !_signedOut) return;
+              await _finishSignoutCleanup(
+                generation,
+                epoch,
+                cursorBeforeCleanup,
+                wipeLocal,
+              );
+            },
+            expectedGeneration: storeGeneration,
+            expectedServer: server,
+          )
+        : await store.clearTokenAndRunIfCurrent(
+            token,
+            epoch,
+            () async {
+              if (generation != _authGeneration || !_signedOut) return;
+              await _finishSignoutCleanup(
+                generation,
+                epoch,
+                cursorBeforeCleanup,
+                wipeLocal,
+              );
+            },
+            expectedGeneration: storeGeneration,
+            expectedServer: server,
+          );
+    if (!cleanup ||
+        generation != _authGeneration ||
+        (!_signedOut && !wipeRecoveryRetry) ||
+        store.credentialEpoch != epoch ||
+        store.authGeneration != storeGeneration) {
+      return revoked;
+    }
+    _signOutCleanupPending = false;
+    if (!wipeLocal && _wipeCommitFailed) _wipeCommitFailed = false;
+    if (generation == _authGeneration &&
+        (_signedOut || wipeRecoveryRetry) &&
+        store.credentialEpoch == epoch) {
+      ref.read(syncStatusProvider.notifier).set(SyncStatus.unpaired);
+      ref.read(pairedStateRevisionProvider.notifier).refresh();
+      unawaited(ref.read(pushProvider).register());
+    }
     return revoked;
+  }
+
+  Future<void> _finishSignoutCleanup(
+    int generation,
+    int epoch,
+    int cursorBeforeCleanup,
+    bool wipeLocal,
+  ) async {
+    final store = ref.read(storeProvider);
+    if (generation != _authGeneration ||
+        !_signedOut ||
+        store.credentialEpoch != epoch) {
+      return;
+    }
+    try {
+      await store.resetSync();
+    } catch (_) {
+      var restored = false;
+      try {
+        await store.setCursor(cursorBeforeCleanup);
+        restored = store.cursor == cursorBeforeCleanup;
+      } catch (_) {
+        restored = false;
+      }
+      if (!restored) {
+        store.markPreferencesUnreliable();
+      }
+      rethrow;
+    }
+    if (generation != _authGeneration ||
+        !_signedOut ||
+        store.credentialEpoch != epoch) {
+      return;
+    }
+    if (wipeLocal) {
+      try {
+        if (!await _wipeLocalIfCurrent(generation)) {
+          if (_wipeCommitFailed) throw const _LocalWipeFailed();
+          await store.setCursor(cursorBeforeCleanup);
+        } else {
+          await store.clearAccount();
+        }
+      } catch (_) {
+        var restored = false;
+        try {
+          await store.setCursor(cursorBeforeCleanup);
+          restored = store.cursor == cursorBeforeCleanup;
+        } catch (_) {
+          restored = false;
+        }
+        if (!restored) {
+          store.markPreferencesUnreliable();
+        }
+        rethrow;
+      }
+    }
+    if (generation != _authGeneration ||
+        !_signedOut ||
+        store.credentialEpoch != epoch) {
+      return;
+    }
+  }
+
+  Future<bool> _wipeLocalIfCurrent(int generation) async {
+    final completion = Completer<void>();
+    _wipeCommitCompletion = completion;
+    try {
+      await _db.transaction(() async {
+        if (generation != _authGeneration || !_signedOut) {
+          throw const _AuthTransitionSuperseded();
+        }
+        await _db.delete(_db.completions).go();
+        await _db.delete(_db.items).go();
+        if (generation != _authGeneration || !_signedOut) {
+          throw const _AuthTransitionSuperseded();
+        }
+      });
+      _wipeCommitFailed = false;
+      return generation == _authGeneration && _signedOut;
+    } on _AuthTransitionSuperseded {
+      return false;
+    } catch (_) {
+      _wipeCommitFailed = true;
+      rethrow;
+    } finally {
+      if (identical(_wipeCommitCompletion, completion)) {
+        _wipeCommitCompletion = null;
+      }
+      if (!completion.isCompleted) completion.complete();
+    }
+  }
+
+  Future<void> pairedAgain() async {
+    final pendingWipe = _wipeCommitCompletion;
+    if (pendingWipe != null) await pendingWipe.future;
+    if (_wipeCommitFailed) throw const _LocalWipeFailed();
+    _authGeneration++;
+    _signedOut = false;
+    _pairedCredentialAccepted = false;
+    ref.read(storeProvider).claimPairingOwnership();
+    _pairingPending = true;
+    // Keep sync admission closed until the old sign-out's local cleanup finishes.
+    ref.read(syncEngineProvider).invalidate();
+  }
+
+  /// Recover a rolled-back destructive wipe without deleting retained rows or
+  /// revoking the just-issued pairing credential. The caller must retry the
+  /// pending pairing only after this returns true.
+  Future<bool> recoverAfterWipeFailure() async {
+    if (!_wipeCommitFailed) return true;
+    final active = _wipeRecovery;
+    if (active != null) return active;
+    final recovery = _verifyRolledBackDatabase();
+    _wipeRecovery = recovery;
+    try {
+      return await recovery;
+    } finally {
+      if (identical(_wipeRecovery, recovery)) _wipeRecovery = null;
+    }
+  }
+
+  Future<bool> _verifyRolledBackDatabase() async {
+    final pendingWipe = _wipeCommitCompletion;
+    if (pendingWipe != null) await pendingWipe.future;
+    if (!_wipeCommitFailed) return true;
+    try {
+      // Read every retained row before releasing the fail-closed latch. This
+      // proves rollback readability on the current production executor. The
+      // latch remains set until a keep-data sign-out completes successfully.
+      await _db.select(_db.items).get();
+      await _db.select(_db.completions).get();
+      return _wipeCommitFailed;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> claimPairingAfterRecovery() async {
+    final recovered = await recoverAfterWipeFailure();
+    if (!recovered) return false;
+    if (_wipeCommitFailed) {
+      // This is an explicit keep-data recovery transition, serialized with
+      // token/cursor mutations. It does not contact the server or wipe rows.
+      final store = ref.read(storeProvider);
+      final generation = store.authGeneration;
+      final server = store.serverUrl;
+      final token = await store.readTokenForGeneration(generation);
+      if (store.authGeneration != generation || store.serverUrl != server) {
+        return false;
+      }
+      final kept = await store.runIfCredentialCurrentForRecovery(
+        token,
+        generation,
+        server,
+        () async {
+          try {
+            await _db.select(_db.items).get();
+            await _db.select(_db.completions).get();
+            await store.resetSync();
+            return true;
+          } catch (_) {
+            return false;
+          }
+        },
+      );
+      if (!kept) return false;
+      _wipeCommitFailed = false;
+    }
+    if (_wipeCommitFailed) return false;
+    _authGeneration++;
+    _signedOut = true;
+    _pairedCredentialAccepted = false;
+    ref.read(storeProvider).claimPairingOwnership();
+    _pairingPending = true;
+    ref.read(syncEngineProvider).invalidate();
+    return true;
+  }
+
+  Future<bool> restoreEstablishedPairing(
+    int storeGeneration,
+    String server,
+  ) async {
+    if (_hasEstablishedPairing || _signedOut || _pairingPending) return false;
+    final store = ref.read(storeProvider);
+    final token = await store.readTokenForGeneration(storeGeneration);
+    if (token == null ||
+        _hasEstablishedPairing ||
+        _signedOut ||
+        _pairingPending ||
+        _signOutCleanupPending ||
+        store.authGeneration != storeGeneration ||
+        store.serverUrl != server) {
+      return false;
+    }
+    _pairedCredentialAccepted = true;
+    _pairedGeneration = _authGeneration;
+    _pairedStoreGeneration = storeGeneration;
+    _pairedServer = server;
+    _hasEstablishedPairing = true;
+    return true;
+  }
+
+  Future<void> abandonRecoveredPairing(String expectedToken) async {
+    final store = ref.read(storeProvider);
+    final generation = store.authGeneration;
+    final server = store.serverUrl;
+    await store.clearTokenIfCurrent(
+      expectedToken,
+      generation,
+      expectedServer: server,
+    );
+    if (store.authGeneration == generation && store.serverUrl == server) {
+      _authGeneration++;
+      _signedOut = true;
+      _pairingPending = false;
+      _signOutCleanupPending = false;
+      ref.read(syncEngineProvider).invalidate();
+    }
+  }
+
+  void pairingPersistenceFailed() {
+    _pairingPending = false;
+    _signedOut = true;
+    _pairedCredentialAccepted = false;
+    _signOutCleanupPending = true;
+    ref.read(syncEngineProvider).invalidate();
+  }
+
+  void pairingPersistenceFailedForCredentialOwner(
+    int expectedGeneration,
+    String expectedServer,
+  ) {
+    final store = ref.read(storeProvider);
+    if (_authGeneration != expectedGeneration ||
+        store.serverUrl != expectedServer) {
+      return;
+    }
+    pairingPersistenceFailed();
+  }
+
+  void pairingPersisted() {
+    _pairingPending = false;
+    _signedOut = false;
+    _pairedCredentialAccepted = true;
+    _pairedGeneration = _authGeneration;
+    _pairedStoreGeneration = ref.read(storeProvider).authGeneration;
+    _pairedServer = ref.read(storeProvider).serverUrl;
+    _hasEstablishedPairing = true;
+    if (!_signedOut) {
+      _signOutCleanupPending = false;
+      ref.read(syncEngineProvider).revalidate();
+    }
   }
 
   Future<void> toggle(ItemRow item, DateTime date, {Offset? at}) async {

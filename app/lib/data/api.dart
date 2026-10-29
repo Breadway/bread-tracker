@@ -9,8 +9,9 @@ class AuthLost implements Exception {
 }
 
 class ApiException implements Exception {
-  ApiException(this.message);
+  ApiException(this.message, {this.statusCode});
   final String message;
+  final int? statusCode;
   @override
   String toString() => message;
 }
@@ -136,6 +137,7 @@ class Api {
       throw ApiException(
         (parsed && decoded is Map ? decoded['error'] : null)?.toString() ??
             'Server error ${res.statusCode}',
+        statusCode: res.statusCode,
       );
     }
     if (!parsed || decoded is! Map) {
@@ -145,9 +147,10 @@ class Api {
   }
 
   /// Add this device to the account the code was made for.
-  Future<AccountInfo> pair(String code, String deviceName) async => AccountInfo.fromJson(
-    await _send('POST', '/pair', {'code': code, 'device_name': deviceName}),
-  );
+  Future<AccountInfo> pair(String code, String deviceName) async =>
+      AccountInfo.fromJson(
+        await _send('POST', '/pair', {'code': code, 'device_name': deviceName}),
+      );
 
   /// Create an account from an invite code. [timezone] is the phone's IANA zone, if known.
   Future<AccountInfo> signup({
@@ -165,12 +168,16 @@ class Api {
   );
 
   /// Who this token belongs to.
-  Future<AccountInfo> me() async => AccountInfo.fromJson(await _send('GET', '/me'));
+  Future<AccountInfo> me() async =>
+      AccountInfo.fromJson(await _send('GET', '/me'));
 
   /// A code for adding another device to this account.
   Future<PairCode> newPairCode() async {
     final r = await _send('POST', '/pair-code');
-    return PairCode(r['code'] as String, (r['expires_in_secs'] as num?)?.toInt() ?? 900);
+    return PairCode(
+      r['code'] as String,
+      (r['expires_in_secs'] as num?)?.toInt() ?? 900,
+    );
   }
 
   Future<Map<String, dynamic>> sync(
@@ -204,4 +211,6 @@ class Api {
 
   /// Ask the server to revoke this device's token.
   Future<void> signOut() => _send('DELETE', '/device');
+
+  Future<Map<String, dynamic>> createPairCode() => _send('POST', '/pair-code');
 }

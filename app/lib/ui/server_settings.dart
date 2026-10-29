@@ -14,10 +14,22 @@ import 'widgets.dart';
 final serverSettingsProvider = FutureProvider.autoDispose<ServerSettings>((
   ref,
 ) async {
+  ref.watch(pairedStateRevisionProvider);
   final store = ref.watch(storeProvider);
-  final token = await store.token;
+  final generation = store.authGeneration;
+  final server = store.serverUrl;
+  final token = await store.readTokenForGeneration(generation);
+  if (store.authGeneration != generation || store.serverUrl != server) {
+    throw ApiException('Account changed. Reload settings.');
+  }
   if (token == null) throw ApiException('Not paired');
-  return ref.watch(apiFactoryProvider)(store.serverUrl, token).getSettings();
+  final settings = await ref
+      .read(apiFactoryProvider)(server, token)
+      .getSettings();
+  if (store.authGeneration != generation || store.serverUrl != server) {
+    throw ApiException('Account changed. Reload settings.');
+  }
+  return settings;
 }, retry: (_, _) => null);
 
 String _hhmm(TimeOfDay t) =>
@@ -86,9 +98,19 @@ class _Loaded extends ConsumerWidget {
     final messenger = ScaffoldMessenger.of(context);
     try {
       final store = ref.read(storeProvider);
-      final token = await store.token;
+      final generation = store.authGeneration;
+      final server = store.serverUrl;
+      final token = await store.readTokenForGeneration(generation);
+      if (store.authGeneration != generation || store.serverUrl != server) {
+        return;
+      }
       if (token == null) throw ApiException('Not paired');
-      await ref.read(apiFactoryProvider)(store.serverUrl, token).putSettings(patch);
+      await ref.read(apiFactoryProvider)(server, token).putSettings(patch);
+      if (!context.mounted ||
+          store.authGeneration != generation ||
+          store.serverUrl != server) {
+        return;
+      }
       ref.invalidate(serverSettingsProvider);
     } on ApiException catch (e) {
       messenger.showSnackBar(SnackBar(content: Text(e.message)));
@@ -101,8 +123,13 @@ class _Loaded extends ConsumerWidget {
     }
   }
 
-  Future<void> _pickQuiet(BuildContext context, WidgetRef ref, bool start) async {
-    final cur = _parse(start ? settings.quietStart : settings.quietEnd) ??
+  Future<void> _pickQuiet(
+    BuildContext context,
+    WidgetRef ref,
+    bool start,
+  ) async {
+    final cur =
+        _parse(start ? settings.quietStart : settings.quietEnd) ??
         TimeOfDay(hour: start ? 22 : 7, minute: 0);
     final picked = await showTimePicker(context: context, initialTime: cur);
     if (picked == null || !context.mounted) return;
@@ -139,7 +166,9 @@ class _Loaded extends ConsumerWidget {
             child: SwitchListTile(
               contentPadding: EdgeInsets.zero,
               title: const Text('Send reminders'),
-              subtitle: const Text('Turn off to stop all reminder notifications'),
+              subtitle: const Text(
+                'Turn off to stop all reminder notifications',
+              ),
               value: settings.remindersEnabled,
               onChanged: (v) => _save(context, ref, {'reminders_enabled': v}),
             ),
@@ -168,7 +197,8 @@ class _Loaded extends ConsumerWidget {
           PanelButton(
             icon: Icons.notifications_active_outlined,
             title: 'Turn quiet hours off',
-            onTap: () => _save(context, ref, {'quiet_start': '', 'quiet_end': ''}),
+            onTap: () =>
+                _save(context, ref, {'quiet_start': '', 'quiet_end': ''}),
           ),
         ],
         const Spacer8(),

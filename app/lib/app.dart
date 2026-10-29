@@ -5,7 +5,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'fx/fx.dart';
-import 'reminders.dart';
 import 'state.dart';
 import 'theme.dart';
 import 'ui/pair.dart';
@@ -52,8 +51,25 @@ class _GateState extends ConsumerState<Gate> {
         if (isPaired || skipped) return const Shell();
         return PairScreen(
           onSkip: () async {
-            await prefs.setBool('skipPair', true);
-            setState(() {});
+            try {
+              final saved = await prefs.setBool('skipPair', true);
+              if (!saved) {
+                await prefs.reload();
+                if (!(prefs.getBool('skipPair') ?? false)) {
+                  throw StateError('Offline choice was not persisted.');
+                }
+              }
+              if (mounted) setState(() {});
+            } catch (_) {
+              if (!context.mounted) return;
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text(
+                    'Could not save offline mode. Pairing remains available.',
+                  ),
+                ),
+              );
+            }
           },
         );
       },
@@ -71,7 +87,6 @@ class _ShellState extends ConsumerState<Shell> with WidgetsBindingObserver {
   int _tab = 0;
   Timer? _poll;
   StreamSubscription<List<ConnectivityResult>>? _conn;
-  StreamSubscription<ReminderPayload>? _taps;
 
   @override
   void initState() {
@@ -80,9 +95,6 @@ class _ShellState extends ConsumerState<Shell> with WidgetsBindingObserver {
     final ctl = ref.read(controllerProvider);
     ctl.syncNow();
     ref.read(pushProvider).register();
-    _taps = ref.read(pushProvider).taps.listen(
-      (p) => ref.read(openTodayProvider.notifier).request(p.date),
-    );
     _poll = Timer.periodic(const Duration(seconds: 60), (_) => ctl.syncNow());
     _conn = Connectivity().onConnectivityChanged.listen((r) {
       if (r.any((c) => c != ConnectivityResult.none)) {
@@ -96,8 +108,6 @@ class _ShellState extends ConsumerState<Shell> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       ref.read(todayProvider.notifier).refresh();
-      // A notification action may have written rows from another isolate while we slept.
-      ref.read(dbProvider).refreshStreams();
       ref.read(controllerProvider).syncNow();
       ref.read(pushProvider).register();
     }
@@ -107,23 +117,12 @@ class _ShellState extends ConsumerState<Shell> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _poll?.cancel();
-    _taps?.cancel();
     _conn?.cancel().catchError((_) {});
     super.dispose();
   }
 
-  void _openToday(OpenTodayRequest? r) {
-    if (r == null) return;
-    final d = r.date == null ? null : DateTime.tryParse(r.date!);
-    if (d != null) {
-      ref.read(selectedDayProvider.notifier).select(DateTime.utc(d.year, d.month, d.day));
-    }
-    setState(() => _tab = 0);
-  }
-
   @override
   Widget build(BuildContext context) {
-    ref.listen(openTodayProvider, (_, r) => _openToday(r));
     return Scaffold(
       body: IndexedStack(
         index: _tab,

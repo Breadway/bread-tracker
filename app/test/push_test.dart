@@ -5,13 +5,27 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:tracker/data/api.dart';
 import 'package:tracker/data/store.dart';
 import 'package:tracker/push.dart';
-import 'package:tracker/reminders.dart';
 
 class MemoryStore extends Store {
   MemoryStore(super.prefs);
   String? credential = 'paired';
   @override
   Future<String?> get token async => credential;
+  @override
+  Future<void> clearToken() async => credential = null;
+  @override
+  Future<bool> clearTokenIfCurrentForGeneration(
+    String expected,
+    int expectedGeneration, {
+    String? expectedServer,
+  }) async {
+    if (credential != expected) return false;
+    credential = null;
+    return true;
+  }
+
+  @override
+  Future<void> saveToken(String token) async => credential = token;
 }
 
 class FakeDevice implements PushDevice {
@@ -20,6 +34,8 @@ class FakeDevice implements PushDevice {
   bool broken = false;
   int prompts = 0;
   String? registration = 'fcm-token';
+  Completer<void>? tokenStarted;
+  Completer<void>? releaseToken;
   @override
   Future<void> initialize() async {
     if (broken) throw StateError('Firebase unavailable');
@@ -32,11 +48,14 @@ class FakeDevice implements PushDevice {
   }
 
   @override
-  Future<String?> token() async => registration;
+  Future<String?> token() async {
+    tokenStarted?.complete();
+    if (releaseToken != null) await releaseToken!.future;
+    return registration;
+  }
+
   @override
   Stream<String> get tokens => events.stream;
-  @override
-  Stream<ReminderPayload> get taps => const Stream.empty();
   @override
   void dispose() => unawaited(events.close());
 }
@@ -45,10 +64,24 @@ class RegistrationApi extends Api {
   RegistrationApi() : super('https://example.invalid');
   bool offline = false;
   bool revoked = false;
+  Completer<void>? callStarted;
+  Completer<void>? releaseResponse;
+  Completer<void>? requestStarted;
+  Completer<void>? releaseAuthLost;
   final sent = <String?>[];
   @override
   Future<void> setFcmToken(String? token) async {
+    callStarted?.complete();
+    if (releaseResponse != null) {
+      await releaseResponse!.future;
+      throw AuthLost();
+    }
     if (offline) throw ApiException('offline');
+    if (releaseAuthLost != null) {
+      requestStarted!.complete();
+      await releaseAuthLost!.future;
+      throw AuthLost();
+    }
     if (revoked) throw AuthLost();
     sent.add(token);
   }
@@ -61,6 +94,7 @@ void main() {
   late FcmPushService push;
 
   setUp(() async {
+    TestWidgetsFlutterBinding.ensureInitialized();
     SharedPreferences.setMockInitialValues({});
     store = MemoryStore(await SharedPreferences.getInstance());
     device = FakeDevice();
@@ -75,6 +109,33 @@ void main() {
     expect(api.sent, ['fcm-token']);
     expect(device.prompts, 0);
   });
+
+  test(
+    'old bearer is never sent to a replacement server after delayed FCM lookup',
+    () async {
+      device.tokenStarted = Completer<void>();
+      device.releaseToken = Completer<void>();
+      final destinations = <String>[];
+      final guardedPush = FcmPushService(
+        store,
+        device: device,
+        apiFactory: (server, token) {
+          destinations.add('$server|$token');
+          return api;
+        },
+      );
+      final pending = guardedPush.init();
+      await device.tokenStarted!.future;
+      store.claimPairingOwnership();
+      await store.setServerUrl('https://replacement.invalid');
+      store.credential = 'replacement';
+      device.releaseToken!.complete();
+      await pending;
+      expect(destinations, isEmpty);
+      expect(api.sent, isEmpty);
+      guardedPush.dispose();
+    },
+  );
 
   test('permission denial is visible and can be retried explicitly', () async {
     device.allowed = false;
@@ -96,6 +157,19 @@ void main() {
     api.revoked = true;
     await push.register();
     expect(push.status.value, PushStatus.unpaired);
+  });
+
+  test('delayed old registration 401 cannot clear a new pairing', () async {
+    api
+      ..callStarted = Completer<void>()
+      ..releaseResponse = Completer<void>();
+    final pending = push.init();
+    await api.callStarted!.future;
+    store.credential = 'new-token';
+    api.releaseResponse!.complete();
+    await pending;
+    expect(store.credential, 'new-token');
+    expect(push.status.value, PushStatus.registering);
   });
 
   test('network and initialization failures can be retried', () async {

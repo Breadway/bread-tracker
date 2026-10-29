@@ -40,6 +40,16 @@ Future<void> loadFont() async {
   }
 }
 
+/// Chores that only run on some weekdays. `mask` uses the app's weekday bits (bit 0 = Monday).
+/// Both the seed and the perfect-day test read this one table, so they cannot drift apart.
+const weekdaySpecificChores = <(String, String, int, String)>[
+  ('c-recycle', 'Recycling', 1, '17:15'),
+  ('c-worm', 'Worm Food', 4, '16:00'),
+  ('c-wash', 'Put washing in machine', 16, '15:30'),
+  ('c-bath', 'Clean bathroom', 16, '17:00'),
+  ('c-room', 'Room clean', 32, '09:30'),
+];
+
 Future<AppDb> seededDb() async {
   final db = AppDb(NativeDatabase.memory());
   final fixedToday = DateTime.now();
@@ -50,11 +60,9 @@ Future<AppDb> seededDb() async {
         updatedAt: Value(ms(today)), dirty: const Value(false)));
   // every weekday has the daily chore and four habits; a few weekday-specific chores
   await item('c-dinner', 'chore', 'Wash or dry dishes, or cook dinner', 127, '18:30', 10);
-  await item('c-recycle', 'chore', 'Recycling', 1, '17:15', 10);
-  await item('c-worm', 'chore', 'Worm Food', 4, '16:00', 10);
-  await item('c-wash', 'chore', 'Put washing in machine', 16, '15:30', 10);
-  await item('c-bath', 'chore', 'Clean bathroom', 16, '17:00', 10);
-  await item('c-room', 'chore', 'Room clean', 32, '09:30', 10);
+  for (final (id, name, mask, time) in weekdaySpecificChores) {
+    await item(id, 'chore', name, mask, time, 10);
+  }
   await item('h-gym', 'habit', 'Gym or workout', 127, null, 15);
   await item('h-read', 'habit', 'Read 20 minutes', 127, null, 15);
   await item('h-shoot', 'habit', 'Shoot 50 free throws', 127, null, 15);
@@ -159,15 +167,10 @@ void main() {
     await tester.pump(const Duration(milliseconds: 200));
     await tester.tap(find.text('Shoot 50 free throws'));
     await tester.pump(const Duration(milliseconds: 200));
-    // The seed also has weekday-specific chores (see seededDb), so finish whatever is
-    // scheduled today before the last tick; otherwise this only passes on some weekdays.
-    const todaysExtras = {
-      DateTime.monday: ['Recycling'],
-      DateTime.wednesday: ['Worm Food'],
-      DateTime.friday: ['Put washing in machine', 'Clean bathroom'],
-      DateTime.saturday: ['Room clean'],
-    };
-    for (final name in todaysExtras[DateTime.now().weekday] ?? const <String>[]) {
+    // The seed also has weekday-specific chores, so finish whatever is scheduled today before
+    // the last tick. Derived from the seed table so it holds on every weekday.
+    final todayBit = 1 << weekdayIndex(DateTime.now());
+    for (final (_, name, _, _) in weekdaySpecificChores.where((c) => (c.$3 & todayBit) != 0)) {
       await tester.ensureVisible(find.text(name));
       await tester.tap(find.text(name));
       await tester.pump(const Duration(milliseconds: 200));

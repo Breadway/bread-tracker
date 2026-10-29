@@ -3,7 +3,6 @@
 //! transaction. Only the SHA-256 of a code is stored.
 
 use rand::Rng;
-use sqlx::Connection;
 
 use crate::auth::{self, hash, normalize_code, CODE_ALPHABET};
 use crate::db::Db;
@@ -15,7 +14,9 @@ const DAY_MS: i64 = 86_400_000;
 /// A fresh code in `XXXX-XXXX-XXXX` form (12 characters, about 60 bits).
 fn new_code() -> String {
     let mut rng = rand::thread_rng();
-    let raw: String = (0..12).map(|_| CODE_ALPHABET[rng.gen_range(0..CODE_ALPHABET.len())] as char).collect();
+    let raw: String = (0..12)
+        .map(|_| CODE_ALPHABET[rng.gen_range(0..CODE_ALPHABET.len())] as char)
+        .collect();
     format!("{}-{}-{}", &raw[..4], &raw[4..8], &raw[8..])
 }
 
@@ -96,7 +97,12 @@ pub async fn list(db: &Db) -> Result<Vec<InviteInfo>, sqlx::Error> {
             } else {
                 InviteStatus::Active
             };
-            InviteInfo { id: r.id, created_at: r.created_at, expires_at: r.expires_at, status }
+            InviteInfo {
+                id: r.id,
+                created_at: r.created_at,
+                expires_at: r.expires_at,
+                status,
+            }
         })
         .collect())
 }
@@ -119,8 +125,15 @@ pub async fn revoke(db: &Db, id: i64) -> Result<Revoked, sqlx::Error> {
     if res.rows_affected() > 0 {
         return Ok(Revoked::Revoked);
     }
-    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM invites WHERE id = ?").bind(id).fetch_optional(db).await?;
-    Ok(if exists.is_some() { Revoked::NotActive } else { Revoked::NotFound })
+    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM invites WHERE id = ?")
+        .bind(id)
+        .fetch_optional(db)
+        .await?;
+    Ok(if exists.is_some() {
+        Revoked::NotActive
+    } else {
+        Revoked::NotFound
+    })
 }
 
 #[derive(Debug)]
@@ -153,9 +166,33 @@ pub async fn signup(
     timezone: Option<&str>,
     max_users: i64,
 ) -> Result<Result<SignedUp, SignupError>, sqlx::Error> {
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    let result = signup_in_limited(&mut tx, code, name, device_name, timezone, max_users).await?;
+    if result.is_ok() {
+        tx.commit().await?;
+    }
+    Ok(result)
+}
+
+pub async fn signup_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    code: &str,
+    name: &str,
+    device_name: &str,
+    timezone: Option<&str>,
+) -> Result<Result<SignedUp, SignupError>, sqlx::Error> {
+    signup_in_limited(tx, code, name, device_name, timezone, i64::MAX).await
+}
+
+pub async fn signup_in_limited(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    code: &str,
+    name: &str,
+    device_name: &str,
+    timezone: Option<&str>,
+    max_users: i64,
+) -> Result<Result<SignedUp, SignupError>, sqlx::Error> {
     let now = now_ms();
-    let mut conn = db.acquire().await?;
-    let mut tx = conn.begin().await?;
 
     let claimed: Option<i64> = sqlx::query_scalar(
         "UPDATE invites SET used_at = ?
@@ -165,44 +202,51 @@ pub async fn signup(
     .bind(now)
     .bind(hash(&normalize_code(code)))
     .bind(now)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     let Some(invite_id) = claimed else {
         return Ok(Err(SignupError::BadInvite));
     };
 
-    // Checked after the claim so it is serialised with other signups; a full server rolls the
-    // claim back, so the invite is not wasted.
-    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users").fetch_one(&mut *tx).await?;
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&mut **tx)
+        .await?;
     if users >= max_users {
         return Ok(Err(SignupError::ServerFull));
     }
-    let inserted = sqlx::query_scalar::<_, i64>("INSERT INTO users (name, is_admin, created_at) VALUES (?, 0, ?) RETURNING id")
+
+    let inserted = sqlx::query_scalar::<_, i64>("INSERT INTO users (name, name_key, name_confirmed, is_admin, created_at) VALUES (?, ?, 1, 0, ?) RETURNING id")
         .bind(name)
+        .bind(users::name_key(name))
         .bind(now)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await;
     let user_id = match inserted {
         Ok(id) => id,
-        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => return Ok(Err(SignupError::NameTaken)),
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+            return Ok(Err(SignupError::NameTaken))
+        }
         Err(e) => return Err(e),
     };
     sqlx::query("UPDATE invites SET used_by = ? WHERE id = ?")
         .bind(user_id)
         .bind(invite_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     if let Some(tz) = timezone {
         // The row exists already (created by the trigger on users).
         sqlx::query("UPDATE user_settings SET timezone = ? WHERE user_id = ?")
             .bind(tz)
             .bind(user_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
     }
-    let (device_id, token) = auth::insert_device(&mut tx, user_id, device_name).await?;
-    tx.commit().await?;
-    Ok(Ok(SignedUp { user_id, device_id, token }))
+    let (device_id, token) = auth::insert_device(tx, user_id, device_name).await?;
+    Ok(Ok(SignedUp {
+        user_id,
+        device_id,
+        token,
+    }))
 }
 
 /// Validate a user-chosen name for signup.

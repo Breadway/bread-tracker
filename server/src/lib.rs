@@ -8,13 +8,13 @@ pub mod devices;
 pub mod error;
 pub mod invites;
 pub mod model;
+pub mod public_auth;
 pub mod push;
 pub mod store;
 pub mod users;
 pub mod xp;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use config::Config;
 use db::Db;
@@ -25,24 +25,14 @@ pub struct AppState {
     pub db: Db,
     pub config: Arc<Config>,
     pub push: Arc<dyn PushSender>,
-    pub pair_limiter: Arc<auth::FailureLimiter>,
-    /// Failed signup attempts (unknown, used, expired or revoked invite), counted per client
-    /// address with the same limiter type as `/pair`.
-    pub signup_limiter: Arc<auth::FailureLimiter>,
-    /// Requests per device token, from `Limits::requests_per_minute`.
-    pub rate_limiter: Arc<auth::RateLimiter>,
 }
 
 impl AppState {
     pub fn new(db: Db, config: Config, push: Arc<dyn PushSender>) -> Self {
-        let requests_per_minute = config.limits.requests_per_minute;
         Self {
             db,
             config: Arc::new(config),
             push,
-            pair_limiter: Arc::new(auth::FailureLimiter::new(5, Duration::from_secs(600))),
-            signup_limiter: Arc::new(auth::FailureLimiter::new(10, Duration::from_secs(600))),
-            rate_limiter: Arc::new(auth::RateLimiter::new(requests_per_minute, Duration::from_secs(60))),
         }
     }
 }

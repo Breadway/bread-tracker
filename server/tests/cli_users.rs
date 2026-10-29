@@ -23,7 +23,9 @@ fn err(o: &Output) -> String {
 fn exec(db: &std::path::Path, sql: &str) {
     use sqlx::Executor;
     tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", db.display())).await.unwrap();
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", db.display()))
+            .await
+            .unwrap();
         pool.execute(sql).await.unwrap();
         pool.close().await;
     });
@@ -31,7 +33,9 @@ fn exec(db: &std::path::Path, sql: &str) {
 
 fn query(db: &std::path::Path, sql: &str) -> String {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", db.display())).await.unwrap();
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", db.display()))
+            .await
+            .unwrap();
         // Every query here selects one column; COUNT(*) comes back as an integer, names as text.
         let row = sqlx::query(sql).fetch_one(&pool).await.unwrap();
         let v = match sqlx::Row::try_get::<i64, _>(&row, 0) {
@@ -68,13 +72,20 @@ fn pair_targets_the_admin_by_default_and_a_named_user_with_user() {
     assert!(o.status.success());
     assert_eq!(out(&o).trim().len(), 9, "XXXX-XXXX");
     assert!(err(&o).contains("admin"), "{}", err(&o));
-    assert_eq!(query(&db, "SELECT COUNT(*) FROM pairing_codes WHERE user_id = 1"), "1");
+    assert_eq!(
+        query(&db, "SELECT COUNT(*) FROM pairing_codes WHERE user_id = 1"),
+        "1"
+    );
 
     let o = run(&db, &["pair", "--user", "bob"]); // case-insensitive
     assert!(o.status.success(), "{}", err(&o));
     assert!(err(&o).contains("Bob"));
     assert_eq!(query(&db, "SELECT COUNT(*) FROM pairing_codes WHERE user_id = (SELECT id FROM users WHERE name = 'Bob')"), "1");
-    assert_eq!(query(&db, "SELECT COUNT(*) FROM pairing_codes WHERE user_id = 1"), "1", "the admin's code was not touched");
+    assert_eq!(
+        query(&db, "SELECT COUNT(*) FROM pairing_codes WHERE user_id = 1"),
+        "1",
+        "the admin's code was not touched"
+    );
 
     // An unknown user is an error, never a fallback to the admin.
     let before = query(&db, "SELECT COUNT(*) FROM pairing_codes");
@@ -82,7 +93,25 @@ fn pair_targets_the_admin_by_default_and_a_named_user_with_user() {
     assert!(!o.status.success());
     assert!(err(&o).contains("no user named"), "{}", err(&o));
     assert_eq!(query(&db, "SELECT COUNT(*) FROM pairing_codes"), before);
-    assert!(!run(&db, &["pair", "--user"]).status.success(), "--user needs a value");
+    assert!(run(&db, &["device", "list", "--user", "Bob"])
+        .status
+        .success());
+    assert!(!run(&db, &["device", "list", "--usr", "Bob"])
+        .status
+        .success());
+    for args in [
+        vec!["pair", "--usr", "Bob"],
+        vec!["pair", "--user"],
+        vec!["pair", "--user", "Bob", "--user", "admin"],
+        vec!["devices", "--usr", "Bob"],
+    ] {
+        assert!(!run(&db, &args).status.success(), "{args:?}");
+        assert_eq!(query(&db, "SELECT COUNT(*) FROM pairing_codes"), before);
+    }
+    assert!(
+        !run(&db, &["pair", "--user"]).status.success(),
+        "--user needs a value"
+    );
 }
 
 #[test]
@@ -127,7 +156,9 @@ fn user_list_and_remove_need_confirmation_and_protect_the_admin() {
     assert_eq!(query(&db, "SELECT COUNT(*) FROM users"), "3");
 
     // Unknown user.
-    assert!(!run(&db, &["user", "remove", "ghost", "--yes"]).status.success());
+    assert!(!run(&db, &["user", "remove", "ghost", "--yes"])
+        .status
+        .success());
 
     // With --yes, Bob and his rows are gone, Cy is untouched.
     let o = run(&db, &["user", "remove", "bob", "--yes"]);
@@ -145,7 +176,12 @@ fn bad_usage_fails_without_changing_anything() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.db");
     run(&db, &["user", "list"]);
-    for bad in [&["user"][..], &["user", "frobnicate"], &["user", "remove"], &["user", "remove", "--yes"]] {
+    for bad in [
+        &["user"][..],
+        &["user", "frobnicate"],
+        &["user", "remove"],
+        &["user", "remove", "--yes"],
+    ] {
         assert!(!run(&db, bad).status.success(), "{bad:?}");
     }
     assert_eq!(query(&db, "SELECT COUNT(*) FROM users"), "1");
@@ -160,15 +196,35 @@ fn disable_and_enable_keep_all_data_and_protect_the_admin() {
 
     let o = run(&db, &["user", "disable", "bob"]);
     assert!(o.status.success(), "{}", err(&o));
-    assert_eq!(query(&db, "SELECT COUNT(*) FROM users WHERE disabled_at IS NOT NULL"), "1");
-    assert_eq!(query(&db, "SELECT COUNT(*) FROM devices"), "1", "data is untouched");
+    assert_eq!(
+        query(
+            &db,
+            "SELECT COUNT(*) FROM users WHERE disabled_at IS NOT NULL"
+        ),
+        "1"
+    );
+    assert_eq!(
+        query(&db, "SELECT COUNT(*) FROM devices"),
+        "1",
+        "data is untouched"
+    );
     assert_eq!(query(&db, "SELECT COUNT(*) FROM items"), "1");
     let list = out(&run(&db, &["user", "list"]));
-    assert!(list.lines().any(|l| l.contains("Bob") && l.contains("DISABLED")), "{list}");
+    assert!(
+        list.lines()
+            .any(|l| l.contains("Bob") && l.contains("DISABLED")),
+        "{list}"
+    );
 
     let o = run(&db, &["user", "enable", "Bob"]);
     assert!(o.status.success());
-    assert_eq!(query(&db, "SELECT COUNT(*) FROM users WHERE disabled_at IS NOT NULL"), "0");
+    assert_eq!(
+        query(
+            &db,
+            "SELECT COUNT(*) FROM users WHERE disabled_at IS NOT NULL"
+        ),
+        "0"
+    );
     assert!(!out(&run(&db, &["user", "list"])).contains("DISABLED"));
 
     let o = run(&db, &["user", "disable", "admin"]);

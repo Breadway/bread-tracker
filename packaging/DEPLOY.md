@@ -276,8 +276,8 @@ The source tests build the failed-migration state for real:
 and the adjacent failing-0002/0006/0007 tests. Scratch evidence for this revision recorded
 `PRAGMA user_version = 0`, ledger rows 1, 2 and 3 with `success = 1`, no row 5, the 0002
 `user_id` rebuild present, and no 0005 `name_key` column. The frozen-copy checker was run on a
-scratch copy and the new server was started against a scratch copy. That is source and
-component evidence only.
+scratch copy, and the new image was built with the shipped Containerfile and started against a
+scratch copy. That is source and component evidence only.
 
 Not run for this change: the full Compose rollback above (stop, restore, retag,
 `up --no-build`, health), restarting the old image on the restored volume, Litestream resuming

@@ -14,6 +14,8 @@ pub struct Config {
     pub reminder_grace_mins: i64,
     /// Reverse proxies (IPs or CIDRs) whose `X-Forwarded-For` is believed. Empty = never.
     pub trusted_proxies: Vec<TrustedProxy>,
+    /// Name for the first (admin) user, who owns all data that existed before multi-user.
+    pub admin_name: Option<String>,
 }
 
 impl Config {
@@ -44,6 +46,7 @@ impl Config {
                         .collect()
                 })
                 .unwrap_or_default(),
+            admin_name: get("BREADTRACKER_ADMIN_NAME"),
         }
     }
 

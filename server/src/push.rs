@@ -2,7 +2,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -16,7 +15,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{Completion, Item};
-use crate::store::{self, now_ms};
+use crate::store::{self, now_ms, UserDb};
 use crate::AppState;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -329,35 +328,42 @@ fn parse_quiet(start: &str, end: &str) -> Option<(NaiveTime, NaiveTime)> {
     Some((s, e))
 }
 
-/// One scheduler pass. Returns the number of reminders sent.
+/// One scheduler pass over every user. Returns the number of reminders sent.
+///
+/// Each user's timezone, quiet hours, enabled switch, rows and devices are scoped independently.
+/// An error for one user is logged and never prevents the next user's pass.
 pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize> {
-    if !st.push.enabled() || store::get_setting(&st.db, "reminders_enabled").await? != "1" {
+    if !st.push.enabled() {
         return Ok(0);
     }
-    let tz = Tz::from_str(&store::get_setting(&st.db, "timezone").await?)
-        .unwrap_or(chrono_tz::Australia::Perth);
-    let quiet = parse_quiet(
-        &store::get_setting(&st.db, "quiet_start").await?,
-        &store::get_setting(&st.db, "quiet_end").await?,
-    );
-    let now = tz.from_utc_datetime(&now_utc.naive_utc());
+    let users: Vec<i64> = sqlx::query_scalar("SELECT id FROM users ORDER BY id")
+        .fetch_all(&st.db)
+        .await?;
+    let mut count = 0;
+    for uid in users {
+        match tick_user(st, UserDb::new(&st.db, uid), now_utc).await {
+            Ok(n) => count += n,
+            Err(e) => tracing::error!(user = uid, error = ?e, "reminder tick failed for user"),
+        }
+    }
+    Ok(count)
+}
+
+async fn tick_user(st: &AppState, user: UserDb, now_utc: DateTime<Utc>) -> anyhow::Result<usize> {
+    let settings = user.settings().await?;
+    if !settings.reminders_enabled {
+        return Ok(0);
+    }
+    let quiet = parse_quiet(&settings.quiet_start, &settings.quiet_end);
+    let now = settings.tz().from_utc_datetime(&now_utc.naive_utc());
     let date = now.format("%Y-%m-%d").to_string();
     let yesterday = (now.date_naive() - ChronoDuration::days(1))
         .format("%Y-%m-%d")
         .to_string();
 
-    let items = store::all_items(&st.db).await?;
-    let mut completions = store::reminder_completions(&st.db, &date).await?;
-    completions.extend(store::reminder_completions(&st.db, &yesterday).await?);
-    let sent: HashSet<(String, String)> = sqlx::query_as::<_, (String, String)>(
-        "SELECT item_id, date FROM reminders_sent WHERE date IN (?, ?)",
-    )
-    .bind(&date)
-    .bind(&yesterday)
-    .fetch_all(&st.db)
-    .await?
-    .into_iter()
-    .collect();
+    let items = user.reminder_items().await?;
+    let completions = user.reminder_completions(&date, &yesterday).await?;
+    let sent = user.sent_reminders(&date, &yesterday).await?;
 
     let due = due_reminders(
         now,
@@ -371,8 +377,9 @@ pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize
         return Ok(0);
     }
     let devices: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, fcm_token FROM devices WHERE fcm_token IS NOT NULL AND fcm_token != ''",
+        "SELECT id, fcm_token FROM devices WHERE user_id = ? AND fcm_token IS NOT NULL AND fcm_token != ''",
     )
+    .bind(user.user_id())
     .fetch_all(&st.db)
     .await?;
     if devices.is_empty() {
@@ -396,38 +403,54 @@ pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize
             match st.push.send(&msg).await {
                 Ok(SendOutcome::Sent) => delivered = true,
                 Ok(SendOutcome::Unregistered) => {
-                    tracing::info!(device = %device_id, "fcm token unregistered, clearing");
-                    sqlx::query("UPDATE devices SET fcm_token = NULL WHERE id = ?")
-                        .bind(device_id)
-                        .execute(&st.db)
-                        .await?;
+                    tracing::info!(user = user.user_id(), device = %device_id, "fcm token unregistered, clearing");
+                    // Clear only the token FCM rejected: a delayed answer must not wipe a
+                    // newer token the device registered while the send was in flight.
+                    sqlx::query(
+                        "UPDATE devices SET fcm_token = NULL WHERE id = ? AND user_id = ? AND fcm_token = ?",
+                    )
+                    .bind(device_id)
+                    .bind(user.user_id())
+                    .bind(token)
+                    .execute(&st.db)
+                    .await?;
                 }
-                Err(e) => tracing::warn!(error = ?e, item = %d.item_id, "reminder send failed"),
+                Err(e) => tracing::warn!(
+                    user = user.user_id(),
+                    error = ?e,
+                    item = %d.item_id,
+                    "reminder send failed"
+                ),
             }
         }
         if delivered {
-            sqlx::query(
-                "INSERT OR IGNORE INTO reminders_sent (item_id, date, sent_at) VALUES (?, ?, ?)",
-            )
-            .bind(&d.item_id)
-            .bind(&d.date)
-            .bind(now_ms())
-            .execute(&st.db)
-            .await?;
+            user.mark_reminder_sent(&d.item_id, &d.date).await?;
             count += 1;
         }
     }
     Ok(count)
 }
 
+/// Ticks between cleanup passes (30 s each, so about an hour).
+const PRUNE_EVERY_TICKS: u64 = 120;
+
 pub fn spawn_scheduler(st: AppState) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
+        let mut n: u64 = 0;
         loop {
             interval.tick().await;
             if let Err(e) = tick(&st, Utc::now()).await {
                 tracing::error!(error = ?e, "reminder tick failed");
             }
+            if n.is_multiple_of(PRUNE_EVERY_TICKS) {
+                match store::prune(&st.db, now_ms()).await {
+                    Ok(p) if p != store::Pruned::default() => tracing::info!(?p, "pruned old rows"),
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(error = ?e, "cleanup failed"),
+                }
+            }
+            n = n.wrapping_add(1);
         }
     });
 }

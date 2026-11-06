@@ -1,5 +1,6 @@
-//! Single-user device auth: a one-time pairing code is exchanged for a long-lived bearer
-//! token. Only the SHA-256 of codes and tokens is stored.
+//! Device auth: a one-time pairing code is exchanged for a long-lived bearer token. Only the
+//! SHA-256 of codes and tokens is stored. The deployment remains single-user, but devices and
+//! pairing codes now carry the owning user id.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -18,9 +19,15 @@ use crate::AppState;
 
 const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const CODE_TTL_MS: i64 = 15 * 60 * 1000;
+const LAST_SEEN_INTERVAL_MS: i64 = 60 * 1000;
 
 #[derive(Clone, Debug)]
 pub struct DeviceId(pub String);
+
+/// The user who owns the authenticated device. Set by [`require_auth`] from the database,
+/// never from anything the client sends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserId(pub i64);
 
 pub fn hash(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
@@ -39,8 +46,14 @@ fn normalize_code(code: &str) -> String {
         .to_ascii_uppercase()
 }
 
-/// Create a pairing code valid for 15 minutes. Returned in `XXXX-XXXX` form.
+/// Create a pairing code valid for 15 minutes for the first (admin) user. Returned in
+/// `XXXX-XXXX` form.
 pub async fn create_pairing_code(db: &Db) -> Result<String, sqlx::Error> {
+    create_pairing_code_for(db, crate::users::ADMIN_ID).await
+}
+
+/// Create a pairing code that adds a device to `user_id`'s account.
+pub async fn create_pairing_code_for(db: &Db, user_id: i64) -> Result<String, sqlx::Error> {
     let mut rng = rand::thread_rng();
     let raw: String = (0..8)
         .map(|_| CODE_ALPHABET[rng.gen_range(0..CODE_ALPHABET.len())] as char)
@@ -49,12 +62,55 @@ pub async fn create_pairing_code(db: &Db) -> Result<String, sqlx::Error> {
         .bind(now_ms())
         .execute(db)
         .await?;
-    sqlx::query("INSERT INTO pairing_codes (code_hash, expires_at) VALUES (?, ?)")
+    sqlx::query("INSERT INTO pairing_codes (code_hash, user_id, expires_at) VALUES (?, ?, ?)")
         .bind(hash(&raw))
+        .bind(user_id)
         .bind(now_ms() + CODE_TTL_MS)
         .execute(db)
         .await?;
     Ok(format!("{}-{}", &raw[..4], &raw[4..]))
+}
+
+/// Redeem a code (single use) without the failure budget. Returns `(device_id, token)`.
+///
+/// The code is consumed and the device created in one `BEGIN IMMEDIATE` transaction: if the
+/// device cannot be stored, the code is still there and the same code can be redeemed again.
+/// The write lock is taken first, so two concurrent redemptions of one code serialize and
+/// exactly one of them finds it. Production pairing goes through [`pair_with_limit`]; this
+/// entry point exists for the migration fixtures and user tests.
+pub async fn redeem(
+    db: &Db,
+    code: &str,
+    device_name: &str,
+) -> Result<Option<(String, String)>, sqlx::Error> {
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    let used: Option<i64> = sqlx::query_scalar(
+        "DELETE FROM pairing_codes WHERE code_hash = ? AND expires_at > ? RETURNING user_id",
+    )
+    .bind(hash(&normalize_code(code)))
+    .bind(now_ms())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(user_id) = used else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    let token = random_token();
+    let now = now_ms();
+    sqlx::query(
+        "INSERT INTO devices (id, user_id, name, token_hash, created_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(user_id)
+    .bind(device_name)
+    .bind(hash(&token))
+    .bind(now)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some((id, token)))
 }
 
 /// Redeem a pairing code under the durable per-source attempt budget.
@@ -97,23 +153,24 @@ pub async fn pair_with_limit(
         .bind(&source).bind(now).bind(now).bind(now.saturating_sub(FAILURE_WINDOW_MS)).bind(now.saturating_sub(FAILURE_WINDOW_MS))
         .execute(&mut *tx).await?;
 
-    let used: Option<String> = sqlx::query_scalar(
-        "DELETE FROM pairing_codes WHERE code_hash = ? AND expires_at > ? RETURNING code_hash",
+    let used: Option<i64> = sqlx::query_scalar(
+        "DELETE FROM pairing_codes WHERE code_hash = ? AND expires_at > ? RETURNING user_id",
     )
     .bind(hash(&normalize_code(code)))
     .bind(now)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some(_) = used else {
+    let Some(user_id) = used else {
         tx.commit().await?;
         return Ok(PairAttempt::InvalidCode);
     };
     let id = uuid::Uuid::new_v4().to_string();
     let token = random_token();
     sqlx::query(
-        "INSERT INTO devices (id, name, token_hash, created_at, last_seen) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO devices (id, user_id, name, token_hash, created_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
+    .bind(user_id)
     .bind(device_name)
     .bind(hash(&token))
     .bind(now)
@@ -474,16 +531,26 @@ pub async fn require_auth(
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(ApiError::Unauthorized)?
         .to_string();
-    let id: Option<String> = sqlx::query_scalar("SELECT id FROM devices WHERE token_hash = ?")
-        .bind(hash(&token))
-        .fetch_optional(&st.db)
-        .await?;
-    let id = id.ok_or(ApiError::Unauthorized)?;
-    sqlx::query("UPDATE devices SET last_seen = ? WHERE id = ?")
-        .bind(now_ms())
+    let row: Option<(String, i64, i64)> =
+        sqlx::query_as("SELECT id, last_seen, user_id FROM devices WHERE token_hash = ?")
+            .bind(hash(&token))
+            .fetch_optional(&st.db)
+            .await?;
+    let (id, last_seen, user_id) = row.ok_or(ApiError::Unauthorized)?;
+    // last_seen is informational, so write it at most once per interval, not per request.
+    let now = now_ms();
+    if now - last_seen >= LAST_SEEN_INTERVAL_MS {
+        sqlx::query(
+            "UPDATE devices SET last_seen = ? WHERE id = ? AND user_id = ? AND last_seen < ?",
+        )
+        .bind(now)
         .bind(&id)
+        .bind(user_id)
+        .bind(now - LAST_SEEN_INTERVAL_MS)
         .execute(&st.db)
         .await?;
+    }
     req.extensions_mut().insert(DeviceId(id));
+    req.extensions_mut().insert(UserId(user_id));
     Ok(next.run(req).await)
 }

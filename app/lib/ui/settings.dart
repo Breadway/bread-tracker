@@ -91,6 +91,71 @@ class SettingsScreen extends ConsumerWidget {
               context,
             ).push(MaterialPageRoute<void>(builder: (_) => const PairScreen())),
           ),
+          if (paired) const Spacer8(),
+          if (paired)
+            PanelButton(
+              icon: Icons.logout_rounded,
+              title: 'Sign out',
+              subtitle: 'Stop syncing and reminders on this phone',
+              onTap: () async {
+                final choice = await showDialog<_SignOut>(
+                  context: context,
+                  builder: (_) => const _SignOutDialog(),
+                );
+                if (choice == null) return;
+                var ownerGeneration = ctl.currentAuthGeneration;
+                var ownerStoreGeneration = store.authGeneration;
+                final ownerServer = store.serverUrl;
+                Future<void> finishSignOut() async {
+                  if (ctl.currentAuthGeneration != ownerGeneration ||
+                      store.authGeneration != ownerStoreGeneration ||
+                      store.serverUrl != ownerServer) {
+                    return;
+                  }
+                  try {
+                    final pending = ctl.signOut(
+                      wipeLocal: choice == _SignOut.wipe,
+                      expectedAuthGeneration: ownerGeneration,
+                      expectedStoreGeneration: ownerStoreGeneration,
+                      expectedServer: ownerServer,
+                    );
+                    // signOut claims ownership synchronously before its first
+                    // await. Retain that attempt's identity, not the identity
+                    // that happens to exist when a later failure is handled.
+                    ownerGeneration = ctl.currentAuthGeneration;
+                    ownerStoreGeneration = store.authGeneration;
+                    final revoked = await pending;
+                    toast(
+                      revoked
+                          ? 'Signed out'
+                          : 'Signed out here, but the server could not be reached. '
+                                'Revoke this device from the server to be sure.',
+                    );
+                  } catch (_) {
+                    if (!context.mounted) return;
+                    if (ctl.currentAuthGeneration != ownerGeneration ||
+                        store.authGeneration != ownerStoreGeneration ||
+                        store.serverUrl != ownerServer) {
+                      return;
+                    }
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: const Text(
+                          'Sign-out cleanup failed on this phone. '
+                          'Sync is paused. Retry local cleanup.',
+                        ),
+                        action: SnackBarAction(
+                          label: 'Retry',
+                          onPressed: finishSignOut,
+                        ),
+                      ),
+                    );
+                  }
+                }
+
+                await finishSignOut();
+              },
+            ),
           const SectionHeader('Your list'),
           PanelButton(
             icon: Icons.tune_rounded,
@@ -104,8 +169,7 @@ class SettingsScreen extends ConsumerWidget {
           PanelButton(
             icon: Icons.playlist_add_rounded,
             title: 'Add example chores',
-            subtitle:
-                'A few generic weekly chores, skipping any already added',
+            subtitle: 'A few generic weekly chores, skipping any already added',
             onTap: () async =>
                 toast('Added ${await ctl.addStarterChores()} chores'),
           ),
@@ -122,9 +186,20 @@ class SettingsScreen extends ConsumerWidget {
                       title: const Text('Sound effects'),
                       value: sfx.sound,
                       onChanged: (v) async {
-                        sfx.sound = v;
-                        await store.setSound(v);
-                        set(() {});
+                        try {
+                          await store.setSound(v);
+                          sfx.sound = v;
+                          set(() {});
+                        } catch (error) {
+                          if (!context.mounted) return;
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                'Could not save sound preference: $error',
+                              ),
+                            ),
+                          );
+                        }
                       },
                     ),
                   ),
@@ -134,9 +209,20 @@ class SettingsScreen extends ConsumerWidget {
                       title: const Text('Vibration'),
                       value: sfx.haptics,
                       onChanged: (v) async {
-                        sfx.haptics = v;
-                        await store.setHaptics(v);
-                        set(() {});
+                        try {
+                          await store.setHaptics(v);
+                          sfx.haptics = v;
+                          set(() {});
+                        } catch (error) {
+                          if (!context.mounted) return;
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                'Could not save vibration preference: $error',
+                              ),
+                            ),
+                          );
+                        }
                       },
                     ),
                   ),
@@ -170,8 +256,14 @@ class SettingsScreen extends ConsumerWidget {
             title: 'Send a test notification',
             subtitle: 'Checks that the server can reach this phone',
             onTap: () async {
-              final token = await store.token;
-              if (token == null) return toast('Pair with the server first.');
+              final generation = store.authGeneration;
+              final server = store.serverUrl;
+              final token = await store.readTokenForGeneration(generation);
+              if (token == null ||
+                  store.authGeneration != generation ||
+                  store.serverUrl != server) {
+                return toast('Pair with the server first.');
+              }
               try {
                 final push = ref.read(pushProvider);
                 await push.register(requestPermission: true);
@@ -179,11 +271,19 @@ class SettingsScreen extends ConsumerWidget {
                   toast('Enable notifications and register this phone first.');
                   return;
                 }
-                await Api(store.serverUrl, token: token).pushTest();
+                await ref.read(apiFactoryProvider)(server, token).pushTest();
                 toast('Sent. It should arrive in a moment.');
               } on ApiException catch (e) {
                 toast(e.message);
               } on AuthLost catch (e) {
+                if (await store.clearTokenIfCurrentForGeneration(
+                  token,
+                  generation,
+                  expectedServer: server,
+                )) {
+                  ref.read(pairedStateRevisionProvider.notifier).refresh();
+                  await ref.read(pushProvider).register();
+                }
                 toast(e.toString());
               }
             },
@@ -192,4 +292,34 @@ class SettingsScreen extends ConsumerWidget {
       ),
     );
   }
+}
+
+enum _SignOut { keep, wipe }
+
+class _SignOutDialog extends StatelessWidget {
+  const _SignOutDialog();
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('Sign out of this phone?'),
+    content: const Text(
+      'This phone stops syncing and its reminders stop. '
+      'You can keep the items and ticks stored on this phone, or delete them. '
+      'Anything not yet synced is lost if you delete.',
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('Cancel'),
+      ),
+      TextButton(
+        onPressed: () => Navigator.pop(context, _SignOut.wipe),
+        child: const Text('Sign out and delete data'),
+      ),
+      FilledButton(
+        onPressed: () => Navigator.pop(context, _SignOut.keep),
+        child: const Text('Sign out'),
+      ),
+    ],
+  );
 }

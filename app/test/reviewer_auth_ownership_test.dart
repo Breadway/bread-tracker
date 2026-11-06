@@ -361,6 +361,9 @@ void main() {
         FlutterSecureStoragePlatform.instance =
             TestFlutterSecureStoragePlatform({'token': 'tok'});
         final store = Store(prefs);
+        await store.setAccount(
+          const Account('https://tracker.breadway.dev', 1, 'Owner'),
+        );
         final gate = _CommitGate();
         final db = AppDb(
           NativeDatabase(File('${dir.path}/tracker.sqlite'))
@@ -386,7 +389,10 @@ void main() {
         if (request.url.path == '/pair') {
           pairCalls++;
           pairEntered.complete();
-          return http.Response('{"token":"issued-once"}', 200);
+          return http.Response(
+            '{"token":"issued-once","user_id":1,"name":"Owner"}',
+            200,
+          );
         }
         if (request.method == 'DELETE') return http.Response('{}', 200);
         return http.Response('{}', 200);
@@ -420,7 +426,7 @@ void main() {
       });
       final widget = UncontrolledProviderScope(
         container: c,
-        child: const MaterialApp(home: PairScreen()),
+        child: const MaterialApp(home: PairScreen(joinInitially: false)),
       );
       await tester.pumpWidget(widget);
       await tester.pumpAndSettle();
@@ -429,13 +435,19 @@ void main() {
         'https://tracker.breadway.dev',
       );
       await tester.enterText(find.byType(TextField).at(1), 'ABCD-1234');
-      await tester.tap(find.text('Pair'));
+      await tester.ensureVisible(find.widgetWithText(FilledButton, 'Pair'));
+      await tester.drag(find.byType(ListView).first, const Offset(0, -160));
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(FilledButton, 'Pair'));
       await tester.pump();
       await tester.runAsync(() async {
         await Future<void>.delayed(const Duration(milliseconds: 100));
       });
       for (var i = 0; i < 40 && !gate.entered.isCompleted; i++) {
         await tester.pump(const Duration(milliseconds: 25));
+        await tester.runAsync(() async {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        });
       }
       expect(
         pairEntered.isCompleted,
@@ -498,7 +510,10 @@ void main() {
         );
         expect(await db.select(db.completions).get(), hasLength(1));
       });
-      await tester.tap(find.text('Pair'));
+      await tester.ensureVisible(find.widgetWithText(FilledButton, 'Pair'));
+      await tester.drag(find.byType(ListView).first, const Offset(0, -160));
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(FilledButton, 'Pair'));
       await tester.pump();
       for (
         var i = 0;
@@ -512,6 +527,9 @@ void main() {
         i++
       ) {
         await tester.pump(const Duration(milliseconds: 25));
+        await tester.runAsync(() async {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        });
       }
       await tester.pumpAndSettle();
       expect(
@@ -525,7 +543,12 @@ void main() {
         reason: 'the same live screen reused its cached successful exchange',
       );
       await tester.runAsync(() async {
-        expect(await store.token, 'issued-once');
+        expect(
+          await store.token,
+          'issued-once',
+          reason:
+              'PairScreen state: ${tester.widgetList<Text>(find.byType(Text)).map((text) => text.data).whereType<String>().toList()}',
+        );
         await db.close();
         final finalReopen = AppDb(
           NativeDatabase(File('${dir.path}/tracker.sqlite')),
@@ -557,7 +580,10 @@ void main() {
         if (request.url.path == '/pair') {
           pairRequests++;
           await releasePairResponse.future;
-          return http.Response('{"token":"fresh-token"}', 200);
+          return http.Response(
+            '{"token":"fresh-token","user_id":1,"name":"Owner"}',
+            200,
+          );
         }
         return http.Response('{}', 200);
       });
@@ -588,7 +614,7 @@ void main() {
       await tester.pumpWidget(
         UncontrolledProviderScope(
           container: container,
-          child: const MaterialApp(home: PairScreen()),
+          child: const MaterialApp(home: PairScreen(joinInitially: false)),
         ),
       );
       await tester.pumpAndSettle();
@@ -656,7 +682,10 @@ void main() {
         if (r.url.path == '/pair') {
           pairCalls++;
           await releasePairResponse.future;
-          return http.Response('{"token":"old-token"}', 200);
+          return http.Response(
+            '{"token":"old-token","user_id":1,"name":"Owner"}',
+            200,
+          );
         }
         return http.Response('{}', 200);
       });
@@ -687,7 +716,7 @@ void main() {
       await tester.pumpWidget(
         UncontrolledProviderScope(
           container: container,
-          child: const MaterialApp(home: PairScreen()),
+          child: const MaterialApp(home: PairScreen(joinInitially: false)),
         ),
       );
       await tester.pumpAndSettle();
@@ -760,7 +789,10 @@ void main() {
         final client = MockClient((request) async {
           if (request.url.path == '/pair') {
             pairCalls++;
-            return http.Response('{"token":"fresh-issued"}', 200);
+            return http.Response(
+              '{"token":"fresh-issued","user_id":1,"name":"Owner"}',
+              200,
+            );
           }
           return http.Response('{"cursor":0,"items":[],"completions":[]}', 200);
         });
@@ -791,7 +823,7 @@ void main() {
         await tester.pumpWidget(
           UncontrolledProviderScope(
             container: container,
-            child: const MaterialApp(home: PairScreen()),
+            child: const MaterialApp(home: PairScreen(joinInitially: false)),
           ),
         );
         await tester.pumpAndSettle();
@@ -854,7 +886,10 @@ void main() {
     late AppDb db;
     final client = MockClient((request) async {
       if (request.url.path == '/pair') {
-        return http.Response('{"token":"old-attempt"}', 200);
+        return http.Response(
+          '{"token":"old-attempt","user_id":1,"name":"Owner"}',
+          200,
+        );
       }
       return http.Response('{}', 200);
     });
@@ -886,7 +921,7 @@ void main() {
     await tester.pumpWidget(
       UncontrolledProviderScope(
         container: container,
-        child: const MaterialApp(home: PairScreen()),
+        child: const MaterialApp(home: PairScreen(joinInitially: false)),
       ),
     );
     await tester.pumpAndSettle();

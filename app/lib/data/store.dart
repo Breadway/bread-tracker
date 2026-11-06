@@ -1,6 +1,25 @@
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+/// Which account on which server the data on this phone belongs to.
+class Account {
+  const Account(this.server, this.userId, this.name);
+  final String server;
+  final int userId;
+  final String name;
+
+  /// Same account: same server (ignoring a trailing slash) and same user id.
+  bool sameAs(String otherServer, int otherUserId) =>
+      userId == otherUserId && _norm(server) == _norm(otherServer);
+
+  static String _norm(String value) {
+    final uri = Uri.parse(value.trim().replaceAll(RegExp(r'/+$'), ''));
+    return uri
+        .replace(scheme: uri.scheme.toLowerCase(), host: uri.host.toLowerCase())
+        .toString();
+  }
+}
+
 class PairingOwnership {
   const PairingOwnership({
     required this.generation,
@@ -612,6 +631,46 @@ class Store {
           (expectedServer == null || serverUrl == expectedServer);
     });
     return reset;
+  }
+
+  /// The account the local items and ticks belong to: the server they came from and the user
+  /// id on it. Set when the phone joins or pairs, kept through sign out (the data stays), and
+  /// cleared only when the local data is deleted. Not a secret.
+  Account? get account {
+    final server = prefs.getString('account_server');
+    final id = prefs.getInt('account_user');
+    if (server == null || id == null) return null;
+    return Account(server, id, prefs.getString('account_name') ?? '');
+  }
+
+  Future<void> setAccount(Account a) async {
+    await _checkPreferenceWrite(
+      () => prefs.setString('account_server', a.server),
+      'Account server was not saved.',
+    );
+    await _checkPreferenceWrite(
+      () => prefs.setInt('account_user', a.userId),
+      'Account identity was not saved.',
+    );
+    await _checkPreferenceWrite(
+      () => prefs.setString('account_name', a.name),
+      'Account name was not saved.',
+    );
+  }
+
+  Future<void> clearAccount() async {
+    await _checkPreferenceWrite(
+      () => prefs.remove('account_server'),
+      'Account server was not cleared.',
+    );
+    await _checkPreferenceWrite(
+      () => prefs.remove('account_user'),
+      'Account identity was not cleared.',
+    );
+    await _checkPreferenceWrite(
+      () => prefs.remove('account_name'),
+      'Account name was not cleared.',
+    );
   }
 
   bool get sound => prefs.getBool('sound') ?? true;

@@ -44,6 +44,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sync", get(pull).post(sync))
         .route("/device", put(set_device).delete(sign_out))
         .route("/pair-code", post(new_pair_code))
+        .route("/me", get(me))
         .route("/stats", get(stats))
         .route("/settings", get(get_settings).put(put_settings))
         .route("/push/test", post(push_test))
@@ -73,6 +74,10 @@ struct PairReq {
 struct PairResp {
     device_id: String,
     token: String,
+    /// Which account the new device joined. Added for the app, which must notice when a phone
+    /// that held one account's data is paired to another. Older clients ignore the fields.
+    user_id: i64,
+    name: String,
 }
 
 async fn pair(
@@ -104,14 +109,45 @@ async fn pair(
     match owner {
         Some(owner) => {
             let (device_id, token) = auth::insert_device(&mut tx, owner, &name).await?;
+            let name: String = sqlx::query_scalar("SELECT name FROM users WHERE id = ?")
+                .bind(owner)
+                .fetch_one(&mut *tx)
+                .await?;
             tx.commit().await?;
-            Ok(Json(PairResp { device_id, token }))
+            Ok(Json(PairResp {
+                device_id,
+                token,
+                user_id: owner,
+                name,
+            }))
         }
         None => {
             public_auth::fail(tx, source).await?;
             Err(ApiError::Unauthorized)
         }
     }
+}
+
+#[derive(Serialize)]
+struct MeResp {
+    user_id: i64,
+    name: String,
+    is_admin: bool,
+}
+
+/// Who the caller is. Lets an app that was paired before accounts existed learn its account.
+async fn me(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+) -> ApiResult<Json<MeResp>> {
+    let u = users::find_by_id(&st.db, uid)
+        .await?
+        .ok_or(ApiError::Unauthorized)?;
+    Ok(Json(MeResp {
+        user_id: u.id,
+        name: u.name,
+        is_admin: u.is_admin,
+    }))
 }
 
 #[derive(Serialize)]

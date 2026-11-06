@@ -135,7 +135,10 @@ void main() {
       }),
     );
     expect(await c.read(controllerProvider).signOut(), isTrue);
+    // Unknown provenance is retained locally without opening a discovery request
+    // before signout closes sync admission.
     expect(calls, ['DELETE /device Bearer tok']);
+    expect(store.prefs.getBool('account_owner_unknown'), isTrue);
     expect(await store.token, isNull);
     expect(store.cursor, 0);
     expect(await db.select(db.items).get(), hasLength(1));

@@ -83,10 +83,10 @@ class SettingsScreen extends ConsumerWidget {
           if (paired) const Spacer8(),
           PanelButton(
             icon: Icons.link_rounded,
-            title: paired ? 'Pair again' : 'Pair with server',
+            title: paired ? 'Switch account or pair again' : 'Join or pair',
             subtitle: paired
-                ? 'Use a new code, for example after reinstalling the server'
-                : 'Enter a pairing code from your server',
+                ? 'Join with an invite or use a code. If it is a different account, this phone\'s data is replaced'
+                : 'Join with an invite code, or pair with a code',
             onTap: () => Navigator.of(
               context,
             ).push(MaterialPageRoute<void>(builder: (_) => const PairScreen())),

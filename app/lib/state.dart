@@ -3,6 +3,7 @@ import 'dart:async';
 import 'dart:ui';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_timezone/flutter_timezone.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import 'package:drift/drift.dart' show Value;
@@ -36,9 +37,21 @@ final syncEngineProvider = Provider<SyncEngine>(
 );
 
 /// How the app builds an [Api] for one-off calls (settings, sign out). Tests override it.
-final apiFactoryProvider = Provider<Api Function(String base, String token)>(
+final apiFactoryProvider = Provider<Api Function(String base, String? token)>(
   (ref) =>
       (base, token) => Api(base, token: token),
+);
+
+/// The phone's IANA timezone name (for example `Europe/Berlin`), or null when unknown.
+/// Tests override it; failures must never block signing up.
+final phoneTimezoneProvider = Provider<Future<String?> Function()>(
+  (ref) => () async {
+    try {
+      return (await FlutterTimezone.getLocalTimezone()).identifier;
+    } catch (_) {
+      return null;
+    }
+  },
 );
 final sfxProvider = Provider<Sfx>((ref) => NoSfx());
 final pushProvider = Provider<PushService>((ref) => NoPushService());
@@ -235,6 +248,127 @@ class AppController {
     }
   }
 
+  /// True when the rows already on this phone could belong to another account than the one
+  /// about to be joined, so joining may delete them and the user must be asked first. That is
+  /// the case when there is local data and the phone has a history: a recorded account, or a
+  /// token from before accounts were recorded. A phone that was only ever used offline has no
+  /// history; its data is simply uploaded to the new account.
+  Future<bool> localDataAtRisk() async {
+    final store = ref.read(storeProvider);
+    await ensureAccount();
+    if (store.account == null &&
+        await store.token == null &&
+        !store.prefs.containsKey('account_owner_unknown')) {
+      return false;
+    }
+    return await _db.hasLocalData();
+  }
+
+  /// Make this phone belong to [account] on [server], with [token] as its credential.
+  ///
+  /// The local database is one store shared by whoever signs in, so rows from a previous
+  /// account must never be mixed into the new one or pushed to it. If the account or server
+  /// differs from the recorded one, or the phone has a token from before accounts were
+  /// recorded (so the owner is unknown), local rows are deleted only after new credentials
+  /// persist successfully, inside a database transaction. The same
+  /// account again keeps its data and offers it to the server, and a phone with no history
+  /// (offline use only) keeps its data and uploads it. Returns whether local data was deleted.
+  Future<bool> adoptAccount({
+    required String server,
+    required String token,
+    required AccountInfo account,
+    PairingOwnership? ownership,
+    bool Function()? stillCurrent,
+  }) async {
+    final store = ref.read(storeProvider);
+    await ensureAccount();
+    server = server.trim().replaceAll(RegExp(r'/+$'), '');
+    final prev = store.account;
+    final hadToken = await store.token != null;
+    final same = prev != null && prev.sameAs(server, account.userId);
+    final wipe =
+        !same &&
+        (prev != null ||
+            hadToken ||
+            store.prefs.containsKey('account_owner_unknown'));
+    if (ownership == null) await pairedAgain();
+    final generation = _authGeneration;
+    final owner = ownership ?? store.pairingOwnership(server);
+    PairingPersistenceReceipt? receipt;
+    final previousAccount = store.account;
+    final completion = Completer<void>();
+    try {
+      await _db.transaction(() async {
+        // Persist credentials before deleting rows. A storage failure must never
+        // irreversibly erase the previous account's local data.
+        receipt = await store.persistPairing(owner, server, token);
+        await store.setAccount(Account(server, account.userId, account.name));
+        if (generation != _authGeneration || !(stillCurrent?.call() ?? true)) {
+          throw const _AuthTransitionSuperseded();
+        }
+        // Fence claims only at the destructive transaction boundary. While
+        // credential I/O is pending, a newer claim must be able to supersede it.
+        _wipeCommitCompletion = completion;
+        if (wipe) {
+          await _db.delete(_db.completions).go();
+          await _db.delete(_db.items).go();
+        } else {
+          await _db.markAllDirty();
+        }
+        if (!(stillCurrent?.call() ?? true)) {
+          throw const _AuthTransitionSuperseded();
+        }
+      });
+      pairingPersisted();
+    } catch (_) {
+      final saved = receipt;
+      if (saved != null) await store.rollbackPairing(saved);
+      if (store.authGeneration == owner.generation) {
+        if (previousAccount != null) {
+          await store.setAccount(previousAccount);
+        } else {
+          await store.clearAccount();
+        }
+        pairingPersistenceFailed();
+      }
+      rethrow;
+    } finally {
+      if (identical(_wipeCommitCompletion, completion)) {
+        _wipeCommitCompletion = null;
+      }
+      if (!completion.isCompleted) completion.complete();
+    }
+    ref.read(pairedStateRevisionProvider.notifier).refresh();
+    unawaited(syncNow());
+    unawaited(ref.read(pushProvider).register(requestPermission: true));
+    return wipe;
+  }
+
+  /// A phone paired before accounts were recorded does not know whose data it holds. Ask the
+  /// server once and remember it, so a later re-pair to the same account does not wipe.
+  /// Best effort: offline, revoked, or an old server leave things as they were.
+  Future<void> ensureAccount() async {
+    final store = ref.read(storeProvider);
+    if (store.account != null) return;
+    final generation = store.authGeneration;
+    final server = store.serverUrl;
+    final token = await store.readTokenForGeneration(generation);
+    if (token == null) return;
+    // Preserve unknown legacy provenance even after keep-data signout. Offline
+    // owner discovery must not relabel those rows as never-paired local data.
+    if (!await store.prefs.setBool('account_owner_unknown', true)) {
+      throw StateError('Could not preserve local account ownership.');
+    }
+    if (store.authGeneration != generation || store.serverUrl != server) return;
+    try {
+      final me = await ref.read(apiFactoryProvider)(server, token).me();
+      await store.runIfTokenCurrent(token, generation, () async {
+        if (store.serverUrl != server) return;
+        await store.setAccount(Account(server, me.userId, me.name));
+      });
+    } catch (_) {}
+  }
+
   /// Sign this phone out: ask the server to revoke the token (best effort, the phone may be
   /// offline), forget the token and sync cursor, and optionally delete the local data.
   /// Returns false when the server could not be told, so the caller can say the token may
@@ -268,6 +402,11 @@ class AppController {
     final epoch = store.credentialEpoch;
     final cursorBeforeCleanup = store.cursor;
     final token = await store.readTokenForGeneration(storeGeneration);
+    if (token != null && store.account == null) {
+      if (!await store.prefs.setBool('account_owner_unknown', true)) {
+        throw StateError('Could not preserve local account ownership.');
+      }
+    }
     if (generation != _authGeneration ||
         (!_signedOut && !wipeRecoveryRetry) ||
         store.credentialEpoch != epoch ||
@@ -398,6 +537,8 @@ class AppController {
         if (!await _wipeLocalIfCurrent(generation)) {
           if (_wipeCommitFailed) throw const _LocalWipeFailed();
           await store.setCursor(cursorBeforeCleanup);
+        } else {
+          await store.clearAccount();
         }
       } catch (_) {
         var restored = false;

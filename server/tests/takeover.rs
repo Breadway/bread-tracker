@@ -281,6 +281,10 @@ async fn every_user_ends_with_their_own_distinct_token_after_mixed_concurrent_mo
 #[tokio::test]
 async fn concurrent_disjoint_settings_patches_merge_after_external_writer_releases() {
     let (w, p) = world(&["Bob"]).await;
+    sqlx::query("UPDATE user_settings SET timezone = 'Australia/Perth' WHERE user_id = 1")
+        .execute(&w.pool)
+        .await
+        .unwrap();
     let bob = p[1].1.clone();
     for _ in 0..8 {
         assert_eq!(

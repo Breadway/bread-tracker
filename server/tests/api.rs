@@ -23,6 +23,12 @@ struct Harness {
 
 async fn harness() -> Harness {
     let db = db::connect_memory().await.unwrap();
+    // The reminder tests below use a Perth clock. A fresh database defaults to UTC, so put the
+    // admin on Perth explicitly (`fresh_installation_defaults_to_utc` covers the default).
+    sqlx::query("UPDATE user_settings SET timezone = 'Australia/Perth' WHERE user_id = 1")
+        .execute(&db)
+        .await
+        .unwrap();
     let mock = Arc::new(MockSender::default());
     let state = AppState::new(db, Config::from_env(), mock.clone());
     Harness {
@@ -2300,6 +2306,10 @@ async fn a_late_unregistered_answer_clears_only_the_token_fcm_rejected() {
     }
 
     let db = db::connect_memory().await.unwrap();
+    sqlx::query("UPDATE user_settings SET timezone = 'Australia/Perth' WHERE user_id = 1")
+        .execute(&db)
+        .await
+        .unwrap();
     let st = AppState::new(
         db.clone(),
         Config::from_env(),
@@ -3573,5 +3583,20 @@ async fn pair_and_me_say_which_account_the_device_belongs_to() {
     assert_eq!(
         (v["user_id"].as_i64(), v["name"].as_str()),
         (Some(bob_id), Some("Bob"))
+    );
+}
+
+// ---- defaults for new installations and new users ----
+
+#[tokio::test]
+async fn fresh_installation_defaults_to_utc_for_the_admin() {
+    let db = db::connect_memory().await.unwrap();
+    let tz: String = sqlx::query_scalar("SELECT timezone FROM user_settings WHERE user_id = 1")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        tz, "UTC",
+        "a new installation does not inherit the original owner's timezone"
     );
 }

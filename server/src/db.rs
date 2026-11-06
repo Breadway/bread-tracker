@@ -45,6 +45,11 @@ pub async fn connect_with_migrator(
     )
     .fetch_one(&pool)
     .await?;
+    // Establish freshness from the schema before migrations, never from the
+    // current device count. Revoked devices do not make an old household new.
+    let fresh: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%')",
+    ).fetch_one(&pool).await?;
     if old {
         let checksum: Option<Vec<u8>> =
             sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 3")
@@ -60,6 +65,11 @@ pub async fn connect_with_migrator(
             "unsupported experimental invites004 ledger: preserve this database and recreate ONLY your positively identified disposable task-owned fixture; never rewrite the ledger or remove production/reviewer data");
     }
     migrator.run(&pool).await?;
+    if fresh {
+        sqlx::query("UPDATE user_settings SET timezone = 'UTC' WHERE user_id = 1")
+            .execute(&pool)
+            .await?;
+    }
     crate::users::reconcile_name_keys(&pool).await?;
     if let Some(name) = admin_name {
         crate::users::apply_admin_name(&pool, name).await?;
@@ -75,5 +85,8 @@ pub async fn connect_memory() -> anyhow::Result<Db> {
         .connect_with(opts)
         .await?;
     sqlx::migrate!("../migrations").run(&pool).await?;
+    sqlx::query("UPDATE user_settings SET timezone = 'UTC' WHERE user_id = 1")
+        .execute(&pool)
+        .await?;
     Ok(pool)
 }

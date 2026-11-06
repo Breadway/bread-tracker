@@ -172,6 +172,131 @@ fn user_list_and_remove_need_confirmation_and_protect_the_admin() {
 }
 
 #[test]
+fn user_remove_rejects_unknown_extra_and_repeated_arguments_before_deleting() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.db");
+    run(&db, &["user", "list"]);
+    add_user(&db, "Bob");
+    add_user(&db, "Cy");
+
+    for bad in [
+        &["user", "remove", "Bob", "--yes", "--user", "admin"][..],
+        &["user", "remove", "Bob", "--yes", "--yes"],
+        &["user", "remove", "Bob", "--yes", "extra"],
+        &["user", "remove", "Bob", "--force"],
+        &["user", "remove", "--yes", "Bob"],
+        &["user", "remove", "Bob", "extra", "--yes"],
+        &["user", "remove", "Bob", "Bob", "--yes"],
+    ] {
+        let o = run(&db, bad);
+        assert!(!o.status.success(), "{bad:?}");
+        assert_eq!(query(&db, "SELECT COUNT(*) FROM users"), "3", "{bad:?}");
+        assert_eq!(
+            query(&db, "SELECT COUNT(*) FROM users WHERE name = 'Bob'"),
+            "1",
+            "{bad:?}"
+        );
+        assert_eq!(
+            query(&db, "SELECT COUNT(*) FROM devices WHERE id = 'dev-Bob'"),
+            "1",
+            "{bad:?}"
+        );
+    }
+
+    let o = run(&db, &["user", "remove", "Bob", "--yes"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(query(&db, "SELECT COUNT(*) FROM users"), "2");
+    assert_eq!(
+        query(&db, "SELECT COUNT(*) FROM users WHERE name = 'Bob'"),
+        "0"
+    );
+    assert_eq!(query(&db, "SELECT name FROM users WHERE id > 1"), "Cy");
+}
+
+#[test]
+fn revoke_aliases_reject_unknown_and_extra_arguments_before_deleting() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.db");
+    run(&db, &["user", "list"]);
+    add_user(&db, "Bob");
+    add_user(&db, "Cy");
+
+    for bad in [
+        &["revoke", "dev-Bob", "--user", "Bob"][..],
+        &["revoke", "dev-Bob", "extra"],
+        &["revoke", "dev-Bob", "--yes"],
+        &["revoke", "--user", "Bob"],
+        &["revoke", "dev-Bob", "dev-Bob"],
+        &["device", "revoke", "dev-Cy", "extra"],
+        &["device", "revoke", "dev-Cy", "--user", "Cy"],
+        &["device", "revoke", "dev-Cy", "dev-Cy"],
+    ] {
+        let o = run(&db, bad);
+        assert!(!o.status.success(), "{bad:?}");
+        assert_eq!(query(&db, "SELECT COUNT(*) FROM devices"), "2", "{bad:?}");
+        assert_eq!(
+            query(&db, "SELECT COUNT(*) FROM devices WHERE id = 'dev-Bob'"),
+            "1",
+            "{bad:?}"
+        );
+        assert_eq!(
+            query(&db, "SELECT COUNT(*) FROM devices WHERE id = 'dev-Cy'"),
+            "1",
+            "{bad:?}"
+        );
+    }
+
+    assert!(run(&db, &["revoke", "dev-Bob"]).status.success());
+    assert_eq!(query(&db, "SELECT COUNT(*) FROM devices"), "1");
+    assert!(run(&db, &["device", "revoke", "dev-Cy"]).status.success());
+    assert_eq!(query(&db, "SELECT COUNT(*) FROM devices"), "0");
+}
+
+#[test]
+fn non_destructive_user_subcommands_also_reject_extra_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.db");
+    run(&db, &["user", "list"]);
+    add_user(&db, "Bob");
+
+    for bad in [
+        &["user", "list", "extra"][..],
+        &["user", "export", "Bob", "extra"],
+        &["user", "export", "Bob", "--user", "admin"],
+        &["user", "disable", "Bob", "--yes"],
+        &["user", "enable", "Bob", "extra"],
+        &["user", "disable", "Bob", "Bob"],
+    ] {
+        assert!(!run(&db, bad).status.success(), "{bad:?}");
+        assert_eq!(
+            query(
+                &db,
+                "SELECT COUNT(*) FROM users WHERE disabled_at IS NOT NULL"
+            ),
+            "0",
+            "{bad:?}"
+        );
+    }
+
+    assert!(run(&db, &["user", "disable", "Bob"]).status.success());
+    assert_eq!(
+        query(
+            &db,
+            "SELECT COUNT(*) FROM users WHERE disabled_at IS NOT NULL"
+        ),
+        "1"
+    );
+    assert!(run(&db, &["user", "enable", "Bob"]).status.success());
+    assert_eq!(
+        query(
+            &db,
+            "SELECT COUNT(*) FROM users WHERE disabled_at IS NOT NULL"
+        ),
+        "0"
+    );
+}
+
+#[test]
 fn bad_usage_fails_without_changing_anything() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.db");

@@ -3600,3 +3600,560 @@ async fn fresh_installation_defaults_to_utc_for_the_admin() {
         "a new installation does not inherit the original owner's timezone"
     );
 }
+
+// ---- cross-user isolation suite ----
+//
+// Everything below is written as an attack: B holds a valid token and tries to reach A's data
+// through every route and with every verb, and A's rows are compared byte for byte afterwards.
+
+/// Everything stored for a user, as comparable text (items, completions, settings, devices' fcm).
+async fn snapshot(h: &Harness, uid: i64) -> String {
+    let items: Vec<String> = sqlx::query_scalar(
+        "SELECT id || '|' || kind || '|' || name || '|' || weekdays || '|' || COALESCE(remind_time,'') || '|' || points || '|' ||
+                COALESCE(due_date,'') || '|' || sort || '|' || active || '|' || updated_at || '|' || COALESCE(deleted_at,'') || '|' || seq FROM items WHERE user_id = ? ORDER BY id",
+    ).bind(uid).fetch_all(&h.state.db).await.unwrap();
+    let comps: Vec<String> = sqlx::query_scalar(
+        "SELECT item_id || '|' || date || '|' || completed_at || '|' || updated_at || '|' || COALESCE(deleted_at,'') || '|' || seq
+         FROM completions WHERE user_id = ? ORDER BY item_id, date",
+    ).bind(uid).fetch_all(&h.state.db).await.unwrap();
+    let settings: Vec<String> = sqlx::query_scalar(
+        "SELECT timezone || '|' || quiet_start || '|' || quiet_end || '|' || reminders_enabled FROM user_settings WHERE user_id = ?",
+    ).bind(uid).fetch_all(&h.state.db).await.unwrap();
+    let devices: Vec<String> = sqlx::query_scalar(
+        "SELECT id || '|' || COALESCE(fcm_token,'') FROM devices WHERE user_id = ? ORDER BY id",
+    )
+    .bind(uid)
+    .fetch_all(&h.state.db)
+    .await
+    .unwrap();
+    format!("{items:?}\n{comps:?}\n{settings:?}\n{devices:?}")
+}
+
+async fn two_users_with_data(h: &Harness) -> (String, String, i64) {
+    let alice = paired(h).await;
+    let (bob_id, bob) = user_with_device(h, "Bob").await;
+    let now = store::now_ms();
+    call(&h.app, "POST", "/sync", Some(&alice), Some(json!({
+        "items": [item(C1, "chore", "Alice chore", 127, Some("17:15"), now), item(H1, "habit", "Alice habit", 127, None, now)],
+        "completions": [comp(C1, "2026-10-19", now, None), comp(H1, "2026-10-19", now, None)]
+    }))).await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&alice),
+        Some(json!({"fcm_token": "fcm-alice"})),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&alice),
+        Some(json!({"timezone": "Asia/Tokyo", "quiet_start": "22:00", "quiet_end": "07:00"})),
+    )
+    .await;
+    (alice, bob, bob_id)
+}
+
+#[tokio::test]
+async fn b_cannot_delete_tombstone_or_edit_as_a_row_of_a_through_any_sync_call() {
+    let h = harness().await;
+    let (_alice, bob, _) = two_users_with_data(&h).await;
+    let before = snapshot(&h, 1).await;
+    let later = store::now_ms() + 10_000;
+
+    // Before Bob owns either id, a completion cannot resolve through Alice's
+    // rows. Check the entire mixed batch rolls back, not just Alice's snapshot.
+    let sequence_before: i64 = sqlx::query_scalar("SELECT val FROM meta WHERE key = 'seq'")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    let (status, _) = call(&h.app, "POST", "/sync", Some(&bob), Some(json!({
+        "items": [item("55555555-5555-4555-8555-555555555555", "chore", "must roll back", 127, None, later)],
+        "completions": [comp(C1, "2026-10-19", later, None)]
+    }))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let sequence_after: i64 = sqlx::query_scalar("SELECT val FROM meta WHERE key = 'seq'")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(sequence_after, sequence_before);
+    let (_, bob_before) = call(&h.app, "GET", "/sync?since=0", Some(&bob), None).await;
+    assert!(bob_before["items"].as_array().unwrap().is_empty());
+    assert!(bob_before["completions"].as_array().unwrap().is_empty());
+    assert_eq!(snapshot(&h, 1).await, before);
+
+    // Every kind of write B can express against A's ids: soft delete, edit, un-tick, a tick, deactivate.
+    let mut gone = item(C1, "chore", "deleted by B", 1, None, later);
+    gone["deleted_at"] = json!(later);
+    let mut off = item(H1, "habit", "off", 127, None, later + 1);
+    off["active"] = json!(false);
+    for body in [
+        json!({"items": [gone.clone()]}),
+        json!({"items": [off.clone()]}),
+        json!({"completions": [comp(C1, "2026-10-19", later, Some(later))]}),
+        json!({"completions": [comp(H1, "2026-10-20", later, None)]}),
+        json!({"since": 0, "items": [gone, off], "completions": [comp(C1, "2026-10-19", later + 5, Some(later + 5))]}),
+    ] {
+        let (s, _) = call(&h.app, "POST", "/sync", Some(&bob), Some(body)).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+    assert_eq!(snapshot(&h, 1).await, before, "nothing of A's changed");
+
+    // They went into B's own account instead.
+    let (_, v) = call(&h.app, "GET", "/sync?since=0", Some(&bob), None).await;
+    assert_eq!(v["items"].as_array().unwrap().len(), 2);
+    assert!(v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|i| i["name"] != "Alice chore" && i["name"] != "Alice habit"));
+}
+
+#[tokio::test]
+async fn foreign_only_completion_is_rejected_and_snapshot_covers_due_date_and_sort() {
+    let h = harness().await;
+    let (_, bob, _) = two_users_with_data(&h).await;
+    let before = snapshot(&h, 1).await;
+    let (status, _) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&bob),
+        Some(json!({"completions": [comp(C1, "2026-10-19", store::now_ms(), None)]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(snapshot(&h, 1).await, before);
+    sqlx::query("UPDATE items SET due_date = '2026-10-20' WHERE user_id = 1 AND id = ?")
+        .bind(C1)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let changed_date = snapshot(&h, 1).await;
+    assert_ne!(
+        changed_date, before,
+        "the oracle must detect due_date mutation"
+    );
+    sqlx::query("UPDATE items SET sort = sort + 1 WHERE user_id = 1 AND id = ?")
+        .bind(C1)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    assert_ne!(
+        snapshot(&h, 1).await,
+        changed_date,
+        "the oracle must detect sort mutation"
+    );
+}
+
+#[tokio::test]
+async fn actual_transport_error_for_one_owner_does_not_block_another() {
+    use async_trait::async_trait;
+    use bread_tracker_server::push::{Message, PushSender, SendOutcome};
+    struct FailingSender {
+        attempts: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl PushSender for FailingSender {
+        fn enabled(&self) -> bool {
+            true
+        }
+        async fn send(&self, message: &Message) -> anyhow::Result<SendOutcome> {
+            self.attempts.lock().unwrap().push(message.token.clone());
+            if message.token == "fcm-alice" {
+                anyhow::bail!("injected transport failure");
+            }
+            Ok(SendOutcome::Sent)
+        }
+    }
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (_, bob) = perth_user_with_device(&h, "Bob").await;
+    for (token, fcm) in [(&alice, "fcm-alice"), (&bob, "fcm-bob")] {
+        assert_eq!(
+            call(
+                &h.app,
+                "POST",
+                "/sync",
+                Some(token),
+                Some(json!({"items": [
+                    item(C1, "chore", "Private", 127, Some("17:15"), store::now_ms())
+                ]}))
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(
+                &h.app,
+                "PUT",
+                "/device",
+                Some(token),
+                Some(json!({"fcm_token": fcm}))
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    let sender = Arc::new(FailingSender {
+        attempts: Default::default(),
+    });
+    let state = AppState::new(
+        h.state.db.clone(),
+        (*h.state.config).clone(),
+        sender.clone(),
+    );
+    assert_eq!(push::tick(&state, perth(17, 16)).await.unwrap(), 1);
+    let attempts = sender.attempts.lock().unwrap();
+    assert!(
+        attempts.contains(&"fcm-alice".to_owned()),
+        "failure branch must be reached"
+    );
+    assert!(
+        attempts.contains(&"fcm-bob".to_owned()),
+        "other owner must still be served"
+    );
+}
+
+#[tokio::test]
+async fn b_cannot_read_a_through_any_route_even_knowing_her_ids_and_dates() {
+    let h = harness().await;
+    let (alice, bob, _) = two_users_with_data(&h).await;
+    for uri in ["/sync?since=0", "/sync?since=-5", "/sync?since=999999999"] {
+        let (s, v) = call(&h.app, "GET", uri, Some(&bob), None).await;
+        assert_eq!(s, StatusCode::OK, "{uri}");
+        assert!(v["items"].as_array().unwrap().is_empty(), "{uri}: {v}");
+        assert!(
+            v["completions"].as_array().unwrap().is_empty(),
+            "{uri}: {v}"
+        );
+    }
+    let (_, v) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&bob),
+        Some(json!({"since": 0})),
+    )
+    .await;
+    assert!(v["items"].as_array().unwrap().is_empty());
+    let (_, st) = call(&h.app, "GET", "/stats?date=2026-10-19", Some(&bob), None).await;
+    assert_eq!(st["xp"], 0);
+    assert!(st["streaks"].as_object().unwrap().is_empty());
+    assert!(st["perfect_days"].as_array().unwrap().is_empty());
+    let (_, s) = call(&h.app, "GET", "/settings", Some(&bob), None).await;
+    assert_eq!(
+        (s["timezone"].as_str(), s["quiet_start"].as_str()),
+        (Some("UTC"), Some(""))
+    );
+    let (_, me) = call(&h.app, "GET", "/me", Some(&bob), None).await;
+    assert_eq!(me["name"], "Bob");
+    // ...and A is unaffected by B's reads, and still sees her own data.
+    let (_, a) = call(&h.app, "GET", "/sync?since=0", Some(&alice), None).await;
+    assert_eq!(a["items"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn b_changing_settings_device_and_push_leaves_a_untouched() {
+    let h = harness().await;
+    let (_alice, bob, _) = two_users_with_data(&h).await;
+    let before = snapshot(&h, 1).await;
+    call(&h.app, "PUT", "/settings", Some(&bob), Some(json!({"timezone": "Europe/Paris", "reminders_enabled": false, "quiet_start": "01:00", "quiet_end": "02:00"}))).await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&bob),
+        Some(json!({"fcm_token": "fcm-bob"})),
+    )
+    .await;
+    call(&h.app, "POST", "/push/test", Some(&bob), None).await;
+    call(&h.app, "POST", "/pair-code", Some(&bob), None).await;
+    call(&h.app, "DELETE", "/device", Some(&bob), None).await;
+    assert_eq!(snapshot(&h, 1).await, before);
+}
+
+#[tokio::test]
+async fn every_token_resolves_to_exactly_one_user_across_devices_and_signups() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (bob_id, bob) = user_with_device(&h, "Bob").await;
+    // Second devices through the three ways of getting one.
+    let (_, p) = call(&h.app, "POST", "/pair-code", Some(&bob), None).await;
+    let (_, bob2) = call(
+        &h.app,
+        "POST",
+        "/pair",
+        None,
+        Some(json!({"code": p["code"]})),
+    )
+    .await;
+    let code = invite(&h).await;
+    let (_, cy) = signup(&h, &code, "Cy").await;
+    let cy_id = cy["user_id"].as_i64().unwrap();
+    let alice2_code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    let (_, alice2) = call(
+        &h.app,
+        "POST",
+        "/pair",
+        None,
+        Some(json!({"code": alice2_code})),
+    )
+    .await;
+
+    for (tok, uid) in [
+        (alice.clone(), 1),
+        (alice2["token"].as_str().unwrap().to_string(), 1),
+        (bob.clone(), bob_id),
+        (bob2["token"].as_str().unwrap().to_string(), bob_id),
+        (cy["token"].as_str().unwrap().to_string(), cy_id),
+    ] {
+        let (s, me) = call(&h.app, "GET", "/me", Some(&tok), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(me["user_id"].as_i64(), Some(uid));
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(DISTINCT user_id) FROM devices WHERE token_hash = ?")
+                .bind(auth::hash(&tok))
+                .fetch_one(&h.state.db)
+                .await
+                .unwrap();
+        assert_eq!(n, 1);
+    }
+    // Tokens are unique across the whole table.
+    let (total, distinct): (i64, i64) =
+        sqlx::query_as("SELECT COUNT(*), COUNT(DISTINCT token_hash) FROM devices")
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(total, distinct);
+}
+
+const ALL_AUTHED: [(&str, &str); 9] = [
+    ("GET", "/sync"),
+    ("POST", "/sync"),
+    ("GET", "/stats"),
+    ("GET", "/settings"),
+    ("PUT", "/settings"),
+    ("PUT", "/device"),
+    ("DELETE", "/device"),
+    ("POST", "/push/test"),
+    ("GET", "/me"),
+];
+
+#[tokio::test]
+async fn a_revoked_device_is_refused_on_every_route() {
+    use bread_tracker_server::devices;
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (_, bob) = user_with_device(&h, "Bob").await;
+    let id: String = sqlx::query_scalar("SELECT id FROM devices WHERE token_hash = ?")
+        .bind(auth::hash(&bob))
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    devices::revoke(&h.state.db, &id).await.unwrap();
+    for (m, p) in ALL_AUTHED.iter().chain([("POST", "/pair-code")].iter()) {
+        let body = if *m == "GET" || *m == "DELETE" {
+            None
+        } else {
+            Some(json!({}))
+        };
+        let (s, _) = call(&h.app, m, p, Some(&bob), body).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{m} {p}");
+    }
+    assert_eq!(
+        call(&h.app, "GET", "/me", Some(&alice), None).await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn a_removed_user_is_refused_on_every_route_and_the_others_still_work() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (bob_id, bob) = user_with_device(&h, "Bob").await;
+    let (_, p) = call(&h.app, "POST", "/pair-code", Some(&bob), None).await;
+    let bob_code = p["code"].as_str().unwrap().to_string();
+    bread_tracker_server::users::remove(&h.state.db, bob_id)
+        .await
+        .unwrap()
+        .unwrap();
+    for (m, p) in ALL_AUTHED.iter().chain([("POST", "/pair-code")].iter()) {
+        let body = if *m == "GET" || *m == "DELETE" {
+            None
+        } else {
+            Some(json!({}))
+        };
+        assert_eq!(
+            call(&h.app, m, p, Some(&bob), body).await.0,
+            StatusCode::UNAUTHORIZED,
+            "{m} {p}"
+        );
+    }
+    // A pairing code the removed user had made no longer works either.
+    assert_eq!(
+        call(
+            &h.app,
+            "POST",
+            "/pair",
+            None,
+            Some(json!({"code": bob_code}))
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(&h.app, "GET", "/me", Some(&alice), None).await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn a_failing_send_for_one_user_does_not_stop_the_next_users_reminder() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (_, bob) = perth_user_with_device(&h, "Bob").await;
+    let now = store::now_ms();
+    for tok in [&alice, &bob] {
+        call(
+            &h.app,
+            "POST",
+            "/sync",
+            Some(tok),
+            Some(json!({"items": [item(C1, "chore", "Dishes", 127, Some("17:15"), now)]})),
+        )
+        .await;
+    }
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&alice),
+        Some(json!({"fcm_token": "fcm-alice"})),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&bob),
+        Some(json!({"fcm_token": "fcm-bob"})),
+    )
+    .await;
+    // Alice's token has been revoked at FCM: her send reports Unregistered, her token is cleared, and Bob is still served.
+    h.mock
+        .dead_tokens
+        .lock()
+        .unwrap()
+        .insert("fcm-alice".into());
+    assert_eq!(push::tick(&h.state, perth(17, 16)).await.unwrap(), 1);
+    let sent: Vec<String> = h
+        .mock
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| m.token.clone())
+        .collect();
+    assert_eq!(sent, vec!["fcm-bob".to_string()]);
+    let alice_token: Option<String> =
+        sqlx::query_scalar("SELECT fcm_token FROM devices WHERE user_id = 1")
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(alice_token, None, "only Alice's own dead token was cleared");
+    let bob_token: Option<String> =
+        sqlx::query_scalar("SELECT fcm_token FROM devices WHERE user_id != 1")
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(bob_token.as_deref(), Some("fcm-bob"));
+}
+
+#[tokio::test]
+async fn two_users_syncing_with_the_same_cursor_each_get_only_their_own_new_rows() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (_, bob) = user_with_device(&h, "Bob").await;
+    let now = store::now_ms();
+    // Both start from the same cursor value.
+    let (_, a0) = call(&h.app, "GET", "/sync?since=0", Some(&alice), None).await;
+    let (_, b0) = call(&h.app, "GET", "/sync?since=0", Some(&bob), None).await;
+    assert_eq!(a0["cursor"], b0["cursor"]);
+    let c = a0["cursor"].as_i64().unwrap();
+    // They write interleaved.
+    for i in 0..4 {
+        let id = format!("5555555{i}-5555-4555-8555-555555555555");
+        let who = if i % 2 == 0 { &alice } else { &bob };
+        call(
+            &h.app,
+            "POST",
+            "/sync",
+            Some(who),
+            Some(json!({"items": [item(&id, "chore", &format!("n{i}"), 127, None, now)]})),
+        )
+        .await;
+    }
+    for (tok, want) in [(&alice, vec!["n0", "n2"]), (&bob, vec!["n1", "n3"])] {
+        let (_, v) = call(&h.app, "GET", &format!("/sync?since={c}"), Some(tok), None).await;
+        let mut got: Vec<&str> = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["name"].as_str().unwrap())
+            .collect();
+        got.sort();
+        assert_eq!(got, want);
+    }
+}
+
+#[tokio::test]
+async fn the_request_cannot_choose_the_user() {
+    let h = harness().await;
+    let (alice, bob, _) = two_users_with_data(&h).await;
+    let before = snapshot(&h, 1).await;
+    // Extra fields that look like ownership are ignored: no user_id or owner is ever read from input.
+    let now = store::now_ms() + 5000;
+    let mut it = item(C1, "chore", "forged", 127, None, now);
+    it["user_id"] = json!(1);
+    it["owner"] = json!("admin");
+    let (s, _) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&bob),
+        Some(json!({"user_id": 1, "items": [it]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, a) = call(
+        &h.app,
+        "GET",
+        "/sync?since=0&user_id=2&user=Bob",
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(
+        a["items"].as_array().unwrap().len(),
+        2,
+        "query string cannot redirect the read either"
+    );
+    assert_eq!(snapshot(&h, 1).await, before);
+    // The forged row, ownership fields and all, landed in Bob's own account under his own key.
+    let owners: Vec<(i64, String)> =
+        sqlx::query_as("SELECT user_id, name FROM items WHERE id = ? ORDER BY user_id")
+            .bind(C1)
+            .fetch_all(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(owners.len(), 2, "A's row and B's row, side by side");
+    assert_eq!(owners[0], (1, "Alice chore".to_string()));
+    assert_eq!(owners[1].1, "forged");
+    assert_ne!(owners[1].0, 1);
+}

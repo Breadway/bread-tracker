@@ -2,35 +2,83 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../data/api.dart';
+import '../data/store.dart';
 import '../state.dart';
 import '../theme.dart';
 import 'pair.dart' show PanelButton, Spacer8;
 import 'widgets.dart';
 
-/// Loads the server's reminder settings. Re-read by invalidating after a change.
+/// The account a cached [ServerSettings] value belongs to.
+///
+/// The store mutates in place, so a provider that only depends on the [Store]
+/// object can keep serving the previous account's settings. Capture the
+/// credential generation, server and user id together and compare them before
+/// rendering or saving anything.
+@immutable
+class SettingsOwner {
+  const SettingsOwner({
+    required this.generation,
+    required this.server,
+    required this.userId,
+  });
+
+  factory SettingsOwner.capture(Store store) => SettingsOwner(
+    generation: store.authGeneration,
+    server: store.serverUrl,
+    userId: store.account?.userId,
+  );
+
+  final int generation;
+  final String server;
+  final int? userId;
+
+  bool matches(Store store) =>
+      generation == store.authGeneration &&
+      server == store.serverUrl &&
+      userId == store.account?.userId;
+
+  @override
+  bool operator ==(Object other) =>
+      other is SettingsOwner &&
+      other.generation == generation &&
+      other.server == server &&
+      other.userId == userId;
+
+  @override
+  int get hashCode => Object.hash(generation, server, userId);
+}
+
+/// A settings reply tagged with the account it was loaded for.
+@immutable
+class ServerSettingsSnapshot {
+  const ServerSettingsSnapshot(this.owner, this.settings);
+  final SettingsOwner owner;
+  final ServerSettings settings;
+}
+
+/// Loads the server's reminder settings. Re-read by bumping the paired-state
+/// revision after a change.
 ///
 /// No automatic retry: the section shows the error with a Retry button instead of
 /// hammering an unreachable server in the background.
-final serverSettingsProvider = FutureProvider.autoDispose<ServerSettings>((
-  ref,
-) async {
-  ref.watch(pairedStateRevisionProvider);
-  final store = ref.watch(storeProvider);
-  final generation = store.authGeneration;
-  final server = store.serverUrl;
-  final token = await store.readTokenForGeneration(generation);
-  if (store.authGeneration != generation || store.serverUrl != server) {
-    throw ApiException('Account changed. Reload settings.');
-  }
-  if (token == null) throw ApiException('Not paired');
-  final settings = await ref
-      .read(apiFactoryProvider)(server, token)
-      .getSettings();
-  if (store.authGeneration != generation || store.serverUrl != server) {
-    throw ApiException('Account changed. Reload settings.');
-  }
-  return settings;
-}, retry: (_, _) => null);
+final serverSettingsProvider =
+    FutureProvider.autoDispose<ServerSettingsSnapshot>((ref) async {
+      ref.watch(pairedStateRevisionProvider);
+      final store = ref.watch(storeProvider);
+      final owner = SettingsOwner.capture(store);
+      final token = await store.readTokenForGeneration(owner.generation);
+      if (!owner.matches(store)) {
+        throw ApiException('Account changed. Reload settings.');
+      }
+      if (token == null) throw ApiException('Not paired');
+      final settings = await ref
+          .read(apiFactoryProvider)(owner.server, token)
+          .getSettings();
+      if (!owner.matches(store)) {
+        throw ApiException('Account changed. Reload settings.');
+      }
+      return ServerSettingsSnapshot(owner, settings);
+    }, retry: (_, _) => null);
 
 String _hhmm(TimeOfDay t) =>
     '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
@@ -58,9 +106,25 @@ class ServerSettingsSection extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final p = palOf(context);
+    ref.watch(pairedStateRevisionProvider);
+    final store = ref.watch(storeProvider);
+    final current = SettingsOwner.capture(store);
     final settings = ref.watch(serverSettingsProvider);
+    final snapshot = settings.value;
+
+    // Riverpod keeps the previous async value while a provider refreshes. That
+    // value belongs to the previous account and must not stay interactive, so
+    // only render data whose captured owner still matches the live store.
+    if (snapshot != null && snapshot.owner == current) {
+      return _Loaded(
+        key: ValueKey(snapshot.owner),
+        snapshot: snapshot,
+        phoneOffset: phoneOffset,
+      );
+    }
 
     return settings.when(
+      skipLoadingOnRefresh: false,
       loading: () => const Panel(child: Text('Loading reminder settings...')),
       error: (e, _) => Panel(
         child: Row(
@@ -80,15 +144,19 @@ class ServerSettingsSection extends ConsumerWidget {
           ],
         ),
       ),
-      data: (s) => _Loaded(settings: s, phoneOffset: phoneOffset),
+      // Stale data from another account while the replacement is loading.
+      data: (_) => const Panel(child: Text('Loading reminder settings...')),
     );
   }
 }
 
 class _Loaded extends ConsumerWidget {
-  const _Loaded({required this.settings, this.phoneOffset});
-  final ServerSettings settings;
+  const _Loaded({super.key, required this.snapshot, this.phoneOffset});
+  final ServerSettingsSnapshot snapshot;
   final Duration? phoneOffset;
+
+  ServerSettings get settings => snapshot.settings;
+  SettingsOwner get owner => snapshot.owner;
 
   Future<void> _save(
     BuildContext context,
@@ -96,21 +164,32 @@ class _Loaded extends ConsumerWidget {
     Map<String, Object?> patch,
   ) async {
     final messenger = ScaffoldMessenger.of(context);
+    final store = ref.read(storeProvider);
+    // The editor was opened for [owner]. A transition that happened while it
+    // was pending must not write its values through the new account's token.
+    if (!owner.matches(store)) {
+      messenger.showSnackBar(
+        const SnackBar(
+          content: Text('Account changed. Settings were not saved.'),
+        ),
+      );
+      return;
+    }
     try {
-      final store = ref.read(storeProvider);
-      final generation = store.authGeneration;
-      final server = store.serverUrl;
-      final token = await store.readTokenForGeneration(generation);
-      if (store.authGeneration != generation || store.serverUrl != server) {
+      final token = await store.readTokenForGeneration(owner.generation);
+      if (!owner.matches(store)) {
+        messenger.showSnackBar(
+          const SnackBar(
+            content: Text('Account changed. Settings were not saved.'),
+          ),
+        );
         return;
       }
       if (token == null) throw ApiException('Not paired');
-      await ref.read(apiFactoryProvider)(server, token).putSettings(patch);
-      if (!context.mounted ||
-          store.authGeneration != generation ||
-          store.serverUrl != server) {
-        return;
-      }
+      await ref
+          .read(apiFactoryProvider)(owner.server, token)
+          .putSettings(patch);
+      if (!context.mounted || !owner.matches(store)) return;
       ref.invalidate(serverSettingsProvider);
     } on ApiException catch (e) {
       messenger.showSnackBar(SnackBar(content: Text(e.message)));

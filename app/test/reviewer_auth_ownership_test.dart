@@ -1047,12 +1047,15 @@ void main() {
             ),
           ),
           serverSettingsProvider.overrideWith(
-            (ref) async => const ServerSettings(
-              timezone: 'UTC',
-              quietStart: '',
-              quietEnd: '',
-              remindersEnabled: true,
-              utcOffsetMinutes: 0,
+            (ref) async => ServerSettingsSnapshot(
+              SettingsOwner.capture(ref.watch(storeProvider)),
+              const ServerSettings(
+                timezone: 'UTC',
+                quietStart: '',
+                quietEnd: '',
+                remindersEnabled: true,
+                utcOffsetMinutes: 0,
+              ),
             ),
           ),
         ],

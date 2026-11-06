@@ -25,6 +25,16 @@ pub struct DeviceId(pub String);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UserId(pub i64);
 
+/// The exact device and credential that authenticated a request. Handlers that grant
+/// long-lived access recheck this inside their own write transaction, because the device can
+/// be revoked while the request waits for the writer.
+#[derive(Clone, Debug)]
+pub struct CallerIdentity {
+    pub device_id: String,
+    pub token_hash: String,
+    pub user_id: i64,
+}
+
 pub fn hash(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
 }
@@ -142,9 +152,17 @@ pub async fn admin_device_count(db: &Db) -> Result<i64, sqlx::Error> {
 /// so a stuck client cannot pile them up.
 const MAX_OPEN_CODES_PER_USER: i64 = 3;
 
-/// A fresh short-lived pairing code for `user_id`, keeping at most
+/// A fresh short-lived pairing code for the caller, keeping at most
 /// [`MAX_OPEN_CODES_PER_USER`] unexpired codes for that user.
-pub async fn create_pairing_code_limited(db: &Db, user_id: i64) -> Result<String, sqlx::Error> {
+///
+/// Returns `None` without changing anything when the caller is no longer eligible. The check
+/// runs inside the same `BEGIN IMMEDIATE` transaction as the prune and insert: authentication
+/// happens before the handler, but a request can wait for the writer long enough for its device
+/// to be revoked, so the decision to issue access must be made again under the write lock.
+pub async fn create_pairing_code_limited(
+    db: &Db,
+    caller: &CallerIdentity,
+) -> Result<Option<String>, sqlx::Error> {
     let raw: String = {
         let mut rng = rand::thread_rng();
         (0..8)
@@ -152,6 +170,20 @@ pub async fn create_pairing_code_limited(db: &Db, user_id: i64) -> Result<String
             .collect()
     };
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    let eligible: Option<i64> = sqlx::query_scalar(
+        "SELECT d.user_id FROM devices d JOIN users u ON u.id = d.user_id
+         WHERE d.id = ? AND d.token_hash = ? AND d.user_id = ? AND u.disabled_at IS NULL",
+    )
+    .bind(&caller.device_id)
+    .bind(&caller.token_hash)
+    .bind(caller.user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if eligible.is_none() {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let user_id = caller.user_id;
     sqlx::query(
         "DELETE FROM pairing_codes WHERE user_id = ?1 AND code_hash NOT IN
            (SELECT code_hash FROM pairing_codes WHERE user_id = ?1 AND expires_at > ?2
@@ -169,7 +201,7 @@ pub async fn create_pairing_code_limited(db: &Db, user_id: i64) -> Result<String
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(format!("{}-{}", &raw[..4], &raw[4..]))
+    Ok(Some(format!("{}-{}", &raw[..4], &raw[4..])))
 }
 
 /// Expiry of a pairing code, for the response of `POST /pair-code`.
@@ -190,11 +222,12 @@ pub async fn require_auth(
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(ApiError::Unauthorized)?
         .to_string();
+    let token_hash = hash(&token);
     let row: Option<(String, i64, i64, Option<i64>)> = sqlx::query_as(
         "SELECT d.id, d.last_seen, d.user_id, u.disabled_at
          FROM devices d JOIN users u ON u.id = d.user_id WHERE d.token_hash = ?",
     )
-    .bind(hash(&token))
+    .bind(&token_hash)
     .fetch_optional(&st.db)
     .await?;
     let (id, last_seen, user_id, disabled_at) = row.ok_or(ApiError::Unauthorized)?;
@@ -231,8 +264,13 @@ pub async fn require_auth(
     // The user id goes in the log so abuse can be traced to an account. Never the token, and
     // only the path (no query string).
     let (method, path) = (req.method().clone(), req.uri().path().to_string());
-    req.extensions_mut().insert(DeviceId(id));
+    req.extensions_mut().insert(DeviceId(id.clone()));
     req.extensions_mut().insert(UserId(user_id));
+    req.extensions_mut().insert(CallerIdentity {
+        device_id: id,
+        token_hash,
+        user_id,
+    });
     let resp = next.run(req).await;
     tracing::info!(user = user_id, %method, %path, status = resp.status().as_u16(), "request");
     Ok(resp)

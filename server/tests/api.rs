@@ -4952,3 +4952,262 @@ async fn device_rows(h: &Harness) -> i64 {
         .await
         .unwrap()
 }
+
+// ---- account deletion and export ----
+
+#[tokio::test]
+async fn export_contains_the_callers_own_data_including_tombstones_and_nothing_else() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (_, bob) = user_with_device(&h, "Bob").await;
+    let now = store::now_ms();
+    let mut gone = item(H1, "habit", "Deleted habit", 127, None, now);
+    gone["deleted_at"] = json!(now);
+    call(&h.app, "POST", "/sync", Some(&bob), Some(json!({
+        "items": [item(C1, "chore", "Bob's dishes", 127, Some("18:00"), now), gone],
+        "completions": [comp(C1, "2026-10-19", now, None), comp(C1, "2026-10-18", now, Some(now))]
+    }))).await;
+    call(&h.app, "POST", "/sync", Some(&alice), Some(json!({"items": [item(C1, "chore", "ALICE SECRET", 127, None, now)], "completions": [comp(C1, "2026-10-19", now, None)]}))).await;
+    call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&bob),
+        Some(json!({"timezone": "Europe/Berlin", "quiet_start": "22:00", "quiet_end": "07:00"})),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&bob),
+        Some(json!({"fcm_token": "fcm-secret-token"})),
+    )
+    .await;
+
+    let (s, v) = call(&h.app, "GET", "/export", Some(&bob), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        (v["format"].as_str(), v["version"].as_i64()),
+        (Some("bread-tracker-export"), Some(1))
+    );
+    assert_eq!(v["account"]["name"], "Bob");
+    assert_eq!(
+        (
+            v["settings"]["timezone"].as_str(),
+            v["settings"]["quiet_start"].as_str()
+        ),
+        (Some("Europe/Berlin"), Some("22:00"))
+    );
+    let names: Vec<&str> = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 2);
+    assert!(
+        names.contains(&"Bob's dishes") && names.contains(&"Deleted habit"),
+        "tombstones are included"
+    );
+    assert_eq!(v["completions"].as_array().unwrap().len(), 2);
+    assert!(
+        v["completions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| !c["deleted_at"].is_null()),
+        "un-ticks are included"
+    );
+    assert_eq!(v["devices"].as_array().unwrap().len(), 1);
+
+    // Nothing of Alice's, and no secrets: no token hashes, tokens or fcm tokens anywhere.
+    let text = v.to_string();
+    assert!(!text.contains("ALICE SECRET"));
+    assert!(
+        !text.contains("fcm-secret-token") && !text.contains("token"),
+        "{text}"
+    );
+    assert!(!text.contains(&auth::hash(&bob)));
+    assert_eq!(
+        call(&h.app, "GET", "/export", None, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn an_export_can_be_read_back_as_a_sync_push() {
+    let h = harness().await;
+    let (_, bob) = user_with_device(&h, "Bob").await;
+    let now = store::now_ms();
+    call(&h.app, "POST", "/sync", Some(&bob), Some(json!({
+        "items": [item(C1, "chore", "Dishes", 127, Some("18:00"), now), item(H1, "habit", "Read", 127, None, now)],
+        "completions": [comp(C1, "2026-10-19", now, None)]
+    }))).await;
+    let (_, exp) = call(&h.app, "GET", "/export", Some(&bob), None).await;
+    // A fresh account can take the export's items and completions as they are.
+    let (_, cy) = user_with_device(&h, "Cy").await;
+    let (s, v) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&cy),
+        Some(json!({"items": exp["items"], "completions": exp["completions"]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["items"].as_array().unwrap().len(), 2);
+    assert_eq!(v["completions"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn deleting_your_account_needs_the_name_removes_everything_and_leaves_others_alone() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (bob_id, bob) = user_with_device(&h, "Bob").await;
+    let now = store::now_ms();
+    for tok in [&alice, &bob] {
+        call(&h.app, "POST", "/sync", Some(tok), Some(json!({"items": [item(C1, "chore", "Dishes", 127, Some("17:15"), now)], "completions": [comp(C1, "2026-10-19", now, None)]}))).await;
+        call(
+            &h.app,
+            "PUT",
+            "/device",
+            Some(tok),
+            Some(json!({"fcm_token": format!("fcm-{}", &tok[..6])})),
+        )
+        .await;
+    }
+    let (_, p) = call(&h.app, "POST", "/pair-code", Some(&bob), None).await;
+    let spare_code = p["code"].as_str().unwrap().to_string();
+    sqlx::query("INSERT INTO reminders_sent (user_id, item_id, date, sent_at) VALUES (?, ?, '2026-10-19', 0)").bind(bob_id).bind(C1).execute(&h.state.db).await.unwrap();
+    let alice_before = rows_of(&h, 1).await;
+
+    // Wrong or missing confirmation deletes nothing.
+    for body in [
+        json!({"confirm": "Alice"}),
+        json!({"confirm": ""}),
+        json!({"confirm": "bo"}),
+    ] {
+        let (s, _) = call(&h.app, "DELETE", "/account", Some(&bob), Some(body)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(
+        call(&h.app, "DELETE", "/account", Some(&bob), Some(json!({})))
+            .await
+            .0,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "missing field"
+    );
+    assert!(
+        rows_of(&h, bob_id).await.iter().all(|n| *n >= 1),
+        "still all there"
+    );
+
+    let (s, v) = call(
+        &h.app,
+        "DELETE",
+        "/account",
+        Some(&bob),
+        Some(json!({"confirm": "  bOb "})),
+    )
+    .await;
+    assert_eq!(
+        (s, v["deleted"].as_bool()),
+        (StatusCode::OK, Some(true)),
+        "the name matches ignoring case and spaces"
+    );
+    assert_eq!(rows_of(&h, bob_id).await, [0; 6]);
+    assert_eq!(
+        count(
+            &h,
+            &format!("SELECT COUNT(*) FROM users WHERE id = {bob_id}")
+        )
+        .await,
+        0
+    );
+    assert_eq!(rows_of(&h, 1).await, alice_before, "Alice is untouched");
+    // The token and the unredeemed code are dead; Alice still works.
+    assert_eq!(
+        call(&h.app, "GET", "/me", Some(&bob), None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(
+            &h.app,
+            "POST",
+            "/pair",
+            None,
+            Some(json!({"code": spare_code}))
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(&h.app, "GET", "/me", Some(&alice), None).await.0,
+        StatusCode::OK
+    );
+    // And the name is free again.
+    assert_eq!(signup(&h, &invite(&h).await, "Bob").await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn the_admin_cannot_delete_their_account_from_the_app() {
+    let h = harness().await;
+    let admin = paired(&h).await;
+    let (s, v) = call(
+        &h.app,
+        "DELETE",
+        "/account",
+        Some(&admin),
+        Some(json!({"confirm": "admin"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(v["error"].as_str().unwrap().contains("admin"), "{v}");
+    assert_eq!(
+        call(&h.app, "GET", "/me", Some(&admin), None).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(count(&h, "SELECT COUNT(*) FROM users").await, 1);
+}
+
+#[tokio::test]
+async fn deletion_through_the_api_and_the_cli_use_the_same_code_path() {
+    // Same row accounting as users::remove (used by the CLI), and both leave no row behind in
+    // any table that has a user_id column.
+    let h = harness().await;
+    let (bob_id, bob) = user_with_device(&h, "Bob").await;
+    let now = store::now_ms();
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&bob),
+        Some(json!({"items": [item(C1, "chore", "x", 127, None, now)]})),
+    )
+    .await;
+    call(
+        &h.app,
+        "DELETE",
+        "/account",
+        Some(&bob),
+        Some(json!({"confirm": "Bob"})),
+    )
+    .await;
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND sql LIKE '%user_id%'",
+    )
+    .fetch_all(&h.state.db)
+    .await
+    .unwrap();
+    assert!(tables.len() >= 6, "{tables:?}");
+    for t in tables {
+        let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {t} WHERE user_id = ?"))
+            .bind(bob_id)
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "{t} still has rows for the deleted user");
+    }
+}

@@ -19,6 +19,8 @@ pub enum ApiError {
     LimitReached(String),
     #[error("this account is disabled")]
     Disabled,
+    #[error("{0}")]
+    Forbidden(String),
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
 }
@@ -38,6 +40,7 @@ impl IntoResponse for ApiError {
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
             ApiError::LimitReached(m) => (StatusCode::UNPROCESSABLE_ENTITY, m.clone()),
             ApiError::Disabled => (StatusCode::FORBIDDEN, self.to_string()),
+            ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m.clone()),
             ApiError::Internal(e) => {
                 tracing::error!(error = ?e, "internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())

@@ -1,5 +1,10 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:share_plus/share_plus.dart';
 
 import '../data/api.dart';
 import '../data/sync.dart';
@@ -10,6 +15,24 @@ import 'items.dart';
 import 'pair.dart';
 import 'server_settings.dart';
 import 'widgets.dart';
+
+final exportShareProvider = Provider<Future<void> Function(String)>(
+  (ref) => (json) async {
+    await SharePlus.instance.share(
+      ShareParams(
+        files: [
+          XFile.fromData(
+            Uint8List.fromList(utf8.encode(json)),
+            mimeType: 'application/json',
+            name: 'bread-tracker-export.json',
+          ),
+        ],
+        fileNameOverrides: ['bread-tracker-export.json'],
+        title: 'Bread Tracker export',
+      ),
+    );
+  },
+);
 
 class SettingsScreen extends ConsumerWidget {
   const SettingsScreen({super.key});
@@ -157,6 +180,61 @@ class SettingsScreen extends ConsumerWidget {
                 }
 
                 await finishSignOut();
+              },
+            ),
+          if (paired) const Spacer8(),
+          if (paired)
+            PanelButton(
+              icon: Icons.download_rounded,
+              title: 'Export my data',
+              subtitle: 'Copy everything stored for your account as JSON',
+              onTap: () async {
+                try {
+                  final json = await ctl.exportJson();
+                  if (json.length > _maxClipboardChars) {
+                    await ref.read(exportShareProvider)(json);
+                    return;
+                  }
+                  await Clipboard.setData(ClipboardData(text: json));
+                  toast(
+                    'Copied ${json.length ~/ 1024 + 1} KB of JSON to the clipboard',
+                  );
+                } on ApiException catch (e) {
+                  toast(e.message);
+                } on AuthLost catch (e) {
+                  toast(e.toString());
+                } catch (_) {
+                  toast(
+                    'Could not save or share the export. Your data is unchanged. Retry export.',
+                  );
+                }
+              },
+            ),
+          if (paired) const Spacer8(),
+          if (paired)
+            PanelButton(
+              icon: Icons.delete_forever_rounded,
+              title: 'Delete my account',
+              subtitle: 'Permanently remove your account and all of your data from the server',
+              onTap: () async {
+                final name = store.account?.name ?? '';
+                final typed = await showDialog<String>(
+                  context: context,
+                  builder: (_) => _DeleteAccountDialog(name: name),
+                );
+                if (typed == null) return;
+                try {
+                  await ctl.deleteAccount(typed);
+                  toast('Your account was deleted');
+                } on ApiException catch (e) {
+                  toast(e.message);
+                } on AuthLost catch (e) {
+                  toast(e.toString());
+                } catch (_) {
+                  toast(
+                    'Account cleanup failed on this phone. Local sync is paused; retry cleanup before pairing.',
+                  );
+                }
               },
             ),
           if (paired) const Spacer8(),
@@ -415,6 +493,68 @@ class _PairCodeDialogState extends ConsumerState<_PairCodeDialog> {
             onPressed: _busy ? null : _load,
             child: const Text('New code'),
           ),
+      ],
+    );
+  }
+}
+
+/// Android's binder limit is about 1 MB per transaction; stay well under it.
+const _maxClipboardChars = 500 * 1000;
+
+/// Asks the user to type the account name before deleting. Owns its controller.
+class _DeleteAccountDialog extends StatefulWidget {
+  const _DeleteAccountDialog({required this.name});
+  final String name;
+  @override
+  State<_DeleteAccountDialog> createState() => _DeleteAccountDialogState();
+}
+
+class _DeleteAccountDialogState extends State<_DeleteAccountDialog> {
+  final _c = TextEditingController();
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final matches =
+        widget.name.isNotEmpty &&
+        _c.text.trim().toLowerCase() == widget.name.toLowerCase();
+    return AlertDialog(
+      title: const Text('Delete your account?'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'This removes your account, items, history and settings from the server and '
+            'from this phone, and signs out every device on the account. It cannot be '
+            'undone. Export your data first if you want a copy.',
+          ),
+          const SizedBox(height: 12),
+          Text('Type "${widget.name}" to confirm.'),
+          TextField(
+            controller: _c,
+            autofocus: true,
+            onChanged: (_) => setState(() {}),
+            decoration: InputDecoration(hintText: widget.name),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: matches
+              ? () => Navigator.pop(context, _c.text.trim())
+              : null,
+          child: const Text('Delete everything'),
+        ),
       ],
     );
   }

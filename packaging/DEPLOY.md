@@ -107,17 +107,18 @@ step 2 and step 4 and phones retry on their own.
    Do not start the containers again until step 4. Verify the copy itself. It must open,
    pass `integrity_check` and `foreign_key_check`, have a valid migration ledger (every
    migration recorded once and successful, with the checksum of the shipped file), and record
-   only migrations this release supports (`1`, `2`, `3`, `5`, `6`, `7`):
+   only migrations this release supports (`1`, `2`, `3`, `4`, `5`, `6`, `7`, `8`, `9`, `10`,
+   `11`):
 
    ```sh
-   python3 scripts/db-evidence.py check "$COPY/bread-tracker.db" --ledger-subset 1,2,3,5,6,7
+   python3 scripts/db-evidence.py check "$COPY/bread-tracker.db" --ledger-subset 1,2,3,4,5,6,7,8,9,10,11
    ```
 
    It prints the evidence (row counts, `meta.seq`, the migration ledger, a digest of every
    row) and ends with `CHECK PASSED`. The checker works on a private copy of the database file
    and of its `-wal` and `-shm` files, so the files it is pointed at, sidecars included, stay
    byte-identical. Anything else, including a recorded migration this release
-   does not ship such as `0004`, is a stop: leave the copy as it is, go to "If the gate or
+   does not ship, is a stop: leave the copy as it is, go to "If the gate or
    the upgrade fails" below, and do not deploy.
 
 3. **Mandatory backup gate: the Litestream replica must restore and match the frozen copy.**
@@ -159,11 +160,11 @@ step 2 and step 4 and phones retry on their own.
    is called `admin` and can still be named by a later start. A name another user already
    holds stops startup with a message.
 
-   This release ships migrations `1`, `2`, `3`, `5`, `6`, `7`, `8`, `9`, `10` and `11`. A database that has already
-   recorded `4` (the durable pairing limiter, PR31) is refused at start with a missing
-   migration error and is not served. Supporting `4` needs a separately accepted PR31 that is
-   integrated with this change so its migration and runtime ship together; this release does
-   not include them, and the test fixture for `4` in the repository only exercises the ledger.
+   This release ships migrations `1`, `2`, `3`, `4`, `5`, `6`, `7`, `8`, `9`, `10` and `11`.
+   A database that has already recorded `4` (the reserved PR31 pairing-limiter version) is
+   adopted by the same start: its checksum and table are kept and the later migrations apply.
+   The live pairing and signup admission is migration `9`'s `public_auth_limits`; `4`'s
+   `pair_rate_limits` table stays reserved and has no writer.
 
 5. **Verify the result.** The new release and Litestream are now running. Give Litestream a
    few seconds, then restore the replica into a new scratch directory, as in step 3, and check
@@ -227,6 +228,7 @@ docker exec bread-tracker bread-tracker-server user list
 docker exec bread-tracker bread-tracker-server devices [--user NAME]
 docker exec bread-tracker bread-tracker-server pair [--user NAME]    # a code for that user's new device
 docker exec bread-tracker bread-tracker-server revoke <device id>
+docker exec bread-tracker bread-tracker-server user export NAME     # everything stored for a user, as JSON
 docker exec bread-tracker bread-tracker-server user remove NAME --yes # deletes the user and all their data
 ```
 

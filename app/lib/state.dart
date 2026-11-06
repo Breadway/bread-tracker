@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'dart:ui';
 
@@ -367,6 +368,47 @@ class AppController {
         await store.setAccount(Account(server, me.userId, me.name));
       });
     } catch (_) {}
+  }
+
+  /// Delete the signed-in account on the server (it must be confirmed with the account name),
+  /// then forget everything about it on this phone: token, cursor, account and the local items
+  /// and ticks. The local data is only deleted after the server confirmed, so a failed or
+  /// refused request (offline, admin account, wrong name) leaves the phone as it was.
+  /// Throws [ApiException] or [AuthLost] from the request.
+  Future<void> deleteAccount(String confirm) async {
+    final store = ref.read(storeProvider);
+    final generation = _authGeneration;
+    final storeGeneration = store.authGeneration;
+    final server = store.serverUrl;
+    final token = await store.readTokenForGeneration(storeGeneration);
+    if (token == null) throw ApiException('Not signed in');
+    if (generation != _authGeneration || store.serverUrl != server) return;
+    await ref.read(apiFactoryProvider)(server, token).deleteAccount(confirm);
+    // Reuse the same owner-bound, verified-removal and COMMIT-fenced cleanup as
+    // signout. A delayed deletion response never owns a replacement account.
+    await signOut(
+      wipeLocal: true,
+      expectedAuthGeneration: generation,
+      expectedStoreGeneration: storeGeneration,
+      expectedServer: server,
+    );
+  }
+
+  /// The account's data as pretty printed JSON, for the user to keep.
+  Future<String> exportJson() async {
+    final store = ref.read(storeProvider);
+    final generation = store.authGeneration;
+    final server = store.serverUrl;
+    final token = await store.readTokenForGeneration(generation);
+    if (token == null) throw ApiException('Not signed in');
+    if (store.serverUrl != server) {
+      throw ApiException('Account changed. Retry export.');
+    }
+    final doc = await ref.read(apiFactoryProvider)(server, token).exportData();
+    if (store.authGeneration != generation || store.serverUrl != server) {
+      throw ApiException('Account changed. Retry export.');
+    }
+    return const JsonEncoder.withIndent('  ').convert(doc);
   }
 
   /// Sign this phone out: ask the server to revoke the token (best effort, the phone may be

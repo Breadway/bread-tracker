@@ -203,6 +203,12 @@ class Api {
 
   Future<void> pushTest() => _send('POST', '/push/test');
 
+  /// Everything the server holds for this account, as the JSON document the server builds.
+  Future<Map<String, dynamic>> exportData() => _send('GET', '/export');
+
+  /// Delete this account and all of its data on the server. [confirm] must be the account name.
+  Future<void> deleteAccount(String confirm) => _send('DELETE', '/account', {'confirm': confirm});
+
   /// Ask the server to revoke this device's token.
   Future<void> signOut() => _send('DELETE', '/device');
 

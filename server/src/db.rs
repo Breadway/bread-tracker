@@ -52,6 +52,12 @@ pub async fn connect_with_migrator(
                 .await?;
         anyhow::ensure!(checksum.as_ref().map(hex::encode).as_deref() != Some("1e89bcb129fcdeadb396a48b8310419532c080e8b4a6e7e329532d7fbed72074ac4a43f70bb0a389f16cc885343b865f"),
             "unsupported experimental settings003 ledger: preserve this database and recreate ONLY your positively identified disposable task-owned fixture with the current migrations; never edit _sqlx_migrations or delete production/reviewer databases");
+        let invite_checksum: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 4")
+                .fetch_optional(&pool)
+                .await?;
+        anyhow::ensure!(invite_checksum.as_ref().map(hex::encode).as_deref() != Some("ea989dda2ed972c914b78d423bc7dff9f81f5043252d7b616c287c8cbd82c1645ff96462022c625bd3e286c110bb1ed6"),
+            "unsupported experimental invites004 ledger: preserve this database and recreate ONLY your positively identified disposable task-owned fixture; never rewrite the ledger or remove production/reviewer data");
     }
     migrator.run(&pool).await?;
     crate::users::reconcile_name_keys(&pool).await?;

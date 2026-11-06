@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Query, State};
 use axum::middleware;
 use axum::routing::{get, post, put};
@@ -16,8 +17,10 @@ use tower_http::trace::TraceLayer;
 use crate::auth::{self, DeviceId, UserId};
 use crate::error::{ApiError, ApiResult};
 use crate::model::{SyncRequest, SyncResponse};
+use crate::public_auth::{self, ClientIp};
 use crate::push::{Message, SendOutcome};
 use crate::store::{PushError, UserDb, UserSettings};
+use crate::{invites, users};
 use crate::{xp, AppState};
 
 const MAX_BATCH: usize = 5000;
@@ -51,6 +54,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/pair", post(pair))
+        .route("/signup", post(signup))
         .merge(authed)
         .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
@@ -70,19 +74,128 @@ struct PairResp {
     token: String,
 }
 
-async fn pair(State(st): State<AppState>, Json(req): Json<PairReq>) -> ApiResult<Json<PairResp>> {
-    if !st.pair_limiter.check() {
-        return Err(ApiError::TooManyRequests);
-    }
+async fn pair(
+    State(st): State<AppState>,
+    ClientIp(source): ClientIp,
+    body: Result<Json<PairReq>, JsonRejection>,
+) -> ApiResult<Json<PairResp>> {
+    let mut tx = public_auth::admit(&st.db, source).await?;
+    let req = match body {
+        Ok(Json(req)) => req,
+        Err(_) => {
+            public_auth::fail(tx, source).await?;
+            return Err(ApiError::BadRequest("invalid pairing request".into()));
+        }
+    };
     let name = if req.device_name.trim().is_empty() {
         "Android"
     } else {
         req.device_name.trim()
     };
     let name: String = name.chars().take(80).collect();
-    match auth::redeem(&st.db, &req.code, &name).await? {
-        Some((device_id, token)) => Ok(Json(PairResp { device_id, token })),
-        None => Err(ApiError::Unauthorized),
+    let owner: Option<i64> = sqlx::query_scalar(
+        "DELETE FROM pairing_codes WHERE code_hash = ? AND expires_at > ? RETURNING user_id",
+    )
+    .bind(auth::hash(&auth::normalize_code(&req.code)))
+    .bind(crate::store::now_ms())
+    .fetch_optional(&mut *tx)
+    .await?;
+    match owner {
+        Some(owner) => {
+            let (device_id, token) = auth::insert_device(&mut tx, owner, &name).await?;
+            tx.commit().await?;
+            Ok(Json(PairResp { device_id, token }))
+        }
+        None => {
+            public_auth::fail(tx, source).await?;
+            Err(ApiError::Unauthorized)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SignupReq {
+    invite: String,
+    name: String,
+    #[serde(default)]
+    device_name: String,
+    /// The phone's IANA timezone (for example `Europe/Berlin`). Optional; an unknown name is
+    /// ignored and the account keeps the UTC default, so signup never fails over a timezone.
+    #[serde(default)]
+    timezone: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SignupResp {
+    user_id: i64,
+    name: String,
+    device_id: String,
+    token: String,
+}
+
+/// Public. Create an account from an invite code: user, default settings and first device in
+/// one transaction. Never creates an admin. Failed attempts (bad invite) are limited per
+/// client address with the same limiter type as `/pair`.
+async fn signup(
+    State(st): State<AppState>,
+    ClientIp(src): ClientIp,
+    body: Result<Json<SignupReq>, JsonRejection>,
+) -> ApiResult<Json<SignupResp>> {
+    let mut tx = public_auth::admit(&st.db, src).await?;
+    let req = match body {
+        Ok(Json(req)) => req,
+        Err(_) => {
+            public_auth::fail(tx, src).await?;
+            return Err(ApiError::BadRequest("invalid signup request".into()));
+        }
+    };
+    let name = req.name.trim();
+    if !invites::name_ok(name) {
+        public_auth::fail(tx, src).await?;
+        return Err(ApiError::BadRequest(format!(
+            "name must be 1 to {} letters, digits, spaces, '.', '_' or '-'",
+            users::MAX_NAME_LEN
+        )));
+    }
+    let device_name = if req.device_name.trim().is_empty() {
+        "Android"
+    } else {
+        req.device_name.trim()
+    };
+    let device_name: String = device_name.chars().take(80).collect();
+    let timezone = req
+        .timezone
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && Tz::from_str(t).is_ok());
+    sqlx::query("SAVEPOINT signup_redemption")
+        .execute(&mut *tx)
+        .await?;
+    match invites::signup_in(&mut tx, &req.invite, name, &device_name, timezone).await? {
+        Ok(s) => {
+            tx.commit().await?;
+            tracing::info!(user = s.user_id, "signed up");
+            Ok(Json(SignupResp {
+                user_id: s.user_id,
+                name: name.to_string(),
+                device_id: s.device_id,
+                token: s.token,
+            }))
+        }
+        Err(invites::SignupError::BadInvite) => {
+            sqlx::query("ROLLBACK TO signup_redemption")
+                .execute(&mut *tx)
+                .await?;
+            public_auth::fail(tx, src).await?;
+            Err(ApiError::Unauthorized)
+        }
+        Err(invites::SignupError::NameTaken) => {
+            sqlx::query("ROLLBACK TO signup_redemption")
+                .execute(&mut *tx)
+                .await?;
+            public_auth::fail(tx, src).await?;
+            Err(ApiError::Conflict("that name is already taken".into()))
+        }
     }
 }
 

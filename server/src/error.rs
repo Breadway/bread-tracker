@@ -12,6 +12,8 @@ pub enum ApiError {
     TooManyRequests,
     #[error("{0}")]
     BadRequest(String),
+    #[error("{0}")]
+    Conflict(String),
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
 }
@@ -28,6 +30,7 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
             ApiError::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
+            ApiError::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
             ApiError::Internal(e) => {
                 tracing::error!(error = ?e, "internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())

@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Only these transport peers may provide a forwarded client address.
+    pub trusted_proxies: Vec<crate::public_auth::TrustedProxy>,
     pub listen: String,
     pub database_path: PathBuf,
     /// Path to a Firebase service-account JSON. Push is disabled when unset.
@@ -12,12 +14,26 @@ pub struct Config {
     pub reminder_grace_mins: i64,
     /// Name for the first (admin) user, who owns all data that existed before multi-user.
     pub admin_name: Option<String>,
+    /// How long a new invite code stays valid, in days (`invite create --ttl` overrides it).
+    pub invite_ttl_days: i64,
 }
 
 impl Config {
     pub fn from_env() -> Self {
         let get = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         Config {
+            trusted_proxies: get("BREADTRACKER_TRUSTED_PROXIES")
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(|entry| {
+                            crate::public_auth::TrustedProxy::parse(entry).unwrap_or_else(|| {
+                                panic!("invalid BREADTRACKER_TRUSTED_PROXIES entry: {entry}")
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             listen: get("BREADTRACKER_LISTEN").unwrap_or_else(|| "127.0.0.1:7290".into()),
             database_path: get("BREADTRACKER_DATABASE_PATH")
                 .map(PathBuf::from)
@@ -27,6 +43,10 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(360),
             admin_name: get("BREADTRACKER_ADMIN_NAME"),
+            invite_ttl_days: get("BREADTRACKER_INVITE_TTL_DAYS")
+                .and_then(|v| v.parse().ok())
+                .filter(|d| (1..=365).contains(d))
+                .unwrap_or(7),
         }
     }
 

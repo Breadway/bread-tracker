@@ -1,10 +1,6 @@
 //! Single-user device auth: a one-time pairing code is exchanged for a long-lived bearer
 //! token. Only the SHA-256 of codes and tokens is stored.
 
-use std::collections::VecDeque;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
-
 use axum::extract::{Request, State};
 use axum::http::header::AUTHORIZATION;
 use axum::middleware::Next;
@@ -17,7 +13,7 @@ use crate::error::ApiError;
 use crate::store::now_ms;
 use crate::AppState;
 
-const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+pub(crate) const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const CODE_TTL_MS: i64 = 15 * 60 * 1000;
 const LAST_SEEN_INTERVAL_MS: i64 = 60 * 1000;
 
@@ -39,7 +35,7 @@ pub fn random_token() -> String {
     hex::encode(b)
 }
 
-fn normalize_code(code: &str) -> String {
+pub fn normalize_code(code: &str) -> String {
     code.chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect::<String>()
@@ -94,61 +90,36 @@ pub async fn redeem(
         tx.commit().await?;
         return Ok(None);
     };
+    let device = insert_device(&mut tx, user_id, device_name).await?;
+    tx.commit().await?;
+    Ok(Some(device))
+}
+
+/// Create a device for `user_id` and return `(device_id, token)`. Only the token's hash is stored.
+pub async fn insert_device(
+    conn: &mut sqlx::SqliteConnection,
+    user_id: i64,
+    device_name: &str,
+) -> Result<(String, String), sqlx::Error> {
     let id = uuid::Uuid::new_v4().to_string();
     let token = random_token();
     let now = now_ms();
-    sqlx::query(
-        "INSERT INTO devices (id, user_id, name, token_hash, created_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&id)
-    .bind(user_id)
-    .bind(device_name)
-    .bind(hash(&token))
-    .bind(now)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(Some((id, token)))
+    sqlx::query("INSERT INTO devices (id, user_id, name, token_hash, created_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)")
+        .bind(&id)
+        .bind(user_id)
+        .bind(device_name)
+        .bind(hash(&token))
+        .bind(now)
+        .bind(now)
+        .execute(conn)
+        .await?;
+    Ok((id, token))
 }
 
 pub async fn device_count(db: &Db) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar("SELECT COUNT(*) FROM devices")
         .fetch_one(db)
         .await
-}
-
-/// Allows a small number of pairing attempts per window, globally (single-user server).
-pub struct PairLimiter {
-    max: usize,
-    window: Duration,
-    hits: Mutex<VecDeque<Instant>>,
-}
-
-impl PairLimiter {
-    pub fn new(max: usize, window: Duration) -> Self {
-        Self {
-            max,
-            window,
-            hits: Mutex::new(VecDeque::new()),
-        }
-    }
-
-    pub fn check(&self) -> bool {
-        let mut hits = self.hits.lock().unwrap();
-        let now = Instant::now();
-        while hits
-            .front()
-            .is_some_and(|t| now.duration_since(*t) > self.window)
-        {
-            hits.pop_front();
-        }
-        if hits.len() >= self.max {
-            return false;
-        }
-        hits.push_back(now);
-        true
-    }
 }
 
 /// Middleware: require `Authorization: Bearer <token>` matching a paired device.

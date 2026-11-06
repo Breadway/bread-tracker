@@ -200,8 +200,12 @@ void main() {
       final store = MemStore(prefs, 'old');
       await store.setServerUrl(server);
       await store.setAccount(const Account(server, 1, 'Alice'));
-      final directory = await Directory('/tmp/opencode')
-          .createTemp('track22-isolation-');
+      final directory = await Directory.systemTemp.createTemp(
+        'track22-isolation-',
+      );
+      addTearDown(() async {
+        if (directory.existsSync()) await directory.delete(recursive: true);
+      });
       final file = File('${directory.path}/local.db');
       var db = AppDb(NativeDatabase(file));
       final entered = Completer<void>();
@@ -271,7 +275,6 @@ void main() {
       expect(await store.token, 'new');
       await db.close();
       client.close();
-      await directory.delete(recursive: true);
     });
     test(
       'failed credential persistence never deletes the previous account rows',

@@ -33,6 +33,9 @@ class SettingsScreen extends ConsumerWidget {
       SyncStatus.syncing => 'Syncing...',
       SyncStatus.offline =>
         'Cannot reach the server. Changes are saved here and will sync later.',
+      SyncStatus.rejected =>
+        ref.read(syncEngineProvider).rejectionMessage ??
+            'The server refused this sync. Local changes are kept.',
       SyncStatus.unpaired =>
         paired
             ? 'This phone is no longer paired. Pair it again.'
@@ -83,10 +86,10 @@ class SettingsScreen extends ConsumerWidget {
           if (paired) const Spacer8(),
           PanelButton(
             icon: Icons.link_rounded,
-            title: paired ? 'Pair again' : 'Pair with server',
+            title: paired ? 'Switch account or pair again' : 'Join or pair',
             subtitle: paired
-                ? 'Use a new code, for example after reinstalling the server'
-                : 'Enter a pairing code from your server',
+                ? 'Join with an invite or use a code. If it is a different account, this phone\'s data is replaced'
+                : 'Join with an invite code, or pair with a code',
             onTap: () => Navigator.of(
               context,
             ).push(MaterialPageRoute<void>(builder: (_) => const PairScreen())),
@@ -155,6 +158,17 @@ class SettingsScreen extends ConsumerWidget {
 
                 await finishSignOut();
               },
+            ),
+          if (paired) const Spacer8(),
+          if (paired)
+            PanelButton(
+              icon: Icons.devices_rounded,
+              title: 'Add another device',
+              subtitle: 'Create a short-lived code for your own account',
+              onTap: () => showDialog<void>(
+                context: context,
+                builder: (_) => const _PairCodeDialog(),
+              ),
             ),
           const SectionHeader('Your list'),
           PanelButton(
@@ -295,6 +309,116 @@ class SettingsScreen extends ConsumerWidget {
 }
 
 enum _SignOut { keep, wipe }
+
+class _PairCodeDialog extends ConsumerStatefulWidget {
+  const _PairCodeDialog();
+
+  @override
+  ConsumerState<_PairCodeDialog> createState() => _PairCodeDialogState();
+}
+
+class _PairCodeDialogState extends ConsumerState<_PairCodeDialog> {
+  String? _code;
+  DateTime? _expiresAt;
+  String? _error;
+  bool _busy = false;
+  int? _ownerGeneration;
+  int? _ownerAppGeneration;
+  String? _ownerServer;
+
+  @override
+  void initState() {
+    super.initState();
+    Future.microtask(_load);
+  }
+
+  Future<void> _load() async {
+    if (!mounted || _busy) return;
+    final store = ref.read(storeProvider);
+    final controller = ref.read(controllerProvider);
+    final generation = store.authGeneration;
+    final appGeneration = controller.currentAuthGeneration;
+    final server = store.serverUrl;
+    bool ownsRequest() =>
+        mounted &&
+        store.authGeneration == generation &&
+        controller.currentAuthGeneration == appGeneration &&
+        store.serverUrl == server;
+    setState(() {
+      _busy = true;
+      _code = null;
+      _error = null;
+      _ownerGeneration = generation;
+      _ownerAppGeneration = appGeneration;
+      _ownerServer = server;
+    });
+    try {
+      final token = await store.readTokenForGeneration(generation);
+      if (!ownsRequest()) return;
+      if (token == null) throw ApiException('Pair this phone first.');
+      final result = await ref
+          .read(apiFactoryProvider)(server, token)
+          .createPairCode();
+      if (!ownsRequest()) return;
+      final code = result['code'];
+      final ttl = result['expires_in_secs'];
+      if (code is! String || code.isEmpty || ttl is! int || ttl <= 0) {
+        throw ApiException('Invalid pairing-code response.');
+      }
+      setState(() {
+        _code = code;
+        _expiresAt = DateTime.now().add(Duration(seconds: ttl));
+      });
+    } catch (error) {
+      if (ownsRequest()) setState(() => _error = error.toString());
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // A code is account-sensitive: hide it as soon as the owning session changes.
+    ref.watch(pairedStateRevisionProvider);
+    final paired = ref.watch(pairedProvider).value ?? false;
+    final store = ref.watch(storeProvider);
+    final sameOwner =
+        store.authGeneration == _ownerGeneration &&
+        ref.read(controllerProvider).currentAuthGeneration ==
+            _ownerAppGeneration &&
+        store.serverUrl == _ownerServer;
+    return AlertDialog(
+      title: const Text('Add another device'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (!paired)
+            const Text('Pair this phone first.')
+          else if (_busy)
+            const CircularProgressIndicator()
+          else if (_error != null)
+            Text(_error!)
+          else if (_code != null && sameOwner) ...[
+            SelectableText(_code!),
+            Text('Expires at ${_expiresAt!.toLocal()}. Single use.'),
+          ] else if (!sameOwner)
+            const Text('Account changed. Request a new code.'),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Close'),
+        ),
+        if (paired)
+          FilledButton(
+            onPressed: _busy ? null : _load,
+            child: const Text('New code'),
+          ),
+      ],
+    );
+  }
+}
 
 class _SignOutDialog extends StatelessWidget {
   const _SignOutDialog();

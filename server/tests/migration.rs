@@ -327,6 +327,101 @@ async fn admin_name_is_applied_once_and_never_overrides_an_established_name() {
 }
 
 #[tokio::test]
+async fn a_database_in_use_keeps_its_timezone_even_if_it_is_the_old_default() {
+    // The live database: 0001 defaults untouched (Australia/Perth) and a paired device.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live.db");
+    old_database(&path).await;
+    let url = format!("sqlite://{}", path.display());
+    {
+        let opts = SqliteConnectOptions::from_str(&url).unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE settings SET value = 'Australia/Perth' WHERE key = 'timezone'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+    }
+    let pool = db::connect(&url).await.unwrap();
+    let tz: String = sqlx::query_scalar("SELECT timezone FROM user_settings WHERE user_id = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        tz, "Australia/Perth",
+        "it has devices, so it is in use and is left alone"
+    );
+}
+
+#[tokio::test]
+async fn established_household_without_devices_keeps_its_timezone() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("revoked.db");
+    old_database(&path).await;
+    let url = format!("sqlite://{}", path.display());
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE settings SET value = 'Australia/Perth' WHERE key = 'timezone'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM devices")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let upgraded = db::connect(&url).await.unwrap();
+    let timezone: String =
+        sqlx::query_scalar("SELECT timezone FROM user_settings WHERE user_id = 1")
+            .fetch_one(&upgraded)
+            .await
+            .unwrap();
+    assert_eq!(timezone, "Australia/Perth");
+    assert_eq!(count(&upgraded, "SELECT COUNT(*) FROM items").await, 2);
+    upgraded.close().await;
+    let reopened = db::connect(&url).await.unwrap();
+    let timezone: String =
+        sqlx::query_scalar("SELECT timezone FROM user_settings WHERE user_id = 1")
+            .fetch_one(&reopened)
+            .await
+            .unwrap();
+    assert_eq!(timezone, "Australia/Perth");
+}
+
+#[tokio::test]
+async fn only_a_schema_empty_database_receives_utc_and_reopen_keeps_operator_choice() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("fresh-default.db");
+    let url = format!("sqlite://{}", path.display());
+    let pool = db::connect(&url).await.unwrap();
+    let timezone: String =
+        sqlx::query_scalar("SELECT timezone FROM user_settings WHERE user_id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(timezone, "UTC");
+    sqlx::query("UPDATE user_settings SET timezone = 'Australia/Perth' WHERE user_id = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let reopened = db::connect(&url).await.unwrap();
+    let timezone: String =
+        sqlx::query_scalar("SELECT timezone FROM user_settings WHERE user_id = 1")
+            .fetch_one(&reopened)
+            .await
+            .unwrap();
+    assert_eq!(timezone, "Australia/Perth");
+}
+
+#[tokio::test]
 async fn migrating_twice_is_a_no_op() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("old.db");

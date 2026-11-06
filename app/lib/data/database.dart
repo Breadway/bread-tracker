@@ -84,6 +84,21 @@ class AppDb extends _$AppDb {
     );
   }
 
+  /// Mark every local row as unsynced so the next sync pushes all of them. Safe because the
+  /// server keeps whichever copy has the newer `updated_at`.
+  Future<void> markAllDirty() async {
+    await (update(items)).write(const ItemsCompanion(dirty: Value(true)));
+    await (update(completions))
+        .write(const CompletionsCompanion(dirty: Value(true)));
+  }
+
+  /// Whether there is anything on the phone to lose (a tombstone counts: it is unsynced state).
+  Future<bool> hasLocalData() async {
+    final i = await (select(items)..limit(1)).get();
+    if (i.isNotEmpty) return true;
+    return (await (select(completions)..limit(1)).get()).isNotEmpty;
+  }
+
   /// Delete every local item and completion (used when signing out and wiping the phone).
   Future<void> clearAll() => transaction(() async {
     await delete(completions).go();

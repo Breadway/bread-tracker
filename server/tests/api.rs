@@ -1,14 +1,12 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use bread_tracker_server::config::Config;
 use bread_tracker_server::push::{self, MockSender};
 use bread_tracker_server::store::UserDb;
-use bread_tracker_server::{api, auth, db, store, AppState};
+use bread_tracker_server::{api, auth, db, devices, store, AppState};
 use chrono::{Duration, TimeZone, Utc};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
@@ -25,6 +23,12 @@ struct Harness {
 
 async fn harness() -> Harness {
     let db = db::connect_memory().await.unwrap();
+    // The reminder tests below use a Perth clock. A fresh database defaults to UTC, so put the
+    // admin on Perth explicitly (`fresh_installation_defaults_to_utc` covers the default).
+    sqlx::query("UPDATE user_settings SET timezone = 'Australia/Perth' WHERE user_id = 1")
+        .execute(&db)
+        .await
+        .unwrap();
     let mock = Arc::new(MockSender::default());
     let state = AppState::new(db, Config::from_env(), mock.clone());
     Harness {
@@ -373,6 +377,11 @@ async fn scheduler_queries_use_indexes_and_keep_any_date_todo_completion() {
         "reminder selection should use the partial index, got {item_plan:?}"
     );
     for _ in 0..100 {
+        // This test measures scheduler query semantics, not request admission.
+        sqlx::query("DELETE FROM authenticated_rate_limits")
+            .execute(&h.state.db)
+            .await
+            .unwrap();
         let id = uuid::Uuid::new_v4().to_string();
         call(
             &h.app,
@@ -754,12 +763,170 @@ async fn push_test_route_needs_a_registered_token() {
 }
 
 #[tokio::test]
+async fn failed_pair_attempts_from_one_source_do_not_block_another() {
+    let h = harness().await;
+    let bad = json!({"code": "AAAA-BBBB"});
+    for _ in 0..5 {
+        assert_eq!(
+            call_from(&h.app, "203.0.113.9:5000", None, "/pair", bad.clone()).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        call_from(&h.app, "203.0.113.9:5001", None, "/pair", bad.clone()).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    // A different source can still pair with a valid code.
+    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    let ok = call_from(
+        &h.app,
+        "198.51.100.7:4000",
+        None,
+        "/pair",
+        json!({"code": code}),
+    )
+    .await;
+    assert_eq!(ok, StatusCode::OK);
+
+    // The blocked source is refused even with a valid code until its window passes.
+    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    let blocked = call_from(
+        &h.app,
+        "203.0.113.9:5002",
+        None,
+        "/pair",
+        json!({"code": code}),
+    )
+    .await;
+    assert_eq!(blocked, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn successful_pairings_do_not_count_against_the_limit() {
+    let h = harness().await;
+    for _ in 0..8 {
+        let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+        let s = call_from(
+            &h.app,
+            "203.0.113.9:5000",
+            None,
+            "/pair",
+            json!({"code": code}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn forwarded_for_is_only_believed_from_a_trusted_proxy() {
+    use bread_tracker_server::public_auth::TrustedProxy;
+    let bad = json!({"code": "AAAA-BBBB"});
+
+    // Untrusted peer: it cannot dodge the limit by rotating X-Forwarded-For.
+    let h = harness().await;
+    for i in 0..5 {
+        let xff = format!("10.9.9.{i}");
+        call_from(&h.app, "203.0.113.9:5000", Some(&xff), "/pair", bad.clone()).await;
+    }
+    assert_eq!(
+        call_from(
+            &h.app,
+            "203.0.113.9:5000",
+            Some("10.9.9.99"),
+            "/pair",
+            bad.clone()
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    // Trusted proxy (100.64.0.0/10): the client in X-Forwarded-For is the key.
+    let db = db::connect_memory().await.unwrap();
+    let mut config = Config::from_env();
+    config.trusted_proxies = vec![TrustedProxy::parse("100.64.0.0/10").unwrap()];
+    let state = AppState::new(db, config, Arc::new(MockSender::default()));
+    let app = api::router(state.clone());
+    for _ in 0..5 {
+        call_from(
+            &app,
+            "100.100.1.1:4000",
+            Some("203.0.113.50"),
+            "/pair",
+            bad.clone(),
+        )
+        .await;
+    }
+    assert_eq!(
+        call_from(
+            &app,
+            "100.100.1.1:4000",
+            Some("203.0.113.50"),
+            "/pair",
+            bad.clone()
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let code = auth::create_pairing_code(&state.db).await.unwrap();
+    let other = call_from(
+        &app,
+        "100.100.1.1:4000",
+        Some("203.0.113.51"),
+        "/pair",
+        json!({"code": code}),
+    )
+    .await;
+    assert_eq!(
+        other,
+        StatusCode::OK,
+        "the real user behind the same proxy is unaffected"
+    );
+}
+
+#[test]
+fn client_ip_resolution() {
+    use bread_tracker_server::public_auth::{client_ip, TrustedProxy};
+    let trusted = [
+        TrustedProxy::parse("10.0.0.0/8").unwrap(),
+        TrustedProxy::parse("::1").unwrap(),
+    ];
+    let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    assert_eq!(
+        client_ip(ip("1.2.3.4"), Some("9.9.9.9"), &trusted),
+        ip("1.2.3.4"),
+        "untrusted peer"
+    );
+    assert_eq!(
+        client_ip(ip("10.0.0.2"), None, &trusted),
+        ip("10.0.0.2"),
+        "no header"
+    );
+    assert_eq!(
+        client_ip(ip("10.0.0.2"), Some("5.5.5.5"), &trusted),
+        ip("5.5.5.5")
+    );
+    assert_eq!(
+        client_ip(ip("10.0.0.2"), Some("6.6.6.6, 5.5.5.5, 10.0.0.9"), &trusted),
+        ip("5.5.5.5"),
+        "spoofed left entry ignored"
+    );
+    assert_eq!(
+        client_ip(ip("10.0.0.2"), Some("garbage"), &trusted),
+        ip("10.0.0.2")
+    );
+    assert!(TrustedProxy::parse("10.0.0.0/33").is_none());
+    assert!(TrustedProxy::parse("nope").is_none());
+}
+
+#[tokio::test]
 async fn revoked_device_loses_access_immediately() {
     use bread_tracker_server::devices::{self, Revoked};
     let h = harness().await;
     let phone = paired(&h).await;
     let tablet = paired(&h).await;
-    let list = devices::list(&h.state.db).await.unwrap();
+    let list = devices::list(&h.state.db, None).await.unwrap();
     assert_eq!(list.len(), 2);
 
     let (s, _) = call(&h.app, "GET", "/sync", Some(&phone), None).await;
@@ -773,7 +940,7 @@ async fn revoked_device_loses_access_immediately() {
         devices::revoke(&h.state.db, "zzzzzzzz").await.unwrap(),
         Revoked::NotFound
     );
-    assert_eq!(devices::list(&h.state.db).await.unwrap().len(), 2);
+    assert_eq!(devices::list(&h.state.db, None).await.unwrap().len(), 2);
 
     // Revoke the first device by a unique prefix of its id.
     let victim = &list[0];
@@ -803,14 +970,14 @@ async fn ambiguous_prefix_revokes_nothing() {
         devices::revoke(&h.state.db, "aaaa1111").await.unwrap(),
         Revoked::Ambiguous(2)
     );
-    assert_eq!(devices::list(&h.state.db).await.unwrap().len(), 4);
+    assert_eq!(devices::list(&h.state.db, None).await.unwrap().len(), 4);
     assert_eq!(
         devices::revoke(&h.state.db, "aaaa1111-0000-4000-8000-000000000002")
             .await
             .unwrap(),
         Revoked::Removed("d2".into())
     );
-    assert_eq!(devices::list(&h.state.db).await.unwrap().len(), 3);
+    assert_eq!(devices::list(&h.state.db, None).await.unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -2302,6 +2469,10 @@ async fn a_late_unregistered_answer_clears_only_the_token_fcm_rejected() {
     }
 
     let db = db::connect_memory().await.unwrap();
+    sqlx::query("UPDATE user_settings SET timezone = 'Australia/Perth' WHERE user_id = 1")
+        .execute(&db)
+        .await
+        .unwrap();
     let st = AppState::new(
         db.clone(),
         Config::from_env(),
@@ -2671,6 +2842,432 @@ async fn deleting_a_user_removes_their_settings() {
     assert_eq!(after, 1);
 }
 
+// ---- invites and signup ----
+
+use bread_tracker_server::invites;
+
+const DAY: i64 = 86_400_000;
+
+async fn invite(h: &Harness) -> String {
+    invites::create(&h.state.db, 1, 7 * DAY).await.unwrap().1
+}
+
+async fn signup(h: &Harness, code: &str, name: &str) -> (StatusCode, Value) {
+    call(
+        &h.app,
+        "POST",
+        "/signup",
+        None,
+        Some(json!({"invite": code, "name": name, "device_name": "Pixel 9"})),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn signup_creates_the_user_settings_and_device_and_the_token_works() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let now = store::now_ms();
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&alice),
+        Some(json!({"items": [item(C1, "chore", "Alice's", 127, None, now)]})),
+    )
+    .await;
+
+    let code = invite(&h).await;
+    let (s, v) = call(&h.app, "POST", "/signup", None, Some(json!({"invite": code, "name": "  Sam  ", "device_name": "Sam's phone", "timezone": "Europe/Berlin"}))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["name"], "Sam");
+    let tok = v["token"].as_str().unwrap().to_string();
+    let uid = v["user_id"].as_i64().unwrap();
+    assert!(uid > 1);
+
+    let row: (String, bool) = sqlx::query_as("SELECT name, is_admin FROM users WHERE id = ?")
+        .bind(uid)
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(row, ("Sam".to_string(), false), "never an admin");
+    let dev: (i64, String) = sqlx::query_as("SELECT user_id, name FROM devices WHERE id = ?")
+        .bind(v["device_id"].as_str().unwrap())
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(dev, (uid, "Sam's phone".to_string()));
+    let (_, st) = call(&h.app, "GET", "/settings", Some(&tok), None).await;
+    assert_eq!(st["timezone"], "Europe/Berlin");
+
+    // The new account is empty and isolated from Alice's data.
+    let (s, pulled) = call(&h.app, "GET", "/sync?since=0", Some(&tok), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(pulled["items"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn signup_without_a_timezone_or_with_a_bad_one_defaults_to_utc() {
+    let h = harness().await;
+    for (i, tz) in [None, Some("Mars/Olympus"), Some("")]
+        .into_iter()
+        .enumerate()
+    {
+        let code = invite(&h).await;
+        let mut body = json!({"invite": code, "name": format!("User{i}")});
+        if let Some(tz) = tz {
+            body["timezone"] = json!(tz);
+        }
+        let (s, v) = call(&h.app, "POST", "/signup", None, Some(body)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let (_, st) = call(
+            &h.app,
+            "GET",
+            "/settings",
+            Some(v["token"].as_str().unwrap()),
+            None,
+        )
+        .await;
+        assert_eq!(st["timezone"], "UTC");
+    }
+}
+
+#[tokio::test]
+async fn an_invite_is_single_use_and_a_used_one_looks_like_any_other_bad_code() {
+    let h = harness().await;
+    let code = invite(&h).await;
+    let (s, _) = signup(&h, &code.to_lowercase(), "First").await;
+    assert_eq!(s, StatusCode::OK, "case and dash insensitive");
+    let (s, v) = signup(&h, &code, "Second").await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s2, v2) = signup(&h, "AAAA-BBBB-CCCC", "Third").await;
+    assert_eq!(
+        (s, &v),
+        (s2, &v2),
+        "used and unknown codes are indistinguishable"
+    );
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(users, 2, "admin plus First");
+}
+
+#[tokio::test]
+async fn expired_and_revoked_invites_are_refused() {
+    let h = harness().await;
+    let (id, expired) = invites::create(&h.state.db, 1, DAY).await.unwrap();
+    sqlx::query("UPDATE invites SET expires_at = ? WHERE id = ?")
+        .bind(store::now_ms() - 1)
+        .bind(id)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        signup(&h, &expired, "Late").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    let (id, revoked) = invites::create(&h.state.db, 1, DAY).await.unwrap();
+    assert_eq!(
+        invites::revoke(&h.state.db, id).await.unwrap(),
+        invites::Revoked::Revoked
+    );
+    assert_eq!(
+        signup(&h, &revoked, "Nope").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        invites::revoke(&h.state.db, id).await.unwrap(),
+        invites::Revoked::NotActive
+    );
+    assert_eq!(
+        invites::revoke(&h.state.db, 9999).await.unwrap(),
+        invites::Revoked::NotFound
+    );
+
+    let list = invites::list(&h.state.db).await.unwrap();
+    assert_eq!(
+        list.iter().map(|i| i.status.clone()).collect::<Vec<_>>(),
+        vec![
+            invites::InviteStatus::Expired,
+            invites::InviteStatus::Revoked
+        ]
+    );
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(users, 1);
+}
+
+#[tokio::test]
+async fn names_are_validated_and_unique_ignoring_case_and_a_taken_name_keeps_the_invite() {
+    let h = harness().await;
+    let code = invite(&h).await;
+    for bad in ["", "   ", "has/slash", &"x".repeat(41), "tab\there"] {
+        let (s, _) = signup(&h, &code, bad).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad:?}");
+    }
+    // These assertions exercise independent validation cases, not the source budget.
+    sqlx::query("DELETE FROM public_auth_limits")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    // The placeholder admin name is taken, in any case.
+    let (s, v) = signup(&h, &code, "ADMIN").await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    // The failed attempts did not spend the invite.
+    let (s, _) = signup(&h, &code, "Sam").await;
+    assert_eq!(s, StatusCode::OK);
+    let code2 = invite(&h).await;
+    assert_eq!(signup(&h, &code2, "sam").await.0, StatusCode::CONFLICT);
+    let unused = invites::list(&h.state.db)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|i| i.status == invites::InviteStatus::Active)
+        .count();
+    assert_eq!(
+        unused, 1,
+        "the second invite is still usable with another name"
+    );
+    assert_eq!(signup(&h, &code2, "Sam2").await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn signup_unicode_case_collision_does_not_consume_the_invite() {
+    let h = harness().await;
+    let first = invite(&h).await;
+    assert_eq!(signup(&h, &first, "Älex").await.0, StatusCode::OK);
+    let second = invite(&h).await;
+    assert_eq!(signup(&h, &second, "älex").await.0, StatusCode::CONFLICT);
+    assert_eq!(signup(&h, &second, "Other").await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn malformed_signup_and_invalid_names_share_pairing_admission() {
+    let h = harness().await;
+    for _ in 0..5 {
+        let status = call_from(&h.app, "203.0.113.42:1234", None, "/signup", json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(
+        call_from(
+            &h.app,
+            "203.0.113.42:1234",
+            Some("198.51.100.1"),
+            "/signup",
+            json!({})
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    assert_eq!(
+        call_from(
+            &h.app,
+            "203.0.113.42:1234",
+            None,
+            "/pair",
+            json!({"code":code})
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        call_from(
+            &h.app,
+            "203.0.113.43:1234",
+            None,
+            "/pair",
+            json!({"code":code})
+        )
+        .await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn the_invite_code_is_stored_only_as_a_hash() {
+    let h = harness().await;
+    let code = invite(&h).await;
+    let raw = code.replace('-', "");
+    let stored: Vec<String> = sqlx::query_scalar("SELECT code_hash FROM invites")
+        .fetch_all(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert!(!stored[0].contains(&raw) && !stored[0].contains(&code));
+    assert_eq!(stored[0], auth::hash(&raw));
+    assert_eq!(code.len(), 14, "XXXX-XXXX-XXXX");
+}
+
+async fn call_from(
+    app: &Router,
+    peer: &str,
+    forwarded: Option<&str>,
+    path: &str,
+    body: Value,
+) -> StatusCode {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json");
+    if let Some(forwarded) = forwarded {
+        request = request.header("x-forwarded-for", forwarded);
+    }
+    let mut request = request.body(Body::from(body.to_string())).unwrap();
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        peer.parse::<std::net::SocketAddr>().unwrap(),
+    ));
+    app.clone().oneshot(request).await.unwrap().status()
+}
+
+#[tokio::test]
+async fn signup_is_rate_limited_per_source_and_only_failures_count() {
+    let h = harness().await;
+    let bad = json!({"invite": "AAAA-BBBB-CCCC", "name": "Eve"});
+    for _ in 0..5 {
+        assert_eq!(
+            call_from(&h.app, "203.0.113.9:5000", None, "/signup", bad.clone()).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        call_from(&h.app, "203.0.113.9:5001", None, "/signup", bad.clone()).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // Even a valid invite is refused from the blocked source for now...
+    let code = invite(&h).await;
+    let blocked = call_from(
+        &h.app,
+        "203.0.113.9:5002",
+        None,
+        "/signup",
+        json!({"invite": code, "name": "Eve"}),
+    )
+    .await;
+    assert_eq!(blocked, StatusCode::TOO_MANY_REQUESTS);
+    // ...but another source is unaffected, and successful signups never count against anyone.
+    for i in 0..12 {
+        let c = invite(&h).await;
+        let s = call_from(
+            &h.app,
+            "198.51.100.7:4000",
+            None,
+            "/signup",
+            json!({"invite": c, "name": format!("Ok{i}")}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "signup {i}");
+    }
+    // Pairing and signup share the same source budget.
+    let pc = auth::create_pairing_code(&h.state.db).await.unwrap();
+    assert_eq!(
+        call_from(
+            &h.app,
+            "203.0.113.9:5003",
+            None,
+            "/pair",
+            json!({"code": pc})
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
+async fn signup_is_public_but_the_other_routes_still_need_a_token() {
+    let h = harness().await;
+    let (s, _) = call(
+        &h.app,
+        "POST",
+        "/signup",
+        None,
+        Some(json!({"invite": "x", "name": "y"})),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::UNAUTHORIZED,
+        "reaches the handler, refused for the invite, not for a missing token"
+    );
+    let (s, _) = call(&h.app, "GET", "/sync", None, None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn concurrent_double_redeem_creates_exactly_one_user() {
+    // A file database with several connections, so the two redemptions really race.
+    let dir = tempfile::tempdir().unwrap();
+    let pool = db::connect(&format!(
+        "sqlite://{}",
+        dir.path().join("race.db").display()
+    ))
+    .await
+    .unwrap();
+    for round in 0..5 {
+        let (_, code) = invites::create(&pool, 1, DAY).await.unwrap();
+        let mut tasks = Vec::new();
+        for i in 0..8 {
+            let (pool, code) = (pool.clone(), code.clone());
+            tasks.push(tokio::spawn(async move {
+                invites::signup(&pool, &code, &format!("R{round}U{i}"), "phone", None, 1000)
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut ok = 0;
+        for t in tasks {
+            match t.await.unwrap() {
+                Ok(_) => ok += 1,
+                Err(e) => assert_eq!(e, invites::SignupError::BadInvite),
+            }
+        }
+        assert_eq!(ok, 1, "round {round}: exactly one redemption wins");
+    }
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(users, 1 + 5);
+    let devices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(devices, 5);
+    let settings: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_settings")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(settings, 6);
+}
+
+#[tokio::test]
+async fn signup_is_atomic_when_a_step_fails_after_the_claim() {
+    let h = harness().await;
+    let code = invite(&h).await;
+    // Make the device insert fail (token hash collision is impossible, so break the table instead).
+    sqlx::query("CREATE TRIGGER no_devices BEFORE INSERT ON devices BEGIN SELECT RAISE(ABORT, 'no devices today'); END").execute(&h.state.db).await.unwrap();
+    let (s, _) = signup(&h, &code, "Sam").await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+    sqlx::query("DROP TRIGGER no_devices")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(users, 1, "no half-created user");
+    assert_eq!(
+        signup(&h, &code, "Sam").await.0,
+        StatusCode::OK,
+        "the invite was not spent by the failed attempt"
+    );
+}
+
 async fn perth_user_with_device(h: &Harness, name: &str) -> (i64, String) {
     let (uid, token) = user_with_device(h, name).await;
     let (status, _) = call(
@@ -2801,72 +3398,1428 @@ async fn reviewer_file_scheduler_cross_user_todo_quiet_disabled() {
     assert_eq!(markers, 0);
 }
 
-/// Like `call`, but as a request from a given peer address, optionally with X-Forwarded-For.
-async fn call_from(
-    app: &Router,
-    peer: &str,
-    xff: Option<&str>,
-    uri: &str,
-    body: Value,
-) -> StatusCode {
-    let mut req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json");
-    if let Some(x) = xff {
-        req = req.header("x-forwarded-for", x);
+// ---- user administration and adding your own device ----
+
+use bread_tracker_server::users;
+
+async fn rows_of(h: &Harness, uid: i64) -> [i64; 6] {
+    let mut out = [0i64; 6];
+    for (i, t) in [
+        "devices",
+        "items",
+        "completions",
+        "reminders_sent",
+        "pairing_codes",
+        "user_settings",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        out[i] = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {t} WHERE user_id = ?"))
+            .bind(uid)
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
     }
-    let mut req = req.body(Body::from(body.to_string())).unwrap();
-    req.extensions_mut()
-        .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
-    app.clone().oneshot(req).await.unwrap().status()
+    out
 }
 
 #[tokio::test]
-async fn blocked_source_is_denied_before_even_correct_code_validation() {
+async fn pair_for_a_user_binds_the_device_to_that_user() {
     let h = harness().await;
-    for _ in 0..auth::MAX_FAILURES {
+    let (bob_id, _) = user_with_device(&h, "Bob").await;
+    let code = auth::create_pairing_code_for(&h.state.db, bob_id)
+        .await
+        .unwrap();
+    let (s, v) = call(
+        &h.app,
+        "POST",
+        "/pair",
+        None,
+        Some(json!({"code": code, "device_name": "Bob's tablet"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let owner: i64 = sqlx::query_scalar("SELECT user_id FROM devices WHERE id = ?")
+        .bind(v["device_id"].as_str().unwrap())
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(owner, bob_id);
+    assert_eq!(devices_of(&h, bob_id).await, 2);
+    assert_eq!(devices_of(&h, 1).await, 0, "nothing landed on the admin");
+}
+
+#[tokio::test]
+async fn pair_code_route_adds_a_device_to_the_callers_own_account() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (bob_id, bob) = user_with_device(&h, "Bob").await;
+
+    let (s, v) = call(&h.app, "POST", "/pair-code", Some(&bob), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let code = v["code"].as_str().unwrap().to_string();
+    assert_eq!(v["expires_in_secs"], 900);
+
+    // The new device joins Bob, sees Bob's data, and cannot see Alice's.
+    let now = store::now_ms();
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&bob),
+        Some(json!({"items": [item(H1, "habit", "Bob's habit", 127, None, now)]})),
+    )
+    .await;
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&alice),
+        Some(json!({"items": [item(C1, "chore", "Alice's chore", 127, None, now)]})),
+    )
+    .await;
+    let (s, p) = call(
+        &h.app,
+        "POST",
+        "/pair",
+        None,
+        Some(json!({"code": code, "device_name": "Bob tablet"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let tablet = p["token"].as_str().unwrap().to_string();
+    let (_, pulled) = call(&h.app, "GET", "/sync?since=0", Some(&tablet), None).await;
+    let names: Vec<&str> = pulled["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["Bob's habit"]);
+    assert_eq!(devices_of(&h, bob_id).await, 2);
+
+    // Single use, and it needs a token.
+    let (s, _) = call(&h.app, "POST", "/pair", None, Some(json!({"code": code}))).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _) = call(&h.app, "POST", "/pair-code", None, None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn pair_code_route_keeps_only_a_few_open_codes_per_user() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (_, bob) = user_with_device(&h, "Bob").await;
+    let mut codes = Vec::new();
+    for _ in 0..6 {
+        let (_, v) = call(&h.app, "POST", "/pair-code", Some(&bob), None).await;
+        codes.push(v["code"].as_str().unwrap().to_string());
+        // distinct timestamps so "oldest" is well defined
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+    let open_bob: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pairing_codes WHERE user_id != 1")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(open_bob, 3);
+    // A newest code still works; the oldest was replaced.
+    assert_eq!(
+        call(
+            &h.app,
+            "POST",
+            "/pair",
+            None,
+            Some(json!({"code": codes[5]}))
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(
+            &h.app,
+            "POST",
+            "/pair",
+            None,
+            Some(json!({"code": codes[0]}))
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    // Alice's codes are not touched by Bob's churn.
+    let (_, a) = call(&h.app, "POST", "/pair-code", Some(&alice), None).await;
+    assert!(a["code"].is_string());
+    let alice_open: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pairing_codes WHERE user_id = 1")
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(alice_open, 1);
+}
+
+#[tokio::test]
+async fn removing_a_user_deletes_all_of_their_data_and_nobody_elses() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (bob_id, bob) = user_with_device(&h, "Bob").await;
+    let now = store::now_ms();
+    for tok in [&alice, &bob] {
+        call(&h.app, "POST", "/sync", Some(tok), Some(json!({
+            "items": [item(C1, "chore", "Dishes", 127, Some("17:15"), now)], "completions": [comp(C1, "2026-10-19", now, None)]
+        }))).await;
+        call(
+            &h.app,
+            "PUT",
+            "/device",
+            Some(tok),
+            Some(json!({"fcm_token": format!("fcm-{}", &tok[..6])})),
+        )
+        .await;
+    }
+    call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&bob),
+        Some(json!({"timezone": "Europe/Berlin"})),
+    )
+    .await;
+    auth::create_pairing_code_for(&h.state.db, bob_id)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO reminders_sent (user_id, item_id, date, sent_at) VALUES (?, ?, '2026-10-19', 0)").bind(bob_id).bind(C1).execute(&h.state.db).await.unwrap();
+    let code = invite(&h).await;
+    let (_, v) = signup(&h, &code, "Cy").await;
+    let cy = v["token"].as_str().unwrap().to_string();
+
+    let alice_before = rows_of(&h, 1).await;
+    let cy_before = rows_of(&h, v["user_id"].as_i64().unwrap()).await;
+    assert!(
+        rows_of(&h, bob_id).await.iter().all(|n| *n >= 1),
+        "Bob owns something in every table: {:?}",
+        rows_of(&h, bob_id).await
+    );
+
+    let removed = users::remove(&h.state.db, bob_id).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            removed.name.as_str(),
+            removed.devices,
+            removed.items,
+            removed.completions
+        ),
+        ("Bob", 1, 1, 1)
+    );
+    assert_eq!(rows_of(&h, bob_id).await, [0; 6]);
+    assert_eq!(rows_of(&h, 1).await, alice_before);
+    assert_eq!(rows_of(&h, v["user_id"].as_i64().unwrap()).await, cy_before);
+
+    // Bob's token is dead immediately; the others still work.
+    assert_eq!(
+        call(&h.app, "GET", "/sync", Some(&bob), None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(&h.app, "GET", "/sync", Some(&alice), None).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&h.app, "GET", "/sync", Some(&cy), None).await.0,
+        StatusCode::OK
+    );
+    let (_, a) = call(&h.app, "GET", "/sync?since=0", Some(&alice), None).await;
+    assert_eq!(a["items"].as_array().unwrap().len(), 1);
+
+    assert!(users::find(&h.state.db, "Bob").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn the_invite_of_a_removed_user_keeps_its_record_and_the_name_can_be_reused() {
+    let h = harness().await;
+    let code = invite(&h).await;
+    let (_, v) = signup(&h, &code, "Dee").await;
+    let dee = v["user_id"].as_i64().unwrap();
+    assert_eq!(
+        invites::list(&h.state.db).await.unwrap()[0].status,
+        invites::InviteStatus::Used("Dee".into())
+    );
+    users::remove(&h.state.db, dee).await.unwrap().unwrap();
+    let invs = invites::list(&h.state.db).await.unwrap();
+    assert_eq!(invs.len(), 1, "the record stays");
+    assert_eq!(
+        invs[0].status,
+        invites::InviteStatus::Used("(removed user)".into())
+    );
+    assert_eq!(
+        signup(&h, &invite(&h).await, "Dee").await.0,
+        StatusCode::OK,
+        "the name is free again"
+    );
+}
+
+#[tokio::test]
+async fn admins_and_unknown_users_cannot_be_removed() {
+    let h = harness().await;
+    paired(&h).await;
+    assert_eq!(
+        users::remove(&h.state.db, 1).await.unwrap(),
+        Err(users::RemoveError::IsAdmin)
+    );
+    assert_eq!(
+        users::remove(&h.state.db, 999).await.unwrap(),
+        Err(users::RemoveError::NotFound)
+    );
+    assert_eq!(devices_of(&h, 1).await, 1);
+}
+
+#[tokio::test]
+async fn device_list_can_be_filtered_by_user_and_names_the_owner() {
+    let h = harness().await;
+    paired(&h).await;
+    let (bob_id, _) = user_with_device(&h, "Bob").await;
+    let all = devices::list(&h.state.db, None).await.unwrap();
+    assert_eq!(all.len(), 2);
+    let bob = devices::list(&h.state.db, Some(bob_id)).await.unwrap();
+    assert_eq!(bob.len(), 1);
+    assert_eq!(bob[0].user, "Bob");
+    assert!(devices::list(&h.state.db, Some(999))
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn first_run_check_ignores_other_users_devices() {
+    let h = harness().await;
+    user_with_device(&h, "Bob").await;
+    assert_eq!(
+        auth::admin_device_count(&h.state.db).await.unwrap(),
+        0,
+        "the owner still needs a pairing code"
+    );
+    paired(&h).await;
+    assert_eq!(auth::admin_device_count(&h.state.db).await.unwrap(), 1);
+}
+
+// ---- who am I ----
+
+#[tokio::test]
+async fn pair_and_me_say_which_account_the_device_belongs_to() {
+    let h = harness().await;
+    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    let (s, v) = call(&h.app, "POST", "/pair", None, Some(json!({"code": code}))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        (v["user_id"].as_i64(), v["name"].as_str()),
+        (Some(1), Some("admin"))
+    );
+    let admin = v["token"].as_str().unwrap().to_string();
+
+    let (bob_id, bob) = user_with_device(&h, "Bob").await;
+    let (s, me) = call(&h.app, "GET", "/me", Some(&bob), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        (
+            me["user_id"].as_i64(),
+            me["name"].as_str(),
+            me["is_admin"].as_bool()
+        ),
+        (Some(bob_id), Some("Bob"), Some(false))
+    );
+    let (_, me) = call(&h.app, "GET", "/me", Some(&admin), None).await;
+    assert_eq!(
+        (me["user_id"].as_i64(), me["is_admin"].as_bool()),
+        (Some(1), Some(true))
+    );
+    assert_eq!(
+        call(&h.app, "GET", "/me", None, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // A code made for Bob pairs as Bob.
+    let code = auth::create_pairing_code_for(&h.state.db, bob_id)
+        .await
+        .unwrap();
+    let (_, v) = call(&h.app, "POST", "/pair", None, Some(json!({"code": code}))).await;
+    assert_eq!(
+        (v["user_id"].as_i64(), v["name"].as_str()),
+        (Some(bob_id), Some("Bob"))
+    );
+}
+
+// ---- defaults for new installations and new users ----
+
+#[tokio::test]
+async fn fresh_installation_defaults_to_utc_for_the_admin() {
+    let db = db::connect_memory().await.unwrap();
+    let tz: String = sqlx::query_scalar("SELECT timezone FROM user_settings WHERE user_id = 1")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        tz, "UTC",
+        "a new installation does not inherit the original owner's timezone"
+    );
+}
+
+// ---- cross-user isolation suite ----
+//
+// Everything below is written as an attack: B holds a valid token and tries to reach A's data
+// through every route and with every verb, and A's rows are compared byte for byte afterwards.
+
+/// Everything stored for a user, as comparable text (items, completions, settings, devices' fcm).
+async fn snapshot(h: &Harness, uid: i64) -> String {
+    let items: Vec<String> = sqlx::query_scalar(
+        "SELECT id || '|' || kind || '|' || name || '|' || weekdays || '|' || COALESCE(remind_time,'') || '|' || points || '|' ||
+                COALESCE(due_date,'') || '|' || sort || '|' || active || '|' || updated_at || '|' || COALESCE(deleted_at,'') || '|' || seq FROM items WHERE user_id = ? ORDER BY id",
+    ).bind(uid).fetch_all(&h.state.db).await.unwrap();
+    let comps: Vec<String> = sqlx::query_scalar(
+        "SELECT item_id || '|' || date || '|' || completed_at || '|' || updated_at || '|' || COALESCE(deleted_at,'') || '|' || seq
+         FROM completions WHERE user_id = ? ORDER BY item_id, date",
+    ).bind(uid).fetch_all(&h.state.db).await.unwrap();
+    let settings: Vec<String> = sqlx::query_scalar(
+        "SELECT timezone || '|' || quiet_start || '|' || quiet_end || '|' || reminders_enabled FROM user_settings WHERE user_id = ?",
+    ).bind(uid).fetch_all(&h.state.db).await.unwrap();
+    let devices: Vec<String> = sqlx::query_scalar(
+        "SELECT id || '|' || COALESCE(fcm_token,'') FROM devices WHERE user_id = ? ORDER BY id",
+    )
+    .bind(uid)
+    .fetch_all(&h.state.db)
+    .await
+    .unwrap();
+    format!("{items:?}\n{comps:?}\n{settings:?}\n{devices:?}")
+}
+
+async fn two_users_with_data(h: &Harness) -> (String, String, i64) {
+    let alice = paired(h).await;
+    let (bob_id, bob) = user_with_device(h, "Bob").await;
+    let now = store::now_ms();
+    call(&h.app, "POST", "/sync", Some(&alice), Some(json!({
+        "items": [item(C1, "chore", "Alice chore", 127, Some("17:15"), now), item(H1, "habit", "Alice habit", 127, None, now)],
+        "completions": [comp(C1, "2026-10-19", now, None), comp(H1, "2026-10-19", now, None)]
+    }))).await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&alice),
+        Some(json!({"fcm_token": "fcm-alice"})),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&alice),
+        Some(json!({"timezone": "Asia/Tokyo", "quiet_start": "22:00", "quiet_end": "07:00"})),
+    )
+    .await;
+    (alice, bob, bob_id)
+}
+
+#[tokio::test]
+async fn b_cannot_delete_tombstone_or_edit_as_a_row_of_a_through_any_sync_call() {
+    let h = harness().await;
+    let (_alice, bob, _) = two_users_with_data(&h).await;
+    let before = snapshot(&h, 1).await;
+    let later = store::now_ms() + 10_000;
+
+    // Before Bob owns either id, a completion cannot resolve through Alice's
+    // rows. Check the entire mixed batch rolls back, not just Alice's snapshot.
+    let sequence_before: i64 = sqlx::query_scalar("SELECT val FROM meta WHERE key = 'seq'")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    let (status, _) = call(&h.app, "POST", "/sync", Some(&bob), Some(json!({
+        "items": [item("55555555-5555-4555-8555-555555555555", "chore", "must roll back", 127, None, later)],
+        "completions": [comp(C1, "2026-10-19", later, None)]
+    }))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let sequence_after: i64 = sqlx::query_scalar("SELECT val FROM meta WHERE key = 'seq'")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(sequence_after, sequence_before);
+    let (_, bob_before) = call(&h.app, "GET", "/sync?since=0", Some(&bob), None).await;
+    assert!(bob_before["items"].as_array().unwrap().is_empty());
+    assert!(bob_before["completions"].as_array().unwrap().is_empty());
+    assert_eq!(snapshot(&h, 1).await, before);
+
+    // Every kind of write B can express against A's ids: soft delete, edit, un-tick, a tick, deactivate.
+    let mut gone = item(C1, "chore", "deleted by B", 1, None, later);
+    gone["deleted_at"] = json!(later);
+    let mut off = item(H1, "habit", "off", 127, None, later + 1);
+    off["active"] = json!(false);
+    for body in [
+        json!({"items": [gone.clone()]}),
+        json!({"items": [off.clone()]}),
+        json!({"completions": [comp(C1, "2026-10-19", later, Some(later))]}),
+        json!({"completions": [comp(H1, "2026-10-20", later, None)]}),
+        json!({"since": 0, "items": [gone, off], "completions": [comp(C1, "2026-10-19", later + 5, Some(later + 5))]}),
+    ] {
+        let (s, _) = call(&h.app, "POST", "/sync", Some(&bob), Some(body)).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+    assert_eq!(snapshot(&h, 1).await, before, "nothing of A's changed");
+
+    // They went into B's own account instead.
+    let (_, v) = call(&h.app, "GET", "/sync?since=0", Some(&bob), None).await;
+    assert_eq!(v["items"].as_array().unwrap().len(), 2);
+    assert!(v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|i| i["name"] != "Alice chore" && i["name"] != "Alice habit"));
+}
+
+#[tokio::test]
+async fn foreign_only_completion_is_rejected_and_snapshot_covers_due_date_and_sort() {
+    let h = harness().await;
+    let (_, bob, _) = two_users_with_data(&h).await;
+    let before = snapshot(&h, 1).await;
+    let (status, _) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&bob),
+        Some(json!({"completions": [comp(C1, "2026-10-19", store::now_ms(), None)]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(snapshot(&h, 1).await, before);
+    sqlx::query("UPDATE items SET due_date = '2026-10-20' WHERE user_id = 1 AND id = ?")
+        .bind(C1)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let changed_date = snapshot(&h, 1).await;
+    assert_ne!(
+        changed_date, before,
+        "the oracle must detect due_date mutation"
+    );
+    sqlx::query("UPDATE items SET sort = sort + 1 WHERE user_id = 1 AND id = ?")
+        .bind(C1)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    assert_ne!(
+        snapshot(&h, 1).await,
+        changed_date,
+        "the oracle must detect sort mutation"
+    );
+}
+
+#[tokio::test]
+async fn actual_transport_error_for_one_owner_does_not_block_another() {
+    use async_trait::async_trait;
+    use bread_tracker_server::push::{Message, PushSender, SendOutcome};
+    struct FailingSender {
+        attempts: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl PushSender for FailingSender {
+        fn enabled(&self) -> bool {
+            true
+        }
+        async fn send(&self, message: &Message) -> anyhow::Result<SendOutcome> {
+            self.attempts.lock().unwrap().push(message.token.clone());
+            if message.token == "fcm-alice" {
+                anyhow::bail!("injected transport failure");
+            }
+            Ok(SendOutcome::Sent)
+        }
+    }
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (_, bob) = perth_user_with_device(&h, "Bob").await;
+    for (token, fcm) in [(&alice, "fcm-alice"), (&bob, "fcm-bob")] {
         assert_eq!(
-            call_from(
+            call(
                 &h.app,
-                "203.0.113.9:5000",
-                None,
-                "/pair",
-                json!({"code":"invalid"})
+                "POST",
+                "/sync",
+                Some(token),
+                Some(json!({"items": [
+                    item(C1, "chore", "Private", 127, Some("17:15"), store::now_ms())
+                ]}))
             )
-            .await,
-            StatusCode::UNAUTHORIZED
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(
+                &h.app,
+                "PUT",
+                "/device",
+                Some(token),
+                Some(json!({"fcm_token": fcm}))
+            )
+            .await
+            .0,
+            StatusCode::OK
         );
     }
-    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
-    assert_eq!(
-        call_from(
-            &h.app,
-            "203.0.113.9:5000",
-            None,
-            "/pair",
-            json!({"code":code})
-        )
-        .await,
-        StatusCode::TOO_MANY_REQUESTS
+    let sender = Arc::new(FailingSender {
+        attempts: Default::default(),
+    });
+    let state = AppState::new(
+        h.state.db.clone(),
+        (*h.state.config).clone(),
+        sender.clone(),
     );
-    assert_eq!(auth::device_count(&h.state.db).await.unwrap(), 0);
-    let other = auth::create_pairing_code(&h.state.db).await.unwrap();
+    assert_eq!(push::tick(&state, perth(17, 16)).await.unwrap(), 1);
+    let attempts = sender.attempts.lock().unwrap();
+    assert!(
+        attempts.contains(&"fcm-alice".to_owned()),
+        "failure branch must be reached"
+    );
+    assert!(
+        attempts.contains(&"fcm-bob".to_owned()),
+        "other owner must still be served"
+    );
+}
+
+#[tokio::test]
+async fn b_cannot_read_a_through_any_route_even_knowing_her_ids_and_dates() {
+    let h = harness().await;
+    let (alice, bob, _) = two_users_with_data(&h).await;
+    for uri in ["/sync?since=0", "/sync?since=-5", "/sync?since=999999999"] {
+        let (s, v) = call(&h.app, "GET", uri, Some(&bob), None).await;
+        assert_eq!(s, StatusCode::OK, "{uri}");
+        assert!(v["items"].as_array().unwrap().is_empty(), "{uri}: {v}");
+        assert!(
+            v["completions"].as_array().unwrap().is_empty(),
+            "{uri}: {v}"
+        );
+    }
+    let (_, v) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&bob),
+        Some(json!({"since": 0})),
+    )
+    .await;
+    assert!(v["items"].as_array().unwrap().is_empty());
+    let (_, st) = call(&h.app, "GET", "/stats?date=2026-10-19", Some(&bob), None).await;
+    assert_eq!(st["xp"], 0);
+    assert!(st["streaks"].as_object().unwrap().is_empty());
+    assert!(st["perfect_days"].as_array().unwrap().is_empty());
+    let (_, s) = call(&h.app, "GET", "/settings", Some(&bob), None).await;
     assert_eq!(
-        call_from(
-            &h.app,
-            "198.51.100.7:4000",
-            None,
-            "/pair",
-            json!({"code":other})
-        )
-        .await,
+        (s["timezone"].as_str(), s["quiet_start"].as_str()),
+        (Some("UTC"), Some(""))
+    );
+    let (_, me) = call(&h.app, "GET", "/me", Some(&bob), None).await;
+    assert_eq!(me["name"], "Bob");
+    // ...and A is unaffected by B's reads, and still sees her own data.
+    let (_, a) = call(&h.app, "GET", "/sync?since=0", Some(&alice), None).await;
+    assert_eq!(a["items"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn b_changing_settings_device_and_push_leaves_a_untouched() {
+    let h = harness().await;
+    let (_alice, bob, _) = two_users_with_data(&h).await;
+    let before = snapshot(&h, 1).await;
+    call(&h.app, "PUT", "/settings", Some(&bob), Some(json!({"timezone": "Europe/Paris", "reminders_enabled": false, "quiet_start": "01:00", "quiet_end": "02:00"}))).await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&bob),
+        Some(json!({"fcm_token": "fcm-bob"})),
+    )
+    .await;
+    call(&h.app, "POST", "/push/test", Some(&bob), None).await;
+    call(&h.app, "POST", "/pair-code", Some(&bob), None).await;
+    call(&h.app, "DELETE", "/device", Some(&bob), None).await;
+    assert_eq!(snapshot(&h, 1).await, before);
+}
+
+#[tokio::test]
+async fn every_token_resolves_to_exactly_one_user_across_devices_and_signups() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (bob_id, bob) = user_with_device(&h, "Bob").await;
+    // Second devices through the three ways of getting one.
+    let (_, p) = call(&h.app, "POST", "/pair-code", Some(&bob), None).await;
+    let (_, bob2) = call(
+        &h.app,
+        "POST",
+        "/pair",
+        None,
+        Some(json!({"code": p["code"]})),
+    )
+    .await;
+    let code = invite(&h).await;
+    let (_, cy) = signup(&h, &code, "Cy").await;
+    let cy_id = cy["user_id"].as_i64().unwrap();
+    let alice2_code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    let (_, alice2) = call(
+        &h.app,
+        "POST",
+        "/pair",
+        None,
+        Some(json!({"code": alice2_code})),
+    )
+    .await;
+
+    for (tok, uid) in [
+        (alice.clone(), 1),
+        (alice2["token"].as_str().unwrap().to_string(), 1),
+        (bob.clone(), bob_id),
+        (bob2["token"].as_str().unwrap().to_string(), bob_id),
+        (cy["token"].as_str().unwrap().to_string(), cy_id),
+    ] {
+        let (s, me) = call(&h.app, "GET", "/me", Some(&tok), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(me["user_id"].as_i64(), Some(uid));
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(DISTINCT user_id) FROM devices WHERE token_hash = ?")
+                .bind(auth::hash(&tok))
+                .fetch_one(&h.state.db)
+                .await
+                .unwrap();
+        assert_eq!(n, 1);
+    }
+    // Tokens are unique across the whole table.
+    let (total, distinct): (i64, i64) =
+        sqlx::query_as("SELECT COUNT(*), COUNT(DISTINCT token_hash) FROM devices")
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(total, distinct);
+}
+
+const ALL_AUTHED: [(&str, &str); 9] = [
+    ("GET", "/sync"),
+    ("POST", "/sync"),
+    ("GET", "/stats"),
+    ("GET", "/settings"),
+    ("PUT", "/settings"),
+    ("PUT", "/device"),
+    ("DELETE", "/device"),
+    ("POST", "/push/test"),
+    ("GET", "/me"),
+];
+
+#[tokio::test]
+async fn a_revoked_device_is_refused_on_every_route() {
+    use bread_tracker_server::devices;
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (_, bob) = user_with_device(&h, "Bob").await;
+    let id: String = sqlx::query_scalar("SELECT id FROM devices WHERE token_hash = ?")
+        .bind(auth::hash(&bob))
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    devices::revoke(&h.state.db, &id).await.unwrap();
+    for (m, p) in ALL_AUTHED.iter().chain([("POST", "/pair-code")].iter()) {
+        let body = if *m == "GET" || *m == "DELETE" {
+            None
+        } else {
+            Some(json!({}))
+        };
+        let (s, _) = call(&h.app, m, p, Some(&bob), body).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{m} {p}");
+    }
+    assert_eq!(
+        call(&h.app, "GET", "/me", Some(&alice), None).await.0,
         StatusCode::OK
     );
 }
 
 #[tokio::test]
-async fn successful_pairings_do_not_consume_failure_budget() {
+async fn a_removed_user_is_refused_on_every_route_and_the_others_still_work() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (bob_id, bob) = user_with_device(&h, "Bob").await;
+    let (_, p) = call(&h.app, "POST", "/pair-code", Some(&bob), None).await;
+    let bob_code = p["code"].as_str().unwrap().to_string();
+    bread_tracker_server::users::remove(&h.state.db, bob_id)
+        .await
+        .unwrap()
+        .unwrap();
+    for (m, p) in ALL_AUTHED.iter().chain([("POST", "/pair-code")].iter()) {
+        let body = if *m == "GET" || *m == "DELETE" {
+            None
+        } else {
+            Some(json!({}))
+        };
+        assert_eq!(
+            call(&h.app, m, p, Some(&bob), body).await.0,
+            StatusCode::UNAUTHORIZED,
+            "{m} {p}"
+        );
+    }
+    // A pairing code the removed user had made no longer works either.
+    assert_eq!(
+        call(
+            &h.app,
+            "POST",
+            "/pair",
+            None,
+            Some(json!({"code": bob_code}))
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(&h.app, "GET", "/me", Some(&alice), None).await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn a_failing_send_for_one_user_does_not_stop_the_next_users_reminder() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (_, bob) = perth_user_with_device(&h, "Bob").await;
+    let now = store::now_ms();
+    for tok in [&alice, &bob] {
+        call(
+            &h.app,
+            "POST",
+            "/sync",
+            Some(tok),
+            Some(json!({"items": [item(C1, "chore", "Dishes", 127, Some("17:15"), now)]})),
+        )
+        .await;
+    }
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&alice),
+        Some(json!({"fcm_token": "fcm-alice"})),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&bob),
+        Some(json!({"fcm_token": "fcm-bob"})),
+    )
+    .await;
+    // Alice's token has been revoked at FCM: her send reports Unregistered, her token is cleared, and Bob is still served.
+    h.mock
+        .dead_tokens
+        .lock()
+        .unwrap()
+        .insert("fcm-alice".into());
+    assert_eq!(push::tick(&h.state, perth(17, 16)).await.unwrap(), 1);
+    let sent: Vec<String> = h
+        .mock
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| m.token.clone())
+        .collect();
+    assert_eq!(sent, vec!["fcm-bob".to_string()]);
+    let alice_token: Option<String> =
+        sqlx::query_scalar("SELECT fcm_token FROM devices WHERE user_id = 1")
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(alice_token, None, "only Alice's own dead token was cleared");
+    let bob_token: Option<String> =
+        sqlx::query_scalar("SELECT fcm_token FROM devices WHERE user_id != 1")
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(bob_token.as_deref(), Some("fcm-bob"));
+}
+
+#[tokio::test]
+async fn two_users_syncing_with_the_same_cursor_each_get_only_their_own_new_rows() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (_, bob) = user_with_device(&h, "Bob").await;
+    let now = store::now_ms();
+    // Both start from the same cursor value.
+    let (_, a0) = call(&h.app, "GET", "/sync?since=0", Some(&alice), None).await;
+    let (_, b0) = call(&h.app, "GET", "/sync?since=0", Some(&bob), None).await;
+    assert_eq!(a0["cursor"], b0["cursor"]);
+    let c = a0["cursor"].as_i64().unwrap();
+    // They write interleaved.
+    for i in 0..4 {
+        let id = format!("5555555{i}-5555-4555-8555-555555555555");
+        let who = if i % 2 == 0 { &alice } else { &bob };
+        call(
+            &h.app,
+            "POST",
+            "/sync",
+            Some(who),
+            Some(json!({"items": [item(&id, "chore", &format!("n{i}"), 127, None, now)]})),
+        )
+        .await;
+    }
+    for (tok, want) in [(&alice, vec!["n0", "n2"]), (&bob, vec!["n1", "n3"])] {
+        let (_, v) = call(&h.app, "GET", &format!("/sync?since={c}"), Some(tok), None).await;
+        let mut got: Vec<&str> = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["name"].as_str().unwrap())
+            .collect();
+        got.sort();
+        assert_eq!(got, want);
+    }
+}
+
+#[tokio::test]
+async fn the_request_cannot_choose_the_user() {
+    let h = harness().await;
+    let (alice, bob, _) = two_users_with_data(&h).await;
+    let before = snapshot(&h, 1).await;
+    // Extra fields that look like ownership are ignored: no user_id or owner is ever read from input.
+    let now = store::now_ms() + 5000;
+    let mut it = item(C1, "chore", "forged", 127, None, now);
+    it["user_id"] = json!(1);
+    it["owner"] = json!("admin");
+    let (s, _) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&bob),
+        Some(json!({"user_id": 1, "items": [it]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, a) = call(
+        &h.app,
+        "GET",
+        "/sync?since=0&user_id=2&user=Bob",
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(
+        a["items"].as_array().unwrap().len(),
+        2,
+        "query string cannot redirect the read either"
+    );
+    assert_eq!(snapshot(&h, 1).await, before);
+    // The forged row, ownership fields and all, landed in Bob's own account under his own key.
+    let owners: Vec<(i64, String)> =
+        sqlx::query_as("SELECT user_id, name FROM items WHERE id = ? ORDER BY user_id")
+            .bind(C1)
+            .fetch_all(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(owners.len(), 2, "A's row and B's row, side by side");
+    assert_eq!(owners[0], (1, "Alice chore".to_string()));
+    assert_eq!(owners[1].1, "forged");
+    assert_ne!(owners[1].0, 1);
+}
+
+// ---- limits and abuse protection ----
+
+use bread_tracker_server::config::Limits;
+
+async fn limited(limits: Limits) -> Harness {
+    let db = db::connect_memory().await.unwrap();
+    sqlx::query("UPDATE user_settings SET timezone = 'Australia/Perth' WHERE user_id = 1")
+        .execute(&db)
+        .await
+        .unwrap();
+    let mock = Arc::new(MockSender::default());
+    let mut config = Config::from_env();
+    config.limits = limits;
+    let state = AppState::new(db, config, mock.clone());
+    Harness {
+        app: api::router(state.clone()),
+        state,
+        mock,
+    }
+}
+
+fn uuid_n(n: usize) -> String {
+    format!("{:08x}-aaaa-4aaa-8aaa-aaaaaaaaaaaa", n)
+}
+
+async fn count(h: &Harness, sql: &str) -> i64 {
+    sqlx::query_scalar(sql)
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn item_ceiling_is_per_user_counts_tombstones_and_rolls_the_batch_back() {
+    let h = limited(Limits {
+        max_items: 5,
+        ..Limits::default()
+    })
+    .await;
+    let alice = paired(&h).await;
+    let (_, bob) = user_with_device(&h, "Bob").await;
+    let now = store::now_ms();
+    let batch = |from: usize, n: usize| json!({"items": (from..from + n).map(|i| item(&uuid_n(i), "chore", "c", 127, None, now)).collect::<Vec<_>>()});
+
+    assert_eq!(
+        call(&h.app, "POST", "/sync", Some(&alice), Some(batch(0, 5)))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    // One more is refused with a clear message, and a batch that crosses the line stores nothing.
+    let (s, v) = call(&h.app, "POST", "/sync", Some(&alice), Some(batch(5, 1))).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(v["error"].as_str().unwrap().contains("item limit"), "{v}");
+    let (s, _) = call(&h.app, "POST", "/sync", Some(&bob), Some(batch(100, 3))).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = call(&h.app, "POST", "/sync", Some(&bob), Some(batch(200, 3))).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        count(&h, "SELECT COUNT(*) FROM items WHERE user_id != 1").await,
+        3,
+        "Bob's crossing batch stored none of its rows"
+    );
+
+    // The ceiling is per user: Alice being full did not affect Bob (above), and Bob can still fill his own.
+    assert_eq!(
+        call(&h.app, "POST", "/sync", Some(&bob), Some(batch(300, 2)))
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    // Updating and deleting existing rows is always allowed at the ceiling.
+    let mut edit = item(&uuid_n(0), "chore", "renamed", 127, None, now + 1000);
+    edit["deleted_at"] = json!(now + 1000);
+    assert_eq!(
+        call(
+            &h.app,
+            "POST",
+            "/sync",
+            Some(&alice),
+            Some(json!({"items": [edit]}))
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    // A tombstone still counts, so deleting does not make room until it is pruned.
+    assert_eq!(
+        call(&h.app, "POST", "/sync", Some(&alice), Some(batch(5, 1)))
+            .await
+            .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    // Re-sending rows already stored is not "new" and is fine.
+    assert_eq!(
+        call(&h.app, "POST", "/sync", Some(&alice), Some(batch(1, 4)))
+            .await
+            .0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn completion_ceiling_is_per_user_and_replacing_a_tick_is_allowed() {
+    let h = limited(Limits {
+        max_completions: 3,
+        ..Limits::default()
+    })
+    .await;
+    let alice = paired(&h).await;
+    let now = store::now_ms();
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&alice),
+        Some(json!({"items": [item(C1, "habit", "h", 127, None, now)]})),
+    )
+    .await;
+    let days = |range: std::ops::Range<u32>| json!({"completions": range.map(|d| comp(C1, &format!("2026-10-{:02}", d + 1), now, None)).collect::<Vec<_>>()});
+    assert_eq!(
+        call(&h.app, "POST", "/sync", Some(&alice), Some(days(0..3)))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (s, v) = call(&h.app, "POST", "/sync", Some(&alice), Some(days(3..4))).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        v["error"].as_str().unwrap().contains("history limit"),
+        "{v}"
+    );
+    // Un-ticking an existing day (an update) still works at the ceiling.
+    let (s, _) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&alice),
+        Some(json!({"completions": [comp(C1, "2026-10-01", now + 500, Some(now + 500))]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, bob) = user_with_device(&h, "Bob").await;
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&bob),
+        Some(json!({"items": [item(C1, "habit", "h", 127, None, now)]})),
+    )
+    .await;
+    assert_eq!(
+        call(&h.app, "POST", "/sync", Some(&bob), Some(days(0..3)))
+            .await
+            .0,
+        StatusCode::OK,
+        "Bob has his own allowance"
+    );
+}
+
+#[tokio::test]
+async fn completions_for_items_the_user_does_not_own_are_rejected_atomically() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (bob_id, bob) = user_with_device(&h, "Bob").await;
+    let now = store::now_ms();
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&alice),
+        Some(json!({"items": [item(C1, "chore", "A's", 127, None, now)]})),
+    )
+    .await;
+    // Bob ticks Alice's item id, which he does not have, and an id that exists nowhere.
+    let (s, _) = call(&h.app, "POST", "/sync", Some(&bob), Some(json!({"completions": [comp(C1, "2026-10-19", now, None), comp(H1, "2026-10-19", now, None)]}))).await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "unknown owner references reject the entire request"
+    );
+    assert_eq!(
+        count(
+            &h,
+            &format!("SELECT COUNT(*) FROM completions WHERE user_id = {bob_id}")
+        )
+        .await,
+        0
+    );
+    // Within one batch an item may precede its completion; that is normal and stored.
+    let (_, v) = call(&h.app, "POST", "/sync", Some(&bob), Some(json!({"items": [item(C1, "chore", "B's", 127, None, now)], "completions": [comp(C1, "2026-10-19", now, None)]}))).await;
+    assert_eq!(v["completions"].as_array().unwrap().len(), 1);
+    // A deleted item (tombstone) still accepts its un-tick, so offline edits sync.
+    let mut gone = item(C1, "chore", "B's", 127, None, now + 10);
+    gone["deleted_at"] = json!(now + 10);
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&bob),
+        Some(json!({"items": [gone]})),
+    )
+    .await;
+    let (s, _) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&bob),
+        Some(json!({"completions": [comp(C1, "2026-10-19", now + 20, Some(now + 20))]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM completions WHERE user_id = {bob_id} AND deleted_at IS NOT NULL")).await, 1);
+}
+
+#[tokio::test]
+async fn the_device_limit_stops_pairing_and_pair_codes_without_spending_the_code() {
+    let h = limited(Limits {
+        max_devices: 2,
+        ..Limits::default()
+    })
+    .await;
+    let (bob_id, bob) = user_with_device(&h, "Bob").await; // device 1
+    let (s, p) = call(&h.app, "POST", "/pair-code", Some(&bob), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = call(
+        &h.app,
+        "POST",
+        "/pair",
+        None,
+        Some(json!({"code": p["code"]})),
+    )
+    .await; // device 2
+    assert_eq!(s, StatusCode::OK);
+
+    // At the limit: no new pair code, and a code that already existed is refused but not consumed.
+    let spare = auth::create_pairing_code_for(&h.state.db, bob_id)
+        .await
+        .unwrap();
+    let (s, v) = call(&h.app, "POST", "/pair-code", Some(&bob), None).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("maximum of 2 devices"),
+        "{v}"
+    );
+    let (s, _) = call(&h.app, "POST", "/pair", None, Some(json!({"code": spare}))).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        count(&h, "SELECT COUNT(*) FROM pairing_codes").await,
+        1,
+        "the code survived"
+    );
+    // Signing a device out frees a slot and the same code now works.
+    call(&h.app, "DELETE", "/device", Some(&bob), None).await;
+    let (s, _) = call(&h.app, "POST", "/pair", None, Some(json!({"code": spare}))).await;
+    assert_eq!(s, StatusCode::OK);
+    // The limit is per user: another user is unaffected.
+    let (_, cy) = user_with_device(&h, "Cy").await;
+    assert_eq!(
+        call(&h.app, "POST", "/pair-code", Some(&cy), None).await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn the_user_cap_refuses_signup_without_spending_the_invite() {
+    let h = limited(Limits {
+        max_users: 2,
+        ..Limits::default()
+    })
+    .await; // admin + one more
+    let first = invite(&h).await;
+    assert_eq!(signup(&h, &first, "One").await.0, StatusCode::OK);
+    let second = invite(&h).await;
+    let (s, v) = signup(&h, &second, "Two").await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("not accepting new accounts"),
+        "{v}"
+    );
+    assert_eq!(count(&h, "SELECT COUNT(*) FROM users").await, 2);
+    let active = invites::list(&h.state.db)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|i| i.status == invites::InviteStatus::Active)
+        .count();
+    assert_eq!(active, 1, "the refused invite is still valid for later");
+    // A refusal is not a bad-invite failure, so it does not count toward the rate limit.
+    for _ in 0..12 {
+        assert_eq!(
+            signup(&h, &second, "Two").await.0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+    // Removing a user makes room and the same invite works.
+    bread_tracker_server::users::remove(&h.state.db, 2)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(signup(&h, &second, "Two").await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn request_rate_is_limited_per_token_and_does_not_affect_others() {
+    let h = limited(Limits {
+        requests_per_minute: 5,
+        ..Limits::default()
+    })
+    .await;
+    let alice = paired(&h).await;
+    let (_, bob) = user_with_device(&h, "Bob").await;
+    for i in 0..5 {
+        assert_eq!(
+            call(&h.app, "GET", "/me", Some(&alice), None).await.0,
+            StatusCode::OK,
+            "request {i}"
+        );
+    }
+    assert_eq!(
+        call(&h.app, "GET", "/me", Some(&alice), None).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        call(&h.app, "GET", "/sync", Some(&alice), None).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "all authenticated routes share it"
+    );
+    assert_eq!(
+        call(&h.app, "GET", "/me", Some(&bob), None).await.0,
+        StatusCode::OK,
+        "another token is unaffected"
+    );
+    // Public routes are not counted against a token.
+    assert_eq!(
+        call(&h.app, "GET", "/healthz", None, None).await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn a_disabled_user_is_refused_everywhere_keeps_their_data_and_gets_no_reminders() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (bob_id, bob) = perth_user_with_device(&h, "Bob").await;
+    let now = store::now_ms();
+    for tok in [&alice, &bob] {
+        call(
+            &h.app,
+            "POST",
+            "/sync",
+            Some(tok),
+            Some(json!({"items": [item(C1, "chore", "Dishes", 127, Some("17:15"), now)]})),
+        )
+        .await;
+    }
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&alice),
+        Some(json!({"fcm_token": "fcm-alice"})),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&bob),
+        Some(json!({"fcm_token": "fcm-bob"})),
+    )
+    .await;
+    let before = snapshot(&h, bob_id).await;
+
+    let disabled_code = auth::create_pairing_code_for(&h.state.db, bob_id)
+        .await
+        .unwrap();
+
+    assert!(
+        bread_tracker_server::users::set_disabled(&h.state.db, bob_id, true)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        call(
+            &h.app,
+            "POST",
+            "/pair",
+            None,
+            Some(json!({"code": disabled_code}))
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let still_usable: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pairing_codes WHERE code_hash = ?")
+            .bind(auth::hash(&auth::normalize_code(&disabled_code)))
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        still_usable, 1,
+        "disabled pairing refusal must not consume the code"
+    );
+    for (m, p) in ALL_AUTHED.iter().chain([("POST", "/pair-code")].iter()) {
+        let body = if *m == "GET" || *m == "DELETE" {
+            None
+        } else {
+            Some(json!({}))
+        };
+        assert_eq!(
+            call(&h.app, m, p, Some(&bob), body).await.0,
+            StatusCode::FORBIDDEN,
+            "{m} {p}"
+        );
+    }
+    assert_eq!(
+        snapshot(&h, bob_id).await,
+        before,
+        "nothing was deleted or changed"
+    );
+    assert_eq!(
+        call(&h.app, "GET", "/me", Some(&alice), None).await.0,
+        StatusCode::OK
+    );
+
+    // Only Alice is reminded while Bob is disabled.
+    assert_eq!(push::tick(&h.state, perth(17, 16)).await.unwrap(), 1);
+    let sent: Vec<String> = h
+        .mock
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| m.token.clone())
+        .collect();
+    assert_eq!(sent, vec!["fcm-alice".to_string()]);
+
+    // Enabling restores everything, including the reminder that was waiting.
+    assert!(
+        bread_tracker_server::users::set_disabled(&h.state.db, bob_id, false)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        call(&h.app, "GET", "/me", Some(&bob), None).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(push::tick(&h.state, perth(17, 17)).await.unwrap(), 1);
+
+    // Admins cannot be disabled; unknown ids are not found.
+    assert!(
+        !bread_tracker_server::users::set_disabled(&h.state.db, 1, true)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !bread_tracker_server::users::set_disabled(&h.state.db, 999, true)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        call(&h.app, "GET", "/me", Some(&alice), None).await.0,
+        StatusCode::OK
+    );
+}
+
+#[test]
+fn limits_come_from_the_environment_with_sane_fallbacks() {
+    let env: std::collections::HashMap<&str, &str> = [
+        ("BREADTRACKER_MAX_USERS", "3"),
+        ("BREADTRACKER_MAX_ITEMS_PER_USER", "0"),
+        ("BREADTRACKER_MAX_DEVICES_PER_USER", "abc"),
+        ("BREADTRACKER_REQUESTS_PER_MINUTE", "7"),
+    ]
+    .into_iter()
+    .collect();
+    let l = Config::from_lookup(|k| env.get(k).map(|v| v.to_string())).limits;
+    let d = Limits::default();
+    assert_eq!((l.max_users, l.requests_per_minute), (3, 7));
+    assert_eq!(l.max_items, d.max_items, "zero is not a valid limit");
+    assert_eq!(l.max_devices, d.max_devices, "garbage falls back");
+    assert_eq!(l.max_completions, d.max_completions);
+}
+
+// TRACK-5 regressions: `/pair` uses the shared `public_auth` admission from TRACK-20. These
+// pin the bounded, fail-closed capacity behaviour that the removed in-process limiter tried to
+// provide, beyond the per-source and forwarding tests that already cover the incumbent path.
+
+#[tokio::test]
+async fn successful_pairings_do_not_consume_the_shared_failure_budget() {
     let h = harness().await;
     for _ in 0..8 {
         let code = auth::create_pairing_code(&h.state.db).await.unwrap();
@@ -2876,27 +4829,27 @@ async fn successful_pairings_do_not_consume_failure_budget() {
                 "203.0.113.8:5000",
                 None,
                 "/pair",
-                json!({"code":code})
+                json!({"code": code})
             )
             .await,
             StatusCode::OK
         );
     }
     let failures: i64 =
-        sqlx::query_scalar("SELECT COALESCE(SUM(failures), 0) FROM pair_rate_limits")
+        sqlx::query_scalar("SELECT COALESCE(SUM(failures), 0) FROM public_auth_limits")
             .fetch_one(&h.state.db)
             .await
             .unwrap();
-    assert_eq!(failures, 0);
+    assert_eq!(failures, 0, "a success must not leave a partial charge");
 }
 
 #[tokio::test]
-async fn saturated_live_table_rejects_one_hundred_attempts_before_code_validation() {
+async fn saturated_source_table_rejects_pair_attempts_without_evicting_live_budgets() {
     let h = harness().await;
-    for n in 0..auth::MAX_SOURCES as u32 {
+    for n in 0..bread_tracker_server::public_auth::MAX_SOURCES as u32 {
         let source = format!("198.51.{}.{}:4000", (n / 256) % 256, n % 256);
         assert_eq!(
-            call_from(&h.app, &source, None, "/pair", json!({"code":"invalid"})).await,
+            call_from(&h.app, &source, None, "/pair", json!({"code": "invalid"})).await,
             StatusCode::UNAUTHORIZED
         );
     }
@@ -2908,30 +4861,43 @@ async fn saturated_live_table_rejects_one_hundred_attempts_before_code_validatio
                 "192.0.2.222:4000",
                 None,
                 "/pair",
-                json!({"code":code})
+                json!({"code": code})
             )
             .await,
             StatusCode::TOO_MANY_REQUESTS
         );
     }
-    assert_eq!(auth::device_count(&h.state.db).await.unwrap(), 0);
-    assert_eq!(
-        auth::pair_failure_count(&h.state.db).await.unwrap(),
-        auth::MAX_SOURCES
-    );
+    assert_eq!(device_rows(&h).await, 0);
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM public_auth_limits")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(rows, bread_tracker_server::public_auth::MAX_SOURCES);
 }
 
 #[tokio::test]
-async fn expired_capacity_is_reclaimed_without_evicting_live_budgets() {
+async fn expired_capacity_is_reclaimed_without_evicting_live_pair_budgets() {
     let h = harness().await;
-    for n in 0..auth::MAX_SOURCES as u32 {
+    for n in 0..bread_tracker_server::public_auth::MAX_SOURCES as u32 {
         let source = format!("198.51.{}.{}:4000", (n / 256) % 256, n % 256);
         assert_eq!(
-            call_from(&h.app, &source, None, "/pair", json!({"code":"invalid"})).await,
+            call_from(&h.app, &source, None, "/pair", json!({"code": "invalid"})).await,
             StatusCode::UNAUTHORIZED
         );
     }
-    sqlx::query("UPDATE pair_rate_limits SET window_started_at=0, updated_at=0")
+    let blocked = auth::create_pairing_code(&h.state.db).await.unwrap();
+    assert_eq!(
+        call_from(
+            &h.app,
+            "192.0.2.201:4000",
+            None,
+            "/pair",
+            json!({"code": blocked})
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    sqlx::query("UPDATE public_auth_limits SET window_started_at = 0")
         .execute(&h.state.db)
         .await
         .unwrap();
@@ -2939,18 +4905,19 @@ async fn expired_capacity_is_reclaimed_without_evicting_live_budgets() {
     assert_eq!(
         call_from(
             &h.app,
-            "192.0.2.201:4000",
+            "192.0.2.202:4000",
             None,
             "/pair",
-            json!({"code":code})
+            json!({"code": code})
         )
         .await,
-        StatusCode::OK
+        StatusCode::OK,
+        "an expired window frees capacity for a new source"
     );
 }
 
 #[tokio::test]
-async fn concurrent_guesses_have_atomic_five_attempt_limit() {
+async fn concurrent_pair_guesses_get_exactly_five_attempts() {
     let h = harness().await;
     let mut tasks = Vec::new();
     for _ in 0..20 {
@@ -2961,7 +4928,7 @@ async fn concurrent_guesses_have_atomic_five_attempt_limit() {
                 "192.0.2.240:4000",
                 None,
                 "/pair",
-                json!({"code":"invalid"}),
+                json!({"code": "invalid"}),
             )
             .await
         }));
@@ -2979,103 +4946,9 @@ async fn concurrent_guesses_have_atomic_five_attempt_limit() {
     assert_eq!(throttled, 15);
 }
 
-#[tokio::test]
-async fn forwarded_for_is_only_believed_from_a_trusted_proxy() {
-    use bread_tracker_server::auth::TrustedProxy;
-    let bad = json!({"code": "AAAA-BBBB"});
-
-    // Untrusted peer: it cannot dodge the limit by rotating X-Forwarded-For.
-    let h = harness().await;
-    for i in 0..5 {
-        let xff = format!("10.9.9.{i}");
-        call_from(&h.app, "203.0.113.9:5000", Some(&xff), "/pair", bad.clone()).await;
-    }
-    assert_eq!(
-        call_from(
-            &h.app,
-            "203.0.113.9:5000",
-            Some("10.9.9.99"),
-            "/pair",
-            bad.clone()
-        )
-        .await,
-        StatusCode::TOO_MANY_REQUESTS
-    );
-
-    // Trusted proxy (100.64.0.0/10): the client in X-Forwarded-For is the key.
-    let db = db::connect_memory().await.unwrap();
-    let mut config = Config::from_env();
-    config.trusted_proxies = vec![TrustedProxy::parse("100.64.0.0/10").unwrap()];
-    let state = AppState::new(db, config, Arc::new(MockSender::default()));
-    let app = api::router(state.clone());
-    for _ in 0..5 {
-        call_from(
-            &app,
-            "100.100.1.1:4000",
-            Some("203.0.113.50"),
-            "/pair",
-            bad.clone(),
-        )
-        .await;
-    }
-    assert_eq!(
-        call_from(
-            &app,
-            "100.100.1.1:4000",
-            Some("203.0.113.50"),
-            "/pair",
-            bad.clone()
-        )
-        .await,
-        StatusCode::TOO_MANY_REQUESTS
-    );
-    let code = auth::create_pairing_code(&state.db).await.unwrap();
-    let other = call_from(
-        &app,
-        "100.100.1.1:4000",
-        Some("203.0.113.51"),
-        "/pair",
-        json!({"code": code}),
-    )
-    .await;
-    assert_eq!(
-        other,
-        StatusCode::OK,
-        "the real user behind the same proxy is unaffected"
-    );
-}
-
-#[test]
-fn client_ip_resolution() {
-    use bread_tracker_server::auth::{client_ip, TrustedProxy};
-    let trusted = [
-        TrustedProxy::parse("10.0.0.0/8").unwrap(),
-        TrustedProxy::parse("::1").unwrap(),
-    ];
-    let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
-    assert_eq!(
-        client_ip(ip("1.2.3.4"), Some("9.9.9.9"), &trusted),
-        ip("1.2.3.4"),
-        "untrusted peer"
-    );
-    assert_eq!(
-        client_ip(ip("10.0.0.2"), None, &trusted),
-        ip("10.0.0.2"),
-        "no header"
-    );
-    assert_eq!(
-        client_ip(ip("10.0.0.2"), Some("5.5.5.5"), &trusted),
-        ip("5.5.5.5")
-    );
-    assert_eq!(
-        client_ip(ip("10.0.0.2"), Some("6.6.6.6, 5.5.5.5, 10.0.0.9"), &trusted),
-        ip("5.5.5.5"),
-        "spoofed left entry ignored"
-    );
-    assert_eq!(
-        client_ip(ip("10.0.0.2"), Some("garbage"), &trusted),
-        ip("10.0.0.2")
-    );
-    assert!(TrustedProxy::parse("10.0.0.0/33").is_none());
-    assert!(TrustedProxy::parse("nope").is_none());
+async fn device_rows(h: &Harness) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM devices")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap()
 }

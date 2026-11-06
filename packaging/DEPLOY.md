@@ -159,7 +159,7 @@ step 2 and step 4 and phones retry on their own.
    is called `admin` and can still be named by a later start. A name another user already
    holds stops startup with a message.
 
-   This release ships migrations `1`, `2`, `3`, `5`, `6` and `7` only. A database that has already
+   This release ships migrations `1`, `2`, `3`, `5`, `6`, `7`, `8`, `9`, `10` and `11`. A database that has already
    recorded `4` (the durable pairing limiter, PR31) is refused at start with a missing
    migration error and is not served. Supporting `4` needs a separately accepted PR31 that is
    integrated with this change so its migration and runtime ship together; this release does
@@ -173,7 +173,7 @@ step 2 and step 4 and phones retry on their own.
    WORK=$(mktemp -d)
    docker run --rm --user "$(id -u):$(id -g)" -v "$BACKUP_DIR":/b:ro -v "$WORK":/o \
      litestream/litestream:0.3.13 restore -o /o/replica.db file:///b/litestream
-   python3 scripts/db-evidence.py check "$WORK/replica.db" --ledger-exact 1,2,3,5,6,7
+   python3 scripts/db-evidence.py check "$WORK/replica.db" --ledger-exact 1,2,3,5,6,7,8,9,10,11
    ```
 
    Expect `CHECK PASSED` and the same counts for `items`, `completions`, `devices`,
@@ -215,3 +215,23 @@ mechanism for phones, which this release does not ship. A full Compose restart o
 image with Litestream resuming a generation, and phone recovery after a restore, are operator
 deployment checks that have not been run for this change; they need no other pull request to
 be merged first.
+
+## Invite signup admission
+
+This candidate adds migration 0008 for invites and 0009 for shared pairing/signup failure budgets. Set `BREADTRACKER_TRUSTED_PROXIES` only to the verified transport peer IPs or CIDRs of your sanitizing proxy. By default forwarded headers are ignored. Check the actual application peer and effective header chain before deployment; do not trust a client-supplied forwarded address. Pairing and signup share five failures per source per ten minutes and a 1,024-source admission cap. Successful attempts do not spend failures. Old experimental invite004 ledgers are unsupported; preserve their evidence and use a new path only for positively identified disposable experiments. Never rewrite an applied production migration ledger.
+
+## Users and devices
+
+```sh
+docker exec bread-tracker bread-tracker-server user list
+docker exec bread-tracker bread-tracker-server devices [--user NAME]
+docker exec bread-tracker bread-tracker-server pair [--user NAME]    # a code for that user's new device
+docker exec bread-tracker bread-tracker-server revoke <device id>
+docker exec bread-tracker bread-tracker-server user remove NAME --yes # deletes the user and all their data
+```
+
+Without `--user`, `pair` makes a code for the admin. Users add their own second device from the app (Settings), which calls `POST /pair-code`; you do not need to be involved. `user remove` cannot be undone, so take a backup first if in doubt; it refuses to remove an admin.
+
+## Limits
+
+The defaults suit a small shared server (20 users, 2000 items and 50000 completions each, 10 devices each, 120 requests a minute per device). Change them in `.env` with `BREADTRACKER_MAX_USERS`, `BREADTRACKER_MAX_ITEMS_PER_USER`, `BREADTRACKER_MAX_COMPLETIONS_PER_USER`, `BREADTRACKER_MAX_DEVICES_PER_USER` and `BREADTRACKER_REQUESTS_PER_MINUTE`. The existing deployment is well below them. To stop someone without deleting their data: `user disable NAME` (and `user enable NAME`).

@@ -6,6 +6,7 @@ import '../fx/sfx.dart';
 import '../rules.dart';
 import '../state.dart';
 import '../theme.dart';
+import 'items.dart' show showItemEditor;
 import 'widgets.dart';
 
 class TodayScreen extends ConsumerWidget {
@@ -118,12 +119,17 @@ class TodayScreen extends ConsumerWidget {
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    'Add a few example chores in one tap, or create your own chores and habits in Settings.',
+                    'Start by creating a chore or habit of your own, or add a few generic examples to edit later.',
                     textAlign: TextAlign.center,
                     style: TextStyle(color: p.dim),
                   ),
                   const SizedBox(height: 16),
                   FilledButton(
+                    onPressed: () => showItemEditor(context, ref),
+                    child: const Text('Create your first item'),
+                  ),
+                  const SizedBox(height: 8),
+                  TextButton(
                     onPressed: () async {
                       final n = await ctl.addStarterChores();
                       if (context.mounted) {
@@ -132,7 +138,7 @@ class TodayScreen extends ConsumerWidget {
                         );
                       }
                     },
-                    child: const Text('Add example chores'),
+                    child: const Text('Add a few examples'),
                   ),
                 ],
               ),

@@ -34,6 +34,8 @@ class FakeDevice implements PushDevice {
   bool broken = false;
   int prompts = 0;
   String? registration = 'fcm-token';
+  Completer<void>? tokenStarted;
+  Completer<void>? releaseToken;
   @override
   Future<void> initialize() async {
     if (broken) throw StateError('Firebase unavailable');
@@ -46,7 +48,12 @@ class FakeDevice implements PushDevice {
   }
 
   @override
-  Future<String?> token() async => registration;
+  Future<String?> token() async {
+    tokenStarted?.complete();
+    if (releaseToken != null) await releaseToken!.future;
+    return registration;
+  }
+
   @override
   Stream<String> get tokens => events.stream;
   @override
@@ -102,6 +109,33 @@ void main() {
     expect(api.sent, ['fcm-token']);
     expect(device.prompts, 0);
   });
+
+  test(
+    'old bearer is never sent to a replacement server after delayed FCM lookup',
+    () async {
+      device.tokenStarted = Completer<void>();
+      device.releaseToken = Completer<void>();
+      final destinations = <String>[];
+      final guardedPush = FcmPushService(
+        store,
+        device: device,
+        apiFactory: (server, token) {
+          destinations.add('$server|$token');
+          return api;
+        },
+      );
+      final pending = guardedPush.init();
+      await device.tokenStarted!.future;
+      store.claimPairingOwnership();
+      await store.setServerUrl('https://replacement.invalid');
+      store.credential = 'replacement';
+      device.releaseToken!.complete();
+      await pending;
+      expect(destinations, isEmpty);
+      expect(api.sent, isEmpty);
+      guardedPush.dispose();
+    },
+  );
 
   test('permission denial is visible and can be retried explicitly', () async {
     device.allowed = false;

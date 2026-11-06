@@ -94,19 +94,24 @@ class FcmPushService implements PushService {
         return;
       }
       authGeneration = store.authGeneration;
+      server = store.serverUrl;
       final token = await store.readTokenForGeneration(authGeneration);
-      if (store.authGeneration != authGeneration) return;
+      if (store.authGeneration != authGeneration || store.serverUrl != server) {
+        return;
+      }
       requestToken = token;
       if (token == null) {
         status.value = PushStatus.unpaired;
         return;
       }
       final fcm = await _device.token();
+      if (store.authGeneration != authGeneration || store.serverUrl != server) {
+        return;
+      }
       if (fcm == null || fcm.isEmpty) {
         status.value = PushStatus.failed;
         return;
       }
-      server = store.serverUrl;
       await _apiFactory(server, token).setFcmToken(fcm);
       if (store.authGeneration != authGeneration || store.serverUrl != server) {
         return;

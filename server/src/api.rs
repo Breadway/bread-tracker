@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Query, State};
 use axum::middleware;
 use axum::routing::{get, post, put};
@@ -13,11 +14,13 @@ use serde::{Deserialize, Serialize};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::auth::{self, ClientIp, DeviceId, UserId};
+use crate::auth::{self, DeviceId, UserId};
 use crate::error::{ApiError, ApiResult};
 use crate::model::{SyncRequest, SyncResponse};
+use crate::public_auth::{self, ClientIp};
 use crate::push::{Message, SendOutcome};
 use crate::store::{PushError, UserDb, UserSettings};
+use crate::{invites, users};
 use crate::{xp, AppState};
 
 const MAX_BATCH: usize = 5000;
@@ -40,6 +43,8 @@ pub fn router(state: AppState) -> Router {
     let authed = Router::new()
         .route("/sync", get(pull).post(sync))
         .route("/device", put(set_device).delete(sign_out))
+        .route("/pair-code", post(new_pair_code))
+        .route("/me", get(me))
         .route("/stats", get(stats))
         .route("/settings", get(get_settings).put(put_settings))
         .route("/push/test", post(push_test))
@@ -51,6 +56,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/pair", post(pair))
+        .route("/signup", post(signup))
         .merge(authed)
         .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
@@ -68,23 +74,228 @@ struct PairReq {
 struct PairResp {
     device_id: String,
     token: String,
+    /// Which account the new device joined. Added for the app, which must notice when a phone
+    /// that held one account's data is paired to another. Older clients ignore the fields.
+    user_id: i64,
+    name: String,
 }
 
 async fn pair(
     State(st): State<AppState>,
-    ClientIp(src): ClientIp,
-    Json(req): Json<PairReq>,
+    ClientIp(source): ClientIp,
+    body: Result<Json<PairReq>, JsonRejection>,
 ) -> ApiResult<Json<PairResp>> {
+    let mut tx = public_auth::admit(&st.db, source).await?;
+    let req = match body {
+        Ok(Json(req)) => req,
+        Err(_) => {
+            public_auth::fail(tx, source).await?;
+            return Err(ApiError::BadRequest("invalid pairing request".into()));
+        }
+    };
     let name = if req.device_name.trim().is_empty() {
         "Android"
     } else {
         req.device_name.trim()
     };
     let name: String = name.chars().take(80).collect();
-    match auth::pair_with_limit(&st.db, src, &req.code, &name).await? {
-        auth::PairAttempt::Paired(device_id, token) => Ok(Json(PairResp { device_id, token })),
-        auth::PairAttempt::InvalidCode => Err(ApiError::Unauthorized),
-        auth::PairAttempt::Throttled => Err(ApiError::TooManyRequests),
+    let owner: Option<i64> = sqlx::query_scalar(
+        "SELECT user_id FROM pairing_codes WHERE code_hash = ? AND expires_at > ?",
+    )
+    .bind(auth::hash(&auth::normalize_code(&req.code)))
+    .bind(crate::store::now_ms())
+    .fetch_optional(&mut *tx)
+    .await?;
+    match owner {
+        Some(owner) => {
+            let disabled: bool =
+                sqlx::query_scalar("SELECT disabled_at IS NOT NULL FROM users WHERE id = ?")
+                    .bind(owner)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if disabled {
+                return Err(ApiError::Disabled);
+            }
+            let devices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE user_id = ?")
+                .bind(owner)
+                .fetch_one(&mut *tx)
+                .await?;
+            if devices >= st.config.limits.max_devices {
+                return Err(ApiError::LimitReached(
+                    "device limit reached; sign out of another device first".into(),
+                ));
+            }
+            sqlx::query("DELETE FROM pairing_codes WHERE code_hash = ?")
+                .bind(auth::hash(&auth::normalize_code(&req.code)))
+                .execute(&mut *tx)
+                .await?;
+            let (device_id, token) = auth::insert_device(&mut tx, owner, &name).await?;
+            let name: String = sqlx::query_scalar("SELECT name FROM users WHERE id = ?")
+                .bind(owner)
+                .fetch_one(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok(Json(PairResp {
+                device_id,
+                token,
+                user_id: owner,
+                name,
+            }))
+        }
+        None => {
+            public_auth::fail(tx, source).await?;
+            Err(ApiError::Unauthorized)
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct MeResp {
+    user_id: i64,
+    name: String,
+    is_admin: bool,
+}
+
+/// Who the caller is. Lets an app that was paired before accounts existed learn its account.
+async fn me(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+) -> ApiResult<Json<MeResp>> {
+    let u = users::find_by_id(&st.db, uid)
+        .await?
+        .ok_or(ApiError::Unauthorized)?;
+    Ok(Json(MeResp {
+        user_id: u.id,
+        name: u.name,
+        is_admin: u.is_admin,
+    }))
+}
+
+#[derive(Serialize)]
+struct PairCodeResp {
+    code: String,
+    expires_in_secs: i64,
+}
+
+/// Authenticated: a short-lived code that adds another device to the caller's own account.
+/// It is bound to the caller's user id, taken from their token, never from the request.
+async fn new_pair_code(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+) -> ApiResult<Json<PairCodeResp>> {
+    let devices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE user_id = ?")
+        .bind(uid)
+        .fetch_one(&st.db)
+        .await?;
+    if devices >= st.config.limits.max_devices {
+        return Err(ApiError::LimitReached(format!(
+            "this account already has the maximum of {} devices; sign out of one first",
+            st.config.limits.max_devices
+        )));
+    }
+    let code = auth::create_pairing_code_limited(&st.db, uid).await?;
+    tracing::info!(user = uid, "pairing code issued");
+    Ok(Json(PairCodeResp {
+        code,
+        expires_in_secs: auth::pairing_code_ttl_secs(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct SignupReq {
+    invite: String,
+    name: String,
+    #[serde(default)]
+    device_name: String,
+    /// The phone's IANA timezone (for example `Europe/Berlin`). Optional; an unknown name is
+    /// ignored and the account keeps the UTC default, so signup never fails over a timezone.
+    #[serde(default)]
+    timezone: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SignupResp {
+    user_id: i64,
+    name: String,
+    device_id: String,
+    token: String,
+}
+
+/// Public. Create an account from an invite code: user, default settings and first device in
+/// one transaction. Never creates an admin. Failed attempts (bad invite) are limited per
+/// client address with the same limiter type as `/pair`.
+async fn signup(
+    State(st): State<AppState>,
+    ClientIp(src): ClientIp,
+    body: Result<Json<SignupReq>, JsonRejection>,
+) -> ApiResult<Json<SignupResp>> {
+    let mut tx = public_auth::admit(&st.db, src).await?;
+    let req = match body {
+        Ok(Json(req)) => req,
+        Err(_) => {
+            public_auth::fail(tx, src).await?;
+            return Err(ApiError::BadRequest("invalid signup request".into()));
+        }
+    };
+    let name = req.name.trim();
+    if !invites::name_ok(name) {
+        public_auth::fail(tx, src).await?;
+        return Err(ApiError::BadRequest(format!(
+            "name must be 1 to {} letters, digits, spaces, '.', '_' or '-'",
+            users::MAX_NAME_LEN
+        )));
+    }
+    let device_name = if req.device_name.trim().is_empty() {
+        "Android"
+    } else {
+        req.device_name.trim()
+    };
+    let device_name: String = device_name.chars().take(80).collect();
+    let timezone = req
+        .timezone
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && Tz::from_str(t).is_ok());
+    sqlx::query("SAVEPOINT signup_redemption")
+        .execute(&mut *tx)
+        .await?;
+    match invites::signup_in_limited(
+        &mut tx,
+        &req.invite,
+        name,
+        &device_name,
+        timezone,
+        st.config.limits.max_users,
+    )
+    .await?
+    {
+        Ok(s) => {
+            tx.commit().await?;
+            tracing::info!(user = s.user_id, "signed up");
+            Ok(Json(SignupResp {
+                user_id: s.user_id,
+                name: name.to_string(),
+                device_id: s.device_id,
+                token: s.token,
+            }))
+        }
+        Err(invites::SignupError::BadInvite) => {
+            sqlx::query("ROLLBACK TO signup_redemption")
+                .execute(&mut *tx)
+                .await?;
+            public_auth::fail(tx, src).await?;
+            Err(ApiError::Unauthorized)
+        }
+        Err(invites::SignupError::NameTaken) => {
+            sqlx::query("ROLLBACK TO signup_redemption")
+                .execute(&mut *tx)
+                .await?;
+            public_auth::fail(tx, src).await?;
+            Err(ApiError::Conflict("that name is already taken".into()))
+        }
+        Err(invites::SignupError::ServerFull) => Err(ApiError::LimitReached(
+            "this server is not accepting new accounts right now".into(),
+        )),
     }
 }
 
@@ -125,7 +336,10 @@ async fn sync(
     // device deleted the item). An unknown reference, or one that only another user holds,
     // rejects the whole batch with nothing written.
     let user = UserDb::new(&st.db, uid);
-    match user.apply_push(&req.items, &req.completions).await {
+    match user
+        .apply_push_limited(&req.items, &req.completions, &st.config.limits)
+        .await
+    {
         Ok(()) => {}
         Err(PushError::UnknownItem) => {
             return Err(ApiError::BadRequest(
@@ -133,6 +347,7 @@ async fn sync(
             ))
         }
         Err(PushError::Db(e)) => return Err(e.into()),
+        Err(PushError::LimitReached(message)) => return Err(ApiError::LimitReached(message)),
     }
     Ok(Json(user.pull(req.since).await?))
 }

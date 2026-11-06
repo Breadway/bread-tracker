@@ -40,9 +40,12 @@ final pairedProvider = FutureProvider<bool>((ref) async {
               controller.acceptedPairingServer == store.serverUrl));
 });
 
+enum _Mode { join, pair }
+
 class PairScreen extends ConsumerStatefulWidget {
-  const PairScreen({super.key, this.onSkip});
+  const PairScreen({super.key, this.onSkip, this.joinInitially = true});
   final VoidCallback? onSkip;
+  final bool joinInitially;
   @override
   ConsumerState<PairScreen> createState() => _PairScreenState();
 }
@@ -52,11 +55,14 @@ class _PairScreenState extends ConsumerState<PairScreen> {
     text: ref.read(storeProvider).serverUrl,
   );
   final _code = TextEditingController();
+  final _name = TextEditingController();
+  _Mode _mode = _Mode.join;
   bool _busy = false;
   String? _error;
   String? _issuedTokenForRetry;
   String? _issuedServerForRetry;
   String? _issuedCodeForRetry;
+  AccountInfo? _issuedAccountForRetry;
   PairingOwnership? _retryOwnership;
   PairingPersistenceReceipt? _persistenceReceipt;
   int _pairAttemptGeneration = 0;
@@ -65,8 +71,10 @@ class _PairScreenState extends ConsumerState<PairScreen> {
   @override
   void initState() {
     super.initState();
+    _mode = widget.joinInitially ? _Mode.join : _Mode.pair;
     _server.addListener(_onPairInputChanged);
     _code.addListener(_onPairInputChanged);
+    _name.addListener(_onPairInputChanged);
   }
 
   void _onPairInputChanged() {
@@ -80,6 +88,7 @@ class _PairScreenState extends ConsumerState<PairScreen> {
   void _invalidatePendingPairingResult() {
     _pairAttemptGeneration++;
     _issuedTokenForRetry = null;
+    _issuedAccountForRetry = null;
     _issuedServerForRetry = null;
     _issuedCodeForRetry = null;
     _retryOwnership = null;
@@ -132,20 +141,75 @@ class _PairScreenState extends ConsumerState<PairScreen> {
     _invalidatePendingPairingResult();
     _server.removeListener(_onPairInputChanged);
     _code.removeListener(_onPairInputChanged);
+    _name.removeListener(_onPairInputChanged);
     _server.dispose();
     _code.dispose();
+    _name.dispose();
     super.dispose();
   }
 
-  Future<void> _pair() async {
+  Future<bool> _confirmReplace() async {
+    final ctl = ref.read(controllerProvider);
+    if (!await ctl.localDataAtRisk()) return true;
+    if (!mounted) return false;
+    final join = _mode == _Mode.join;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Replace the data on this phone?'),
+        content: Text(
+          join
+              ? 'This phone already holds items and ticks from another account. '
+                    'Joining a new account deletes them from this phone first, so they '
+                    'never mix into the new account. Anything not yet synced to the old '
+                    'account is lost.'
+              : 'This phone already holds items and ticks. If this code belongs to a '
+                    'different account than the one they came from, they are deleted '
+                    'from this phone first so they never mix into the other account. '
+                    'Anything not yet synced to the old account is lost.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Continue'),
+          ),
+        ],
+      ),
+    );
+    return ok ?? false;
+  }
+
+  Future<void> _submit() async {
     final server = _server.text.trim().replaceAll(RegExp(r'/+$'), '');
     if (!server.startsWith('https://') && !server.startsWith('http://')) {
       return setState(
         () => _error = 'The server address must start with https://',
       );
     }
-    if (_code.text.trim().length < 8) {
-      return setState(() => _error = 'Enter the 8 character pairing code.');
+    final join = _mode == _Mode.join;
+    final name = _name.text.trim();
+    if (join && name.isEmpty) {
+      return setState(() => _error = 'Choose a name for your account.');
+    }
+    if (_code.text.replaceAll(RegExp(r'[^A-Za-z0-9]'), '').length < 8) {
+      return setState(
+        () => _error = join
+            ? 'Enter the invite code you were given.'
+            : 'Enter the 8 character pairing code.',
+      );
+    }
+    final recoveringIssuedWipe = ref
+        .read(controllerProvider)
+        .isWipeRecoveryPending;
+    if ((!recoveringIssuedWipe &&
+            _issuedTokenForRetry == null &&
+            !await _confirmReplace()) ||
+        !mounted) {
+      return;
     }
     setState(() {
       _busy = true;
@@ -184,8 +248,23 @@ class _PairScreenState extends ConsumerState<PairScreen> {
       }
       String? token = retryingIssuedToken ? _issuedTokenForRetry : null;
       if (!retryingIssuedToken) {
-        token ??= await Api(attemptServer).pair(attemptCode, 'Android');
+        final api = ref.read(apiFactoryProvider)(attemptServer, null);
+        final AccountInfo account;
+        if (join) {
+          account = await api.signup(
+            invite: attemptCode,
+            name: name,
+            deviceName: 'Android',
+            timezone: await ref.read(phoneTimezoneProvider)(),
+          );
+        } else {
+          account = await api.pair(attemptCode, 'Android');
+        }
+        if (!attemptStillCurrent()) return;
         codeWasRedeemed = true;
+        issuedToken = account.token;
+        _issuedAccountForRetry = account;
+        token = account.token;
       }
       final pairedToken = token!;
       issuedToken = pairedToken;
@@ -272,13 +351,22 @@ class _PairScreenState extends ConsumerState<PairScreen> {
         return;
       }
       persistenceStarted = true;
-      _persistenceReceipt = await store.persistPairing(
-        // Set before entering Store: its future may complete with a partial write
-        // and rollback before returning a receipt.
-        owner,
-        attemptServer,
-        pairedToken,
-      );
+      final account = _issuedAccountForRetry;
+      if (account != null) {
+        await controller.adoptAccount(
+          server: attemptServer,
+          token: pairedToken,
+          account: account,
+          ownership: owner,
+          stillCurrent: attemptStillCurrent,
+        );
+      } else {
+        _persistenceReceipt = await store.persistPairing(
+          owner,
+          attemptServer,
+          pairedToken,
+        );
+      }
       if (!attemptStillCurrent()) {
         if (_persistenceReceipt != null) {
           await store.rollbackPairing(_persistenceReceipt!);
@@ -302,11 +390,7 @@ class _PairScreenState extends ConsumerState<PairScreen> {
       if (mounted && Navigator.canPop(context)) Navigator.pop(context);
     } on ApiException catch (e) {
       if (mounted) {
-        setState(
-          () => _error = e.message == 'unauthorized'
-              ? 'That code is wrong or has expired. Make a new one on the server.'
-              : e.message,
-        );
+        setState(() => _error = _friendly(e.message, join));
       }
     } on AuthLost catch (e) {
       if (mounted) setState(() => _error = e.toString());
@@ -407,9 +491,25 @@ class _PairScreenState extends ConsumerState<PairScreen> {
     }
   }
 
+  String _friendly(String message, bool join) {
+    if (message == 'unauthorized') {
+      return join
+          ? 'That invite code is wrong, already used, or has expired. Ask for a new one.'
+          : 'That code is wrong or has expired. Make a new one.';
+    }
+    if (message.contains('already taken')) {
+      return 'That name is already taken. Choose another.';
+    }
+    if (message.contains('too many')) {
+      return 'Too many wrong attempts. Wait a few minutes and try again.';
+    }
+    return message;
+  }
+
   @override
   Widget build(BuildContext context) {
     final p = palOf(context);
+    final join = _mode == _Mode.join;
     return Scaffold(
       body: SafeArea(
         child: ListView(
@@ -424,27 +524,66 @@ class _PairScreenState extends ConsumerState<PairScreen> {
             ),
             const SizedBox(height: 8),
             Text(
-              'Pair this phone with your server so your chores, habits and reminders stay in sync.',
+              join
+                  ? 'Join with the invite code you were given to get your own account. '
+                        'Your chores, habits and reminders are private to you. The person who '
+                        'runs the server can see the data stored on it.'
+                  : 'Add this phone to an account you already have, so your chores, habits '
+                        'and reminders stay in sync.',
               style: TextStyle(color: p.dim, height: 1.4),
             ),
-            const SizedBox(height: 24),
+            const SizedBox(height: 16),
+            SegmentedButton<_Mode>(
+              segments: const [
+                ButtonSegment(
+                  value: _Mode.join,
+                  label: Text('Join with an invite'),
+                ),
+                ButtonSegment(
+                  value: _Mode.pair,
+                  label: Text('Pair with a code'),
+                ),
+              ],
+              selected: {_mode},
+              onSelectionChanged: _busy
+                  ? null
+                  : (s) => setState(() {
+                      _mode = s.first;
+                      _error = null;
+                    }),
+            ),
+            const SizedBox(height: 16),
             TextField(
               controller: _server,
               keyboardType: TextInputType.url,
               decoration: const InputDecoration(labelText: 'Server'),
             ),
             const SizedBox(height: 12),
+            if (join) ...[
+              TextField(
+                controller: _name,
+                textCapitalization: TextCapitalization.words,
+                decoration: const InputDecoration(
+                  labelText: 'Your name',
+                  helperText: 'Letters, digits, spaces, . _ - (up to 40)',
+                ),
+              ),
+              const SizedBox(height: 12),
+            ],
             TextField(
               controller: _code,
               textCapitalization: TextCapitalization.characters,
-              decoration: const InputDecoration(
-                labelText: 'Pairing code',
-                hintText: 'XXXX-XXXX',
+              decoration: InputDecoration(
+                labelText: join ? 'Invite code' : 'Pairing code',
+                hintText: join ? 'XXXX-XXXX-XXXX' : 'XXXX-XXXX',
               ),
             ),
             const SizedBox(height: 8),
             Text(
-              'Make a code on the server with: docker exec bread-tracker bread-tracker-server pair',
+              join
+                  ? 'Invite codes come from whoever runs the server. Each works once.'
+                  : 'Get a code from Settings on a phone that is already signed in to the '
+                        'account (Add another device), or ask whoever runs the server.',
               style: TextStyle(color: p.dim, fontSize: 12),
             ),
             if (_error != null)
@@ -459,8 +598,12 @@ class _PairScreenState extends ConsumerState<PairScreen> {
               ),
             const SizedBox(height: 20),
             FilledButton(
-              onPressed: _busy ? null : _pair,
-              child: Text(_busy ? 'Pairing...' : 'Pair'),
+              onPressed: _busy ? null : _submit,
+              child: Text(
+                _busy
+                    ? (join ? 'Joining...' : 'Pairing...')
+                    : (join ? 'Join' : 'Pair'),
+              ),
             ),
             if (widget.onSkip != null) ...[
               const SizedBox(height: 8),
@@ -476,9 +619,13 @@ class _PairScreenState extends ConsumerState<PairScreen> {
   }
 }
 
-String syncLabel(Store store, bool paired) => paired
-    ? 'Paired with ${store.serverUrl}'
-    : 'Not paired (data stays on this phone)';
+String syncLabel(Store store, bool paired) {
+  if (!paired) return 'Not paired (data stays on this phone)';
+  final name = store.account?.name ?? '';
+  return name.isEmpty
+      ? 'Paired with ${store.serverUrl}'
+      : 'Signed in as $name on ${store.serverUrl}';
+}
 
 /// Small status chip shown on the settings screen.
 class StatusDot extends StatelessWidget {

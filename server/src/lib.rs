@@ -6,14 +6,15 @@ pub mod config;
 pub mod db;
 pub mod devices;
 pub mod error;
+pub mod invites;
 pub mod model;
+pub mod public_auth;
 pub mod push;
 pub mod store;
 pub mod users;
 pub mod xp;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use config::Config;
 use db::Db;
@@ -25,7 +26,6 @@ pub struct AppState {
     pub generation: Arc<std::sync::RwLock<String>>,
     pub config: Arc<Config>,
     pub push: Arc<dyn PushSender>,
-    pub pair_limiter: Arc<auth::PairLimiter>,
 }
 
 impl AppState {
@@ -35,7 +35,6 @@ impl AppState {
             generation: Arc::new(std::sync::RwLock::new(generation)),
             config: Arc::new(config),
             push,
-            pair_limiter: Arc::new(auth::PairLimiter::new(5, Duration::from_secs(600))),
         }
     }
 }

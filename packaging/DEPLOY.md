@@ -149,7 +149,7 @@ step 2 and step 4 and phones retry on their own.
    is called `admin` and can still be named by a later start. A name another user already
    holds stops startup with a message.
 
-   This release ships migrations `1`, `2`, `3`, `5`, `6` and `7` only. A database that has already
+   This release ships migrations `1`, `2`, `3`, `5`, `6`, `7`, `8`, `9`, `10` and `11`. A database that has already
    recorded `4` (the durable pairing limiter, PR31) is refused at start with a missing
    migration error and is not served. Supporting `4` needs a separately accepted PR31 that is
    integrated with this change so its migration and runtime ship together; this release does
@@ -163,7 +163,7 @@ step 2 and step 4 and phones retry on their own.
    WORK=$(mktemp -d)
    docker run --rm --user "$(id -u):$(id -g)" -v "$BACKUP_DIR":/b:ro -v "$WORK":/o \
      litestream/litestream:0.3.13 restore -o /o/replica.db file:///b/litestream
-   python3 scripts/db-evidence.py check "$WORK/replica.db" --ledger-exact 1,2,3,5,6,7
+   python3 scripts/db-evidence.py check "$WORK/replica.db" --ledger-exact 1,2,3,5,6,7,8,9,10,11
    ```
 
    Expect `CHECK PASSED` and the same counts for `items`, `completions`, `devices`,
@@ -291,3 +291,30 @@ scripts/rehearse_restore.sh
 ```
 
 The script checkpoints and integrity-checks the candidate, validates it before replacement, verifies marker and server startup, and tests secret readability without printing its contents. It uses a valid SQLx migration ledger with the SHA-384 checksum of the exact embedded 0001 migration. The server runs in the foreground under a host background PID: after health succeeds, the script verifies the exact task container name, stops only that container, and waits on the host `docker run` process for the exit status. Cleanup refuses to remove bind data while that container remains, uses a root helper to restore host uid/gid ownership, then removes only its exact scratch path and image. Runtime Docker verification is deliberately separate from static CI checks.
+## Invite signup admission
+
+This candidate adds migration 0008 for invites and 0009 for shared pairing/signup failure budgets. Set `BREADTRACKER_TRUSTED_PROXIES` only to the verified transport peer IPs or CIDRs of your sanitizing proxy. By default forwarded headers are ignored. Check the actual application peer and effective header chain before deployment; do not trust a client-supplied forwarded address. Pairing and signup share five failures per source per ten minutes and a 1,024-source admission cap. Successful attempts do not spend failures. Old experimental invite004 ledgers are unsupported; preserve their evidence and use a new path only for positively identified disposable experiments. Never rewrite an applied production migration ledger.
+
+## Users, invites and devices
+
+```sh
+docker exec bread-tracker bread-tracker-server invite create [--ttl 7d] # prints a single-use code, once
+docker exec bread-tracker bread-tracker-server invite list              # state only, never the code
+docker exec bread-tracker bread-tracker-server invite revoke <id>
+docker exec bread-tracker bread-tracker-server user list
+docker exec bread-tracker bread-tracker-server devices [--user NAME]
+docker exec bread-tracker bread-tracker-server pair [--user NAME]    # a code for that user's new device
+docker exec bread-tracker bread-tracker-server revoke <device id>
+docker exec bread-tracker bread-tracker-server user export NAME     # everything stored for a user, as JSON
+docker exec bread-tracker bread-tracker-server user disable NAME
+docker exec bread-tracker bread-tracker-server user enable NAME
+docker exec bread-tracker bread-tracker-server user remove NAME --yes # deletes the user and all their data
+```
+
+Without `--user`, `pair` makes a code for the admin. Users add their own second device from the app (Settings), which calls `POST /pair-code`; you do not need to be involved. `user remove` cannot be undone, so take a backup first if in doubt; it refuses to remove an admin. `user disable` stops an account without deleting anything.
+
+Send an invite code and the server address to the new person through a private channel, then give them `docs/ONBOARDING.md`: it covers installing the APK, joining with the invite, adding a second device, and what you as the server owner can see.
+
+## Limits
+
+The defaults suit a small shared server (20 users, 2000 items and 50000 completions each, 10 devices each, 120 requests a minute per device). Change them in `.env` with `BREADTRACKER_MAX_USERS`, `BREADTRACKER_MAX_ITEMS_PER_USER`, `BREADTRACKER_MAX_COMPLETIONS_PER_USER`, `BREADTRACKER_MAX_DEVICES_PER_USER` and `BREADTRACKER_REQUESTS_PER_MINUTE`. The existing deployment is well below them. To stop someone without deleting their data: `user disable NAME` (and `user enable NAME`).

@@ -349,7 +349,7 @@ void main() {
         expect(await store.token, isNull);
         expect(await container.read(pairedProvider.future), isFalse);
         expect(find.text('Sign out'), findsNothing);
-        expect(find.text('Pair with server'), findsOneWidget);
+        expect(find.text('Join or pair'), findsOneWidget);
         expect(
           await db.select(db.items).get(),
           hasLength(choice == 'keep' ? 1 : 0),

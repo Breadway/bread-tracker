@@ -1,5 +1,10 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:share_plus/share_plus.dart';
 
 import '../data/api.dart';
 import '../data/sync.dart';
@@ -10,6 +15,24 @@ import 'items.dart';
 import 'pair.dart';
 import 'server_settings.dart';
 import 'widgets.dart';
+
+final exportShareProvider = Provider<Future<void> Function(String)>(
+  (ref) => (json) async {
+    await SharePlus.instance.share(
+      ShareParams(
+        files: [
+          XFile.fromData(
+            Uint8List.fromList(utf8.encode(json)),
+            mimeType: 'application/json',
+            name: 'bread-tracker-export.json',
+          ),
+        ],
+        fileNameOverrides: ['bread-tracker-export.json'],
+        title: 'Bread Tracker export',
+      ),
+    );
+  },
+);
 
 class SettingsScreen extends ConsumerWidget {
   const SettingsScreen({super.key});
@@ -33,6 +56,9 @@ class SettingsScreen extends ConsumerWidget {
       SyncStatus.syncing => 'Syncing...',
       SyncStatus.offline =>
         'Cannot reach the server. Changes are saved here and will sync later.',
+      SyncStatus.rejected =>
+        ref.read(syncEngineProvider).rejectionMessage ??
+            'The server refused this sync. Local changes are kept.',
       SyncStatus.unpaired =>
         paired
             ? 'This phone is no longer paired. Pair it again.'
@@ -83,10 +109,10 @@ class SettingsScreen extends ConsumerWidget {
           if (paired) const Spacer8(),
           PanelButton(
             icon: Icons.link_rounded,
-            title: paired ? 'Pair again' : 'Pair with server',
+            title: paired ? 'Switch account or pair again' : 'Join or pair',
             subtitle: paired
-                ? 'Use a new code, for example after reinstalling the server'
-                : 'Enter a pairing code from your server',
+                ? 'Join with an invite or use a code. If it is a different account, this phone\'s data is replaced'
+                : 'Join with an invite code, or pair with a code',
             onTap: () => Navigator.of(
               context,
             ).push(MaterialPageRoute<void>(builder: (_) => const PairScreen())),
@@ -155,6 +181,72 @@ class SettingsScreen extends ConsumerWidget {
 
                 await finishSignOut();
               },
+            ),
+          if (paired) const Spacer8(),
+          if (paired)
+            PanelButton(
+              icon: Icons.download_rounded,
+              title: 'Export my data',
+              subtitle: 'Copy everything stored for your account as JSON',
+              onTap: () async {
+                try {
+                  final json = await ctl.exportJson();
+                  if (json.length > _maxClipboardChars) {
+                    await ref.read(exportShareProvider)(json);
+                    return;
+                  }
+                  await Clipboard.setData(ClipboardData(text: json));
+                  toast(
+                    'Copied ${json.length ~/ 1024 + 1} KB of JSON to the clipboard',
+                  );
+                } on ApiException catch (e) {
+                  toast(e.message);
+                } on AuthLost catch (e) {
+                  toast(e.toString());
+                } catch (_) {
+                  toast(
+                    'Could not save or share the export. Your data is unchanged. Retry export.',
+                  );
+                }
+              },
+            ),
+          if (paired) const Spacer8(),
+          if (paired)
+            PanelButton(
+              icon: Icons.delete_forever_rounded,
+              title: 'Delete my account',
+              subtitle: 'Permanently remove your account and all of your data from the server',
+              onTap: () async {
+                final name = store.account?.name ?? '';
+                final typed = await showDialog<String>(
+                  context: context,
+                  builder: (_) => _DeleteAccountDialog(name: name),
+                );
+                if (typed == null) return;
+                try {
+                  await ctl.deleteAccount(typed);
+                  toast('Your account was deleted');
+                } on ApiException catch (e) {
+                  toast(e.message);
+                } on AuthLost catch (e) {
+                  toast(e.toString());
+                } catch (_) {
+                  toast(
+                    'Account cleanup failed on this phone. Local sync is paused; retry cleanup before pairing.',
+                  );
+                }
+              },
+            ),
+          if (paired) const Spacer8(),
+          if (paired)
+            PanelButton(
+              icon: Icons.devices_rounded,
+              title: 'Add another device',
+              subtitle: 'Create a short-lived code for your own account',
+              onTap: () => showDialog<void>(
+                context: context,
+                builder: (_) => const _PairCodeDialog(),
+              ),
             ),
           const SectionHeader('Your list'),
           PanelButton(
@@ -295,6 +387,178 @@ class SettingsScreen extends ConsumerWidget {
 }
 
 enum _SignOut { keep, wipe }
+
+class _PairCodeDialog extends ConsumerStatefulWidget {
+  const _PairCodeDialog();
+
+  @override
+  ConsumerState<_PairCodeDialog> createState() => _PairCodeDialogState();
+}
+
+class _PairCodeDialogState extends ConsumerState<_PairCodeDialog> {
+  String? _code;
+  DateTime? _expiresAt;
+  String? _error;
+  bool _busy = false;
+  int? _ownerGeneration;
+  int? _ownerAppGeneration;
+  String? _ownerServer;
+
+  @override
+  void initState() {
+    super.initState();
+    Future.microtask(_load);
+  }
+
+  Future<void> _load() async {
+    if (!mounted || _busy) return;
+    final store = ref.read(storeProvider);
+    final controller = ref.read(controllerProvider);
+    final generation = store.authGeneration;
+    final appGeneration = controller.currentAuthGeneration;
+    final server = store.serverUrl;
+    bool ownsRequest() =>
+        mounted &&
+        store.authGeneration == generation &&
+        controller.currentAuthGeneration == appGeneration &&
+        store.serverUrl == server;
+    setState(() {
+      _busy = true;
+      _code = null;
+      _error = null;
+      _ownerGeneration = generation;
+      _ownerAppGeneration = appGeneration;
+      _ownerServer = server;
+    });
+    try {
+      final token = await store.readTokenForGeneration(generation);
+      if (!ownsRequest()) return;
+      if (token == null) throw ApiException('Pair this phone first.');
+      final result = await ref
+          .read(apiFactoryProvider)(server, token)
+          .createPairCode();
+      if (!ownsRequest()) return;
+      final code = result['code'];
+      final ttl = result['expires_in_secs'];
+      if (code is! String || code.isEmpty || ttl is! int || ttl <= 0) {
+        throw ApiException('Invalid pairing-code response.');
+      }
+      setState(() {
+        _code = code;
+        _expiresAt = DateTime.now().add(Duration(seconds: ttl));
+      });
+    } catch (error) {
+      if (ownsRequest()) setState(() => _error = error.toString());
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // A code is account-sensitive: hide it as soon as the owning session changes.
+    ref.watch(pairedStateRevisionProvider);
+    final paired = ref.watch(pairedProvider).value ?? false;
+    final store = ref.watch(storeProvider);
+    final sameOwner =
+        store.authGeneration == _ownerGeneration &&
+        ref.read(controllerProvider).currentAuthGeneration ==
+            _ownerAppGeneration &&
+        store.serverUrl == _ownerServer;
+    return AlertDialog(
+      title: const Text('Add another device'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (!paired)
+            const Text('Pair this phone first.')
+          else if (_busy)
+            const CircularProgressIndicator()
+          else if (_error != null)
+            Text(_error!)
+          else if (_code != null && sameOwner) ...[
+            SelectableText(_code!),
+            Text('Expires at ${_expiresAt!.toLocal()}. Single use.'),
+          ] else if (!sameOwner)
+            const Text('Account changed. Request a new code.'),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Close'),
+        ),
+        if (paired)
+          FilledButton(
+            onPressed: _busy ? null : _load,
+            child: const Text('New code'),
+          ),
+      ],
+    );
+  }
+}
+
+/// Android's binder limit is about 1 MB per transaction; stay well under it.
+const _maxClipboardChars = 500 * 1000;
+
+/// Asks the user to type the account name before deleting. Owns its controller.
+class _DeleteAccountDialog extends StatefulWidget {
+  const _DeleteAccountDialog({required this.name});
+  final String name;
+  @override
+  State<_DeleteAccountDialog> createState() => _DeleteAccountDialogState();
+}
+
+class _DeleteAccountDialogState extends State<_DeleteAccountDialog> {
+  final _c = TextEditingController();
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final matches =
+        widget.name.isNotEmpty &&
+        _c.text.trim().toLowerCase() == widget.name.toLowerCase();
+    return AlertDialog(
+      title: const Text('Delete your account?'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'This removes your account, items, history and settings from the server and '
+            'from this phone, and signs out every device on the account. It cannot be '
+            'undone. Export your data first if you want a copy.',
+          ),
+          const SizedBox(height: 12),
+          Text('Type "${widget.name}" to confirm.'),
+          TextField(
+            controller: _c,
+            autofocus: true,
+            onChanged: (_) => setState(() {}),
+            decoration: InputDecoration(hintText: widget.name),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: matches
+              ? () => Navigator.pop(context, _c.text.trim())
+              : null,
+          child: const Text('Delete everything'),
+        ),
+      ],
+    );
+  }
+}
 
 class _SignOutDialog extends StatelessWidget {
   const _SignOutDialog();

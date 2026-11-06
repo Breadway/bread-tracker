@@ -6,7 +6,7 @@ import 'api.dart';
 import 'database.dart';
 import 'store.dart';
 
-enum SyncStatus { idle, syncing, offline, unpaired }
+enum SyncStatus { idle, syncing, offline, unpaired, rejected }
 
 class _RestoreBatch {
   const _RestoreBatch(this.items, this.completions);
@@ -29,6 +29,7 @@ class SyncEngine {
   bool _invalidated = false;
   String? _token;
   String? _server;
+  String? rejectionMessage;
 
   void invalidate() {
     _generation++;
@@ -67,6 +68,7 @@ class SyncEngine {
   }
 
   Future<SyncStatus> _once() async {
+    rejectionMessage = null;
     if (_invalidated) return SyncStatus.unpaired;
     final storeGeneration = store.authGeneration;
     final token = await store.readTokenForGeneration(storeGeneration);
@@ -94,8 +96,8 @@ class SyncEngine {
       );
     } on AuthLost {
       return _authLost(token, storeGeneration, generation, server);
-    } on ApiException {
-      return SyncStatus.offline;
+    } on ApiException catch (error) {
+      return _apiFailure(error);
     }
     if (!_isCurrent(generation, storeGeneration, server)) {
       return SyncStatus.unpaired;
@@ -172,6 +174,17 @@ class SyncEngine {
       !_invalidated &&
       store.authGeneration == storeGeneration &&
       store.serverUrl == server;
+
+  /// A reachable 4xx answer is a policy rejection, not a network outage: surface the
+  /// server's message instead of retrying forever. Everything else stays offline.
+  SyncStatus _apiFailure(ApiException error) {
+    final code = error.statusCode;
+    if (code != null && code >= 400 && code < 500) {
+      rejectionMessage = error.message;
+      return SyncStatus.rejected;
+    }
+    return SyncStatus.offline;
+  }
 
   /// Apply a remote snapshot row by row, keeping whichever copy has the newer
   /// `updated_at` regardless of its dirty flag.
@@ -262,8 +275,8 @@ class SyncEngine {
         );
       } on AuthLost {
         return _authLost(token, storeGeneration, generation, server);
-      } on ApiException {
-        return SyncStatus.offline;
+      } on ApiException catch (error) {
+        return _apiFailure(error);
       }
       if (!_isCurrent(generation, storeGeneration, server)) {
         return SyncStatus.unpaired;

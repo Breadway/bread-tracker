@@ -1,10 +1,6 @@
 //! Single-user device auth: a one-time pairing code is exchanged for a long-lived bearer
 //! token. Only the SHA-256 of codes and tokens is stored.
 
-use std::collections::VecDeque;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
-
 use axum::extract::{Request, State};
 use axum::http::header::AUTHORIZATION;
 use axum::middleware::Next;
@@ -17,7 +13,7 @@ use crate::error::ApiError;
 use crate::store::now_ms;
 use crate::AppState;
 
-const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+pub(crate) const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const CODE_TTL_MS: i64 = 15 * 60 * 1000;
 const LAST_SEEN_INTERVAL_MS: i64 = 60 * 1000;
 
@@ -29,6 +25,16 @@ pub struct DeviceId(pub String);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UserId(pub i64);
 
+/// The exact device and credential that authenticated a request. Handlers that grant
+/// long-lived access recheck this inside their own write transaction, because the device can
+/// be revoked while the request waits for the writer.
+#[derive(Clone, Debug)]
+pub struct CallerIdentity {
+    pub device_id: String,
+    pub token_hash: String,
+    pub user_id: i64,
+}
+
 pub fn hash(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
 }
@@ -39,7 +45,7 @@ pub fn random_token() -> String {
     hex::encode(b)
 }
 
-fn normalize_code(code: &str) -> String {
+pub fn normalize_code(code: &str) -> String {
     code.chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect::<String>()
@@ -54,10 +60,14 @@ pub async fn create_pairing_code(db: &Db) -> Result<String, sqlx::Error> {
 
 /// Create a pairing code that adds a device to `user_id`'s account.
 pub async fn create_pairing_code_for(db: &Db, user_id: i64) -> Result<String, sqlx::Error> {
-    let mut rng = rand::thread_rng();
-    let raw: String = (0..8)
-        .map(|_| CODE_ALPHABET[rng.gen_range(0..CODE_ALPHABET.len())] as char)
-        .collect();
+    // The RNG is not Send, so it must be gone before the first await (handlers run on a
+    // multi-threaded runtime).
+    let raw: String = {
+        let mut rng = rand::thread_rng();
+        (0..8)
+            .map(|_| CODE_ALPHABET[rng.gen_range(0..CODE_ALPHABET.len())] as char)
+            .collect()
+    };
     sqlx::query("DELETE FROM pairing_codes WHERE expires_at < ?")
         .bind(now_ms())
         .execute(db)
@@ -94,61 +104,109 @@ pub async fn redeem(
         tx.commit().await?;
         return Ok(None);
     };
+    let device = insert_device(&mut tx, user_id, device_name).await?;
+    tx.commit().await?;
+    Ok(Some(device))
+}
+
+/// Create a device for `user_id` and return `(device_id, token)`. Only the token's hash is stored.
+pub async fn insert_device(
+    conn: &mut sqlx::SqliteConnection,
+    user_id: i64,
+    device_name: &str,
+) -> Result<(String, String), sqlx::Error> {
     let id = uuid::Uuid::new_v4().to_string();
     let token = random_token();
     let now = now_ms();
-    sqlx::query(
-        "INSERT INTO devices (id, user_id, name, token_hash, created_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&id)
-    .bind(user_id)
-    .bind(device_name)
-    .bind(hash(&token))
-    .bind(now)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(Some((id, token)))
+    let disabled: Option<i64> = sqlx::query_scalar("SELECT disabled_at FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_one(&mut *conn)
+        .await?;
+    if disabled.is_some() {
+        return Err(sqlx::Error::Protocol(
+            "cannot issue a device for a disabled account".into(),
+        ));
+    }
+    sqlx::query("INSERT INTO devices (id, user_id, name, token_hash, created_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)")
+        .bind(&id)
+        .bind(user_id)
+        .bind(device_name)
+        .bind(hash(&token))
+        .bind(now)
+        .bind(now)
+        .execute(conn)
+        .await?;
+    Ok((id, token))
 }
 
-pub async fn device_count(db: &Db) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar("SELECT COUNT(*) FROM devices")
+/// Number of devices the first-run check looks at: only the admin's. Other users' devices say
+/// nothing about whether the owner still needs a pairing code.
+pub async fn admin_device_count(db: &Db) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE user_id = ?")
+        .bind(crate::users::ADMIN_ID)
         .fetch_one(db)
         .await
 }
 
-/// Allows a small number of pairing attempts per window, globally (single-user server).
-pub struct PairLimiter {
-    max: usize,
-    window: Duration,
-    hits: Mutex<VecDeque<Instant>>,
+/// Pairing codes a user may have outstanding at once. Creating one more replaces the oldest,
+/// so a stuck client cannot pile them up.
+const MAX_OPEN_CODES_PER_USER: i64 = 3;
+
+/// A fresh short-lived pairing code for the caller, keeping at most
+/// [`MAX_OPEN_CODES_PER_USER`] unexpired codes for that user.
+///
+/// Returns `None` without changing anything when the caller is no longer eligible. The check
+/// runs inside the same `BEGIN IMMEDIATE` transaction as the prune and insert: authentication
+/// happens before the handler, but a request can wait for the writer long enough for its device
+/// to be revoked, so the decision to issue access must be made again under the write lock.
+pub async fn create_pairing_code_limited(
+    db: &Db,
+    caller: &CallerIdentity,
+) -> Result<Option<String>, sqlx::Error> {
+    let raw: String = {
+        let mut rng = rand::thread_rng();
+        (0..8)
+            .map(|_| CODE_ALPHABET[rng.gen_range(0..CODE_ALPHABET.len())] as char)
+            .collect()
+    };
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    let eligible: Option<i64> = sqlx::query_scalar(
+        "SELECT d.user_id FROM devices d JOIN users u ON u.id = d.user_id
+         WHERE d.id = ? AND d.token_hash = ? AND d.user_id = ? AND u.disabled_at IS NULL",
+    )
+    .bind(&caller.device_id)
+    .bind(&caller.token_hash)
+    .bind(caller.user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if eligible.is_none() {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let user_id = caller.user_id;
+    sqlx::query(
+        "DELETE FROM pairing_codes WHERE user_id = ?1 AND code_hash NOT IN
+           (SELECT code_hash FROM pairing_codes WHERE user_id = ?1 AND expires_at > ?2
+            ORDER BY expires_at DESC, code_hash DESC LIMIT ?3)",
+    )
+    .bind(user_id)
+    .bind(now_ms())
+    .bind(MAX_OPEN_CODES_PER_USER - 1)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("INSERT INTO pairing_codes(code_hash, user_id, expires_at) VALUES (?, ?, ?)")
+        .bind(hash(&raw))
+        .bind(user_id)
+        .bind(now_ms() + CODE_TTL_MS)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Some(format!("{}-{}", &raw[..4], &raw[4..])))
 }
 
-impl PairLimiter {
-    pub fn new(max: usize, window: Duration) -> Self {
-        Self {
-            max,
-            window,
-            hits: Mutex::new(VecDeque::new()),
-        }
-    }
-
-    pub fn check(&self) -> bool {
-        let mut hits = self.hits.lock().unwrap();
-        let now = Instant::now();
-        while hits
-            .front()
-            .is_some_and(|t| now.duration_since(*t) > self.window)
-        {
-            hits.pop_front();
-        }
-        if hits.len() >= self.max {
-            return false;
-        }
-        hits.push_back(now);
-        true
-    }
+/// Expiry of a pairing code, for the response of `POST /pair-code`.
+pub fn pairing_code_ttl_secs() -> i64 {
+    CODE_TTL_MS / 1000
 }
 
 /// Middleware: require `Authorization: Bearer <token>` matching a paired device.
@@ -164,12 +222,32 @@ pub async fn require_auth(
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(ApiError::Unauthorized)?
         .to_string();
-    let row: Option<(String, i64, i64)> =
-        sqlx::query_as("SELECT id, last_seen, user_id FROM devices WHERE token_hash = ?")
-            .bind(hash(&token))
-            .fetch_optional(&st.db)
-            .await?;
-    let (id, last_seen, user_id) = row.ok_or(ApiError::Unauthorized)?;
+    let token_hash = hash(&token);
+    let row: Option<(String, i64, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT d.id, d.last_seen, d.user_id, u.disabled_at
+         FROM devices d JOIN users u ON u.id = d.user_id WHERE d.token_hash = ?",
+    )
+    .bind(&token_hash)
+    .fetch_optional(&st.db)
+    .await?;
+    let (id, last_seen, user_id, disabled_at) = row.ok_or(ApiError::Unauthorized)?;
+    if disabled_at.is_some() {
+        return Err(ApiError::Disabled);
+    }
+    // Per token, so one noisy device cannot use up the server for everyone else.
+    if !allow_request(&st.db, &id, st.config.limits.requests_per_minute).await? {
+        let still_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM devices WHERE id = ? AND user_id = ?)")
+                .bind(&id)
+                .bind(user_id)
+                .fetch_one(&st.db)
+                .await?;
+        if !still_exists {
+            return Err(ApiError::Unauthorized);
+        }
+        tracing::warn!(user = user_id, device = %id, "request rate limit hit");
+        return Err(ApiError::TooManyRequests);
+    }
     // last_seen is informational, so write it at most once per interval, not per request.
     let now = now_ms();
     if now - last_seen >= LAST_SEEN_INTERVAL_MS {
@@ -183,7 +261,32 @@ pub async fn require_auth(
         .execute(&st.db)
         .await?;
     }
-    req.extensions_mut().insert(DeviceId(id));
+    // The user id goes in the log so abuse can be traced to an account. Never the token, and
+    // only the path (no query string).
+    let (method, path) = (req.method().clone(), req.uri().path().to_string());
+    req.extensions_mut().insert(DeviceId(id.clone()));
     req.extensions_mut().insert(UserId(user_id));
-    Ok(next.run(req).await)
+    req.extensions_mut().insert(CallerIdentity {
+        device_id: id,
+        token_hash,
+        user_id,
+    });
+    let resp = next.run(req).await;
+    tracing::info!(user = user_id, %method, %path, status = resp.status().as_u16(), "request");
+    Ok(resp)
+}
+
+pub async fn allow_request(db: &Db, device_id: &str, limit: i64) -> Result<bool, sqlx::Error> {
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    let now = now_ms();
+    sqlx::query("DELETE FROM authenticated_rate_limits WHERE window_started_at <= ?")
+        .bind(now.saturating_sub(60_000))
+        .execute(&mut *tx)
+        .await?;
+    let admitted: Option<i64> = sqlx::query_scalar(
+        "INSERT INTO authenticated_rate_limits(device_id, requests, window_started_at) SELECT ?, 1, ? WHERE EXISTS(SELECT 1 FROM devices WHERE id = ?) ON CONFLICT(device_id) DO UPDATE SET requests = requests + 1 WHERE requests < ? RETURNING requests")
+        .bind(device_id).bind(now).bind(device_id).bind(limit)
+        .fetch_optional(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(admitted.is_some())
 }

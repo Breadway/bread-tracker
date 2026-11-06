@@ -26,6 +26,8 @@ pub enum PushError {
     /// same batch. Nothing was written.
     #[error("completion references an unknown item")]
     UnknownItem,
+    #[error("{0}")]
+    LimitReached(String),
     #[error(transparent)]
     Db(#[from] sqlx::Error),
 }
@@ -74,8 +76,28 @@ impl UserDb {
         items: &[Item],
         completions: &[Completion],
     ) -> Result<(), PushError> {
+        self.apply_push_limited(items, completions, &crate::config::Limits::default())
+            .await
+    }
+
+    pub async fn apply_push_limited(
+        &self,
+        items: &[Item],
+        completions: &[Completion],
+        limits: &crate::config::Limits,
+    ) -> Result<(), PushError> {
         let ceiling = now_ms() + DAY_MS;
         let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
+        let mut item_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE user_id = ?")
+                .bind(self.user_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let mut completion_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM completions WHERE user_id = ?")
+                .bind(self.user_id)
+                .fetch_one(&mut *tx)
+                .await?;
 
         let incoming: HashSet<&str> = items.iter().map(|i| i.id.as_str()).collect();
         let mut unknown: Vec<&str> = completions
@@ -109,6 +131,15 @@ impl UserDb {
                     .await?;
             if existing.is_some_and(|e| e >= updated) {
                 continue;
+            }
+            if existing.is_none() {
+                if item_count >= limits.max_items {
+                    return Err(PushError::LimitReached(format!(
+                        "item limit reached ({} per account)",
+                        limits.max_items
+                    )));
+                }
+                item_count += 1;
             }
             let seq = next_seq(&mut tx).await?;
             sqlx::query(
@@ -149,6 +180,24 @@ impl UserDb {
             .await?;
             if existing.is_some_and(|e| e >= updated) {
                 continue;
+            }
+            let owned: Option<i64> =
+                sqlx::query_scalar("SELECT 1 FROM items WHERE user_id = ? AND id = ?")
+                    .bind(self.user_id)
+                    .bind(&c.item_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if owned.is_none() {
+                return Err(PushError::UnknownItem);
+            }
+            if existing.is_none() {
+                if completion_count >= limits.max_completions {
+                    return Err(PushError::LimitReached(format!(
+                        "history limit reached ({} entries per account)",
+                        limits.max_completions
+                    )));
+                }
+                completion_count += 1;
             }
             let seq = next_seq(&mut tx).await?;
             sqlx::query(

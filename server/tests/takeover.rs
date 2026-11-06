@@ -96,6 +96,13 @@ async fn tokens(pool: &SqlitePool) -> Vec<(i64, Option<String>)> {
         .unwrap()
 }
 
+async fn codes(pool: &SqlitePool) -> Vec<String> {
+    sqlx::query_scalar("SELECT code_hash FROM pairing_codes ORDER BY code_hash")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
 async fn set(w: &World, token: &str, fcm: &str) -> StatusCode {
     call(
         &w.app,
@@ -201,6 +208,38 @@ async fn a_caller_removed_after_authentication_cannot_take_a_token_and_clears_no
 }
 
 #[tokio::test]
+async fn a_device_revoked_while_a_pair_code_request_waits_gets_401_and_creates_no_code() {
+    // The request authenticates, blocks on the writer, and its device is revoked and committed
+    // before it can issue. It must not return a redeemable code for a device that is gone.
+    let (w, p) = world(&[]).await;
+    let token = p[0].1.clone();
+    let before = codes(&w.pool).await;
+
+    let mut holder = w.pool.acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let app = w.app.clone();
+    let request =
+        tokio::spawn(async move { call(&app, "POST", "/pair-code", Some(&token), None).await.0 });
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(
+        !request.is_finished(),
+        "the handler is blocked on the write lock"
+    );
+    sqlx::query("DELETE FROM devices WHERE user_id = 1")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    sqlx::query("COMMIT").execute(&mut *holder).await.unwrap();
+    drop(holder);
+
+    assert_eq!(request.await.unwrap(), StatusCode::UNAUTHORIZED);
+    assert_eq!(codes(&w.pool).await, before, "no code was added or pruned");
+}
+
+#[tokio::test]
 async fn concurrent_takeovers_of_one_token_always_leave_one_holder_and_every_device() {
     let (w, p) = world(&["Bob", "Cy", "Di", "Ed"]).await;
     for round in 0..15 {
@@ -282,6 +321,10 @@ async fn every_user_ends_with_their_own_distinct_token_after_mixed_concurrent_mo
 #[tokio::test]
 async fn concurrent_disjoint_settings_patches_merge_after_external_writer_releases() {
     let (w, p) = world(&["Bob"]).await;
+    sqlx::query("UPDATE user_settings SET timezone = 'Australia/Perth' WHERE user_id = 1")
+        .execute(&w.pool)
+        .await
+        .unwrap();
     let bob = p[1].1.clone();
     for _ in 0..8 {
         assert_eq!(

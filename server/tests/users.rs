@@ -488,6 +488,10 @@ mod scheduler_boundary {
     use chrono::{TimeZone, Utc};
 
     async fn two_owners_two_devices(pool: &SqlitePool) -> i64 {
+        sqlx::query("UPDATE user_settings SET timezone = 'Australia/Perth' WHERE user_id = 1")
+            .execute(pool)
+            .await
+            .unwrap();
         let sam = users::create(pool, "Sam", false).await.unwrap();
         sqlx::query("UPDATE user_settings SET timezone = 'Australia/Perth' WHERE user_id = ?")
             .bind(sam)
@@ -589,6 +593,10 @@ mod scheduler_boundary {
     #[tokio::test]
     async fn another_owners_completion_does_not_suppress_the_reminder() {
         let pool = db::connect_memory().await.unwrap();
+        sqlx::query("UPDATE user_settings SET timezone = 'Australia/Perth' WHERE user_id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
         let sam = users::create(&pool, "Sam", false).await.unwrap();
         sqlx::query("INSERT INTO items (user_id, id, kind, name, points, weekdays, remind_time, updated_at, seq) VALUES (1, 'shared', 'chore', 'ADMIN PRIVATE', 10, 127, '18:30', 1, 1)")
             .execute(&pool).await.unwrap();

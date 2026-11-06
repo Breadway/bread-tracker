@@ -95,6 +95,21 @@ Future<ProviderContainer> pump(
 
 void main() {
   testWidgets(
+    'settings reload after account revision without disposing the section',
+    (tester) async {
+      final server = FakeSettingsServer();
+      final container = await pump(tester, server);
+      expect(find.text('Server timezone: Australia/Perth'), findsOneWidget);
+      server.s['timezone'] = 'UTC';
+      server.s['utc_offset_minutes'] = 0;
+      container.read(storeProvider).claimPairingOwnership();
+      container.read(pairedStateRevisionProvider.notifier).refresh();
+      await tester.pumpAndSettle();
+      expect(find.text('Server timezone: UTC'), findsOneWidget);
+      expect(find.text('Server timezone: Australia/Perth'), findsNothing);
+    },
+  );
+  testWidgets(
     'shows the server values and the reminder switch writes through',
     (tester) async {
       final server = FakeSettingsServer();

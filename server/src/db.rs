@@ -160,7 +160,7 @@ fn is_sqlite_busy(err: &anyhow::Error) -> bool {
     })
 }
 
-fn is_busy_database_error(err: &sqlx::Error) -> bool {
+pub(crate) fn is_busy_database_error(err: &sqlx::Error) -> bool {
     match err {
         sqlx::Error::Database(db) => db
             .code()

@@ -1,6 +1,7 @@
 //! Sync storage: last-write-wins upserts with a server-assigned change counter.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use sqlx::SqliteConnection;
 
@@ -81,6 +82,27 @@ impl UserDb {
     }
 
     pub async fn apply_push_limited(
+        &self,
+        items: &[Item],
+        completions: &[Completion],
+        limits: &crate::config::Limits,
+    ) -> Result<(), PushError> {
+        // BEGIN IMMEDIATE serializes admission across processes, so normal contention
+        // waits instead of upgrading a read snapshot. If SQLite still reports BUSY after
+        // its busy timeout, retry the whole rolled-back transaction once rather than
+        // surfacing an internal error. A retry starts from scratch: neither the counts nor
+        // any upsert from the failed attempt can leak into it.
+        match self.try_apply_push(items, completions, limits).await {
+            Err(PushError::Db(err)) if crate::db::is_busy_database_error(&err) => {
+                tracing::warn!(error = %err, "sync transaction is busy; retrying once");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                self.try_apply_push(items, completions, limits).await
+            }
+            result => result,
+        }
+    }
+
+    async fn try_apply_push(
         &self,
         items: &[Item],
         completions: &[Completion],

@@ -95,6 +95,13 @@ async fn tokens(pool: &SqlitePool) -> Vec<(i64, Option<String>)> {
         .unwrap()
 }
 
+async fn codes(pool: &SqlitePool) -> Vec<String> {
+    sqlx::query_scalar("SELECT code_hash FROM pairing_codes ORDER BY code_hash")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
 async fn set(w: &World, token: &str, fcm: &str) -> StatusCode {
     call(
         &w.app,
@@ -197,6 +204,38 @@ async fn a_caller_removed_after_authentication_cannot_take_a_token_and_clears_no
         vec![(1, Some("alice-fcm".into()))],
         "Alice kept her token"
     );
+}
+
+#[tokio::test]
+async fn a_device_revoked_while_a_pair_code_request_waits_gets_401_and_creates_no_code() {
+    // The request authenticates, blocks on the writer, and its device is revoked and committed
+    // before it can issue. It must not return a redeemable code for a device that is gone.
+    let (w, p) = world(&[]).await;
+    let token = p[0].1.clone();
+    let before = codes(&w.pool).await;
+
+    let mut holder = w.pool.acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let app = w.app.clone();
+    let request =
+        tokio::spawn(async move { call(&app, "POST", "/pair-code", Some(&token), None).await.0 });
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(
+        !request.is_finished(),
+        "the handler is blocked on the write lock"
+    );
+    sqlx::query("DELETE FROM devices WHERE user_id = 1")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    sqlx::query("COMMIT").execute(&mut *holder).await.unwrap();
+    drop(holder);
+
+    assert_eq!(request.await.unwrap(), StatusCode::UNAUTHORIZED);
+    assert_eq!(codes(&w.pool).await, before, "no code was added or pruned");
 }
 
 #[tokio::test]

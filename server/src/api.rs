@@ -230,8 +230,9 @@ struct PairCodeResp {
 /// It is bound to the caller's user id, taken from their token, never from the request.
 async fn new_pair_code(
     State(st): State<AppState>,
-    Extension(UserId(uid)): Extension<UserId>,
+    Extension(caller): Extension<auth::CallerIdentity>,
 ) -> ApiResult<Json<PairCodeResp>> {
+    let uid = caller.user_id;
     let devices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE user_id = ?")
         .bind(uid)
         .fetch_one(&st.db)
@@ -242,7 +243,9 @@ async fn new_pair_code(
             st.config.limits.max_devices
         )));
     }
-    let code = auth::create_pairing_code_limited(&st.db, uid).await?;
+    let code = auth::create_pairing_code_limited(&st.db, &caller)
+        .await?
+        .ok_or(ApiError::Unauthorized)?;
     tracing::info!(user = uid, "pairing code issued");
     Ok(Json(PairCodeResp {
         code,

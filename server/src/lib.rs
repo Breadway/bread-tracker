@@ -4,10 +4,12 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod devices;
 pub mod error;
 pub mod model;
 pub mod push;
 pub mod store;
+pub mod users;
 pub mod xp;
 
 use std::sync::Arc;

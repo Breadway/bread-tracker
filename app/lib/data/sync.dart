@@ -18,19 +18,38 @@ class SyncEngine {
   SyncEngine(
     this.db,
     this.store, {
-    Api Function(String base, String? token)? apiFactory,
+    Api Function(String base, String token)? apiFactory,
   }) : _apiFactory = apiFactory ?? ((b, t) => Api(b, token: t));
   final AppDb db;
   final Store store;
-  final Api Function(String, String?) _apiFactory;
+  final Api Function(String, String) _apiFactory;
   bool _running = false;
   bool _again = false;
+  int _generation = 0;
+  bool _invalidated = false;
+  String? _token;
+  String? _server;
+
+  void invalidate() {
+    _generation++;
+    _invalidated = true;
+    _again = false;
+  }
+
+  void revalidate() {
+    _generation++;
+    _invalidated = false;
+  }
+
+  /// Close new sync admission while sign-out owns local cleanup.
+  void beginSignOut() => invalidate();
 
   /// Push dirty rows, pull everything newer than the cursor. Safe to call often;
   /// overlapping calls collapse into one follow-up pass.
   Future<SyncStatus> sync() async {
+    if (_invalidated) return SyncStatus.unpaired;
     if (_running) {
-      _again = true;
+      if (!_invalidated) _again = true;
       return SyncStatus.syncing;
     }
     _running = true;
@@ -43,13 +62,26 @@ class SyncEngine {
       return status;
     } finally {
       _running = false;
+      if (_invalidated) _again = false;
     }
   }
 
   Future<SyncStatus> _once() async {
-    final token = await store.token;
+    if (_invalidated) return SyncStatus.unpaired;
+    final storeGeneration = store.authGeneration;
+    final token = await store.readTokenForGeneration(storeGeneration);
+    if (_invalidated || store.authGeneration != storeGeneration) {
+      return SyncStatus.unpaired;
+    }
     if (token == null) return SyncStatus.unpaired;
-    final api = _apiFactory(store.serverUrl, token);
+    if (_token != null && (_token != token || _server != store.serverUrl)) {
+      _generation++;
+    }
+    _token = token;
+    final generation = _generation;
+    final server = store.serverUrl;
+    _server = server;
+    final api = _apiFactory(server, token);
 
     final requestEpoch = store.epoch;
     Map<String, dynamic> preflight;
@@ -61,122 +93,96 @@ class SyncEngine {
         epoch: requestEpoch,
       );
     } on AuthLost {
-      return SyncStatus.unpaired;
+      return _authLost(token, storeGeneration, generation, server);
     } on ApiException {
       return SyncStatus.offline;
     }
+    if (!_isCurrent(generation, storeGeneration, server)) {
+      return SyncStatus.unpaired;
+    }
     final serverEpoch = preflight['epoch'] as String?;
+
     if (serverEpoch != null &&
         requestEpoch != null &&
         serverEpoch != requestEpoch) {
-      // Keep the two-part exchange consistent with the protocol: commit the full
-      // snapshot first, retain dirty local winners, then retry uploads under the new
-      // generation. Never clear sync metadata before the snapshot is committed.
-      return _reuploadAfterRestore(preflight, serverEpoch);
-    }
-    if (serverEpoch != null && requestEpoch == null) {
-      // An upgraded install may already have a non-zero legacy cursor but has never
-      // recorded the generation it belongs to. Reconcile it as a full exchange once:
-      // this recovers phone rows after a pre-upgrade restore and pulls the whole server
-      // snapshot before accepting the new generation as the cursor's owner.
-      if (store.cursor > 0) {
-        await db.transaction(() async {
-          for (final row
-              in (preflight['items'] as List).cast<Map<String, dynamic>>()) {
-            await db.upsertItemIfNewer(_itemCompanion(row));
-          }
-          for (final row
-              in (preflight['completions'] as List)
-                  .cast<Map<String, dynamic>>()) {
-            await db.upsertCompletionIfNewer(_compCompanion(row));
-          }
-          await db.markAllDirty();
-        });
-        await store.setCursor(0);
-      }
-    }
-
-    final dirtyItems = await (db.select(
-      db.items,
-    )..where((t) => t.dirty.equals(true))).get();
-    final dirtyComps = await (db.select(
-      db.completions,
-    )..where((t) => t.dirty.equals(true))).get();
-
-    final Map<String, dynamic> res;
-    try {
-      res = await api.sync(
-        store.cursor,
-        [for (final i in dirtyItems) _itemJson(i)],
-        [for (final c in dirtyComps) _compJson(c)],
-        epoch: store.epoch,
+      // A restored or rebuilt server. Apply the complete snapshot with plain LWW first
+      // (dirty is not a freshness indicator: a synced phone row can be newer than a
+      // restored backup), then offer every local row again under the new generation.
+      // The new epoch is committed only after the last upload succeeds.
+      return _reuploadAfterRestore(
+        preflight,
+        serverEpoch,
+        token: token,
+        generation: generation,
+        storeGeneration: storeGeneration,
+        server: server,
       );
-    } on AuthLost {
-      return SyncStatus.unpaired;
-    } on ApiException {
-      return SyncStatus.offline;
+    }
+    if (serverEpoch != null && requestEpoch == null && store.cursor > 0) {
+      // An upgraded install has a cursor from a server it never recorded an epoch for.
+      // Reconcile it once as a full exchange: pull the whole snapshot before accepting
+      // the new generation as the owner of the cursor.
+      if (!await _applySnapshot(preflight, storeGeneration, generation, server)) {
+        return SyncStatus.unpaired;
+      }
+      // This install never recorded a generation, so its clean rows may never have been
+      // offered to this server. Reoffer all of them, as re-pairing does.
+      await db.markAllDirty();
+      if (!await store.resetSyncIfGeneration(
+        storeGeneration,
+        expectedServer: server,
+      )) {
+        return SyncStatus.unpaired;
+      }
     }
 
-    final epoch = res['epoch'] as String?;
-    if (epoch != null && epoch != store.epoch) {
-      return _reuploadAfterRestore(res, epoch);
-    }
-    if (epoch != null && requestEpoch == null) {
-      await store.setEpoch(epoch);
-    }
-    await db.transaction(() async {
-      // Rows unchanged since we pushed them are now clean.
-      for (final i in dirtyItems) {
-        await (db.update(db.items)..where(
-              (t) => t.id.equals(i.id) & t.updatedAt.equals(i.updatedAt),
-            ))
-            .write(const ItemsCompanion(dirty: Value(false)));
-      }
-      for (final c in dirtyComps) {
-        await (db.update(db.completions)..where(
-              (t) =>
-                  t.itemId.equals(c.itemId) &
-                  t.date.equals(c.date) &
-                  t.updatedAt.equals(c.updatedAt),
-            ))
-            .write(const CompletionsCompanion(dirty: Value(false)));
-      }
-      for (final j in (res['items'] as List).cast<Map<String, dynamic>>()) {
-        final local = await (db.select(
-          db.items,
-        )..where((t) => t.id.equals(j['id']))).getSingleOrNull();
-        if (local != null &&
-            local.dirty &&
-            local.updatedAt > (j['updated_at'] as int)) {
-          continue;
-        }
-        await db.upsertItem(_itemCompanion(j));
-      }
-      for (final j
-          in (res['completions'] as List).cast<Map<String, dynamic>>()) {
-        final local =
-            await (db.select(db.completions)..where(
-                  (t) =>
-                      t.itemId.equals(j['item_id']) & t.date.equals(j['date']),
-                ))
-                .getSingleOrNull();
-        if (local != null &&
-            local.dirty &&
-            local.updatedAt > (j['updated_at'] as int)) {
-          continue;
-        }
-        await db.into(db.completions).insertOnConflictUpdate(_compCompanion(j));
-      }
-    });
-    await store.setCursor(res['cursor'] as int);
-    return SyncStatus.idle;
+    return _pushDirtyBatches(
+      epoch: serverEpoch,
+      startCursor: store.cursor,
+      token: token,
+      generation: generation,
+      storeGeneration: storeGeneration,
+      server: server,
+    );
   }
 
-  Future<SyncStatus> _reuploadAfterRestore(
-    Map<String, dynamic> snapshot,
-    String epoch,
+  Future<SyncStatus> _authLost(
+    String token,
+    int storeGeneration,
+    int generation,
+    String server,
   ) async {
-    final winners = await db.transaction(() async {
+    // The server no longer knows this token (device revoked). Forget it instead of
+    // retrying a dead credential forever; local data is kept for the next pairing.
+    if (generation == _generation &&
+        !_invalidated &&
+        await store.clearTokenIfCurrentForGeneration(
+          token,
+          storeGeneration,
+          expectedServer: server,
+        )) {
+      _invalidated = true;
+      _generation++;
+    }
+    return SyncStatus.unpaired;
+  }
+
+  bool _isCurrent(int generation, int storeGeneration, String server) =>
+      generation == _generation &&
+      !_invalidated &&
+      store.authGeneration == storeGeneration &&
+      store.serverUrl == server;
+
+  /// Apply a remote snapshot row by row, keeping whichever copy has the newer
+  /// `updated_at` regardless of its dirty flag.
+  Future<bool> _applySnapshot(
+    Map<String, dynamic> snapshot,
+    int storeGeneration,
+    int generation,
+    String server,
+  ) async {
+    if (!_isCurrent(generation, storeGeneration, server)) return false;
+    await db.transaction(() async {
       for (final row
           in (snapshot['items'] as List).cast<Map<String, dynamic>>()) {
         await db.upsertItemIfNewer(_itemCompanion(row));
@@ -185,156 +191,217 @@ class SyncEngine {
           in (snapshot['completions'] as List).cast<Map<String, dynamic>>()) {
         await db.upsertCompletionIfNewer(_compCompanion(row));
       }
-      await db.markAllDirty();
-      await store.setCursor(0);
-      await store.setEpoch(epoch);
-      return (
-        await (db.select(db.items)..where((r) => r.dirty.equals(true))).get(),
-        await (db.select(
-          db.completions,
-        )..where((r) => r.dirty.equals(true))).get(),
-      );
     });
-    return _sendRestoreWinners(winners.$1, winners.$2, epoch);
+    return _isCurrent(generation, storeGeneration, server);
   }
 
-  Future<SyncStatus> _sendRestoreWinners(
-    List<ItemRow> items,
-    List<CompletionRow> completions,
-    String epoch,
-  ) async {
-    final token = await store.token;
-    if (token == null) return SyncStatus.unpaired;
-    final api = _apiFactory(store.serverUrl, token);
-    var cursor = 0;
-    var sentBatch = false;
-    for (final batch in _restoreBatches(items, completions)) {
-      sentBatch = true;
-      final Map<String, dynamic> response;
+  Future<SyncStatus> _reuploadAfterRestore(
+    Map<String, dynamic> snapshot,
+    String epoch, {
+    required String token,
+    required int generation,
+    required int storeGeneration,
+    required String server,
+  }) async {
+    if (!await _applySnapshot(snapshot, storeGeneration, generation, server)) {
+      return SyncStatus.unpaired;
+    }
+    if (!_isCurrent(generation, storeGeneration, server)) {
+      return SyncStatus.unpaired;
+    }
+    await db.markAllDirty();
+    if (!await store.resetSyncIfGeneration(
+      storeGeneration,
+      expectedServer: server,
+    )) {
+      return SyncStatus.unpaired;
+    }
+    return _pushDirtyBatches(
+      epoch: epoch,
+      startCursor: 0,
+      token: token,
+      generation: generation,
+      storeGeneration: storeGeneration,
+      server: server,
+    );
+  }
+
+  /// Send every dirty row in bounded batches and apply each response. The server
+  /// enforces the same batch cap as the normal route, so a large history, a re-pair or
+  /// a restore retried after a transient failure must never go out as one POST.
+  ///
+  /// `epoch` is committed only after every batch has succeeded. A failure therefore
+  /// leaves the old (or missing) epoch in place, so the next sync repeats preflight
+  /// detection and resumes with the rows that are still dirty.
+  Future<SyncStatus> _pushDirtyBatches({
+    required String? epoch,
+    required int startCursor,
+    required String token,
+    required int generation,
+    required int storeGeneration,
+    required String server,
+  }) async {
+    final dirtyItems = await (db.select(
+      db.items,
+    )..where((t) => t.dirty.equals(true))).get();
+    final dirtyComps = await (db.select(
+      db.completions,
+    )..where((t) => t.dirty.equals(true))).get();
+    final api = _apiFactory(server, token);
+    var cursor = startCursor;
+    String? responseEpoch;
+
+    for (final batch in _exchangeBatches(dirtyItems, dirtyComps, epoch)) {
+      final Map<String, dynamic> res;
       try {
-        response = await api.sync(
+        res = await api.sync(
           cursor,
           [for (final row in batch.items) _itemJson(row)],
           [for (final row in batch.completions) _compJson(row)],
           epoch: epoch,
         );
       } on AuthLost {
-        return SyncStatus.unpaired;
+        return _authLost(token, storeGeneration, generation, server);
       } on ApiException {
         return SyncStatus.offline;
       }
-      final responseEpoch = response['epoch'] as String?;
-      if (responseEpoch != null && responseEpoch != epoch) {
+      if (!_isCurrent(generation, storeGeneration, server)) {
+        return SyncStatus.unpaired;
+      }
+      responseEpoch = res['epoch'] as String?;
+      if (epoch != null &&
+          responseEpoch != null &&
+          responseEpoch != epoch) {
+        // A second restore landed during this exchange. Restart from preflight.
         return SyncStatus.offline;
       }
       await db.transaction(() async {
-        for (final row in batch.items) {
+        // Rows unchanged since we pushed them are now clean.
+        for (final i in batch.items) {
           await (db.update(db.items)..where(
-                (r) => r.id.equals(row.id) & r.updatedAt.equals(row.updatedAt),
+                (t) => t.id.equals(i.id) & t.updatedAt.equals(i.updatedAt),
               ))
               .write(const ItemsCompanion(dirty: Value(false)));
         }
-        for (final row in batch.completions) {
+        for (final c in batch.completions) {
           await (db.update(db.completions)..where(
-                (r) =>
-                    r.itemId.equals(row.itemId) &
-                    r.date.equals(row.date) &
-                    r.updatedAt.equals(row.updatedAt),
+                (t) =>
+                    t.itemId.equals(c.itemId) &
+                    t.date.equals(c.date) &
+                    t.updatedAt.equals(c.updatedAt),
               ))
               .write(const CompletionsCompanion(dirty: Value(false)));
         }
-        for (final row
-            in (response['items'] as List).cast<Map<String, dynamic>>()) {
+        // LWW regardless of dirty: an already-synced local row can be newer than a
+        // restored backup, and a newer remote row must win over a clean local one.
+        for (final j in (res['items'] as List).cast<Map<String, dynamic>>()) {
           final local = await (db.select(
             db.items,
-          )..where((r) => r.id.equals(row['id']))).getSingleOrNull();
-          if (local == null || local.updatedAt <= (row['updated_at'] as int)) {
-            await db.upsertItem(_itemCompanion(row));
+          )..where((t) => t.id.equals(j['id']))).getSingleOrNull();
+          if (local != null && local.updatedAt > (j['updated_at'] as int)) {
+            continue;
           }
+          await db.upsertItem(_itemCompanion(j));
         }
-        for (final row
-            in (response['completions'] as List).cast<Map<String, dynamic>>()) {
+        for (final j
+            in (res['completions'] as List).cast<Map<String, dynamic>>()) {
           final local =
               await (db.select(db.completions)..where(
-                    (r) =>
-                        r.itemId.equals(row['item_id']) &
-                        r.date.equals(row['date']),
+                    (t) =>
+                        t.itemId.equals(j['item_id']) & t.date.equals(j['date']),
                   ))
                   .getSingleOrNull();
-          if (local == null || local.updatedAt <= (row['updated_at'] as int)) {
-            await db
-                .into(db.completions)
-                .insertOnConflictUpdate(_compCompanion(row));
+          if (local != null && local.updatedAt > (j['updated_at'] as int)) {
+            continue;
           }
+          await db
+              .into(db.completions)
+              .insertOnConflictUpdate(_compCompanion(j));
         }
       });
-      cursor = response['cursor'] as int;
-      await store.setCursor(cursor);
+      cursor = res['cursor'] as int;
+      if (!await store.setCursorIfGeneration(
+        cursor,
+        storeGeneration,
+        expectedServer: server,
+      )) {
+        return SyncStatus.unpaired;
+      }
+      if (!_isCurrent(generation, storeGeneration, server)) {
+        return SyncStatus.unpaired;
+      }
     }
-    if (!sentBatch) {
-      await store.setCursor(0);
+
+    // Commit the generation only after the whole exchange is durable on the server.
+    final committedEpoch = epoch ?? responseEpoch;
+    if (committedEpoch != null && committedEpoch != store.epoch) {
+      if (!await store.setEpochIfGeneration(
+        committedEpoch,
+        storeGeneration,
+        expectedServer: server,
+      )) {
+        return SyncStatus.unpaired;
+      }
+    }
+    if (!_isCurrent(generation, storeGeneration, server)) {
+      return SyncStatus.unpaired;
     }
     return SyncStatus.idle;
   }
 
-  Iterable<_RestoreBatch> _restoreBatches(
+  /// Split dirty rows into requests the server will accept. One empty batch is yielded
+  /// when there is nothing to push so the pull side still runs.
+  Iterable<_RestoreBatch> _exchangeBatches(
     List<ItemRow> items,
     List<CompletionRow> completions,
+    String? epoch,
   ) sync* {
     var batchItems = <ItemRow>[];
     var batchCompletions = <CompletionRow>[];
+    var yielded = false;
+
+    bool overLimit(ItemRow? nextItem, CompletionRow? nextCompletion) {
+      if (batchItems.length + batchCompletions.length + 1 > 5000) return true;
+      final size = utf8
+          .encode(
+            jsonEncode({
+              'since': 0,
+              'epoch': epoch,
+              'items': [
+                for (final value in batchItems) _itemJson(value),
+                if (nextItem != null) _itemJson(nextItem),
+              ],
+              'completions': [
+                for (final value in batchCompletions) _compJson(value),
+                if (nextCompletion != null) _compJson(nextCompletion),
+              ],
+            }),
+          )
+          .length;
+      return size > 1024 * 1024;
+    }
+
     for (final row in items) {
-      final candidate = [...batchItems, row];
-      if (batchItems.isNotEmpty &&
-          (candidate.length + batchCompletions.length > 5000 ||
-              utf8
-                      .encode(
-                        jsonEncode({
-                          'since': 0,
-                          'epoch': store.epoch,
-                          'items': [
-                            for (final value in candidate) _itemJson(value),
-                          ],
-                          'completions': [
-                            for (final value in batchCompletions)
-                              _compJson(value),
-                          ],
-                        }),
-                      )
-                      .length >
-                  1024 * 1024)) {
+      if ((batchItems.isNotEmpty || batchCompletions.isNotEmpty) &&
+          overLimit(row, null)) {
         yield _RestoreBatch(batchItems, batchCompletions);
+        yielded = true;
         batchItems = [];
         batchCompletions = [];
       }
       batchItems.add(row);
     }
     for (final row in completions) {
-      final candidate = [...batchCompletions, row];
-      if (batchItems.length + batchCompletions.length >= 5000 ||
-          (batchItems.isNotEmpty || batchCompletions.isNotEmpty) &&
-              utf8
-                      .encode(
-                        jsonEncode({
-                          'since': 0,
-                          'epoch': store.epoch,
-                          'items': [
-                            for (final value in batchItems) _itemJson(value),
-                          ],
-                          'completions': [
-                            for (final value in candidate) _compJson(value),
-                          ],
-                        }),
-                      )
-                      .length >
-                  1024 * 1024) {
+      if ((batchItems.isNotEmpty || batchCompletions.isNotEmpty) &&
+          overLimit(null, row)) {
         yield _RestoreBatch(batchItems, batchCompletions);
+        yielded = true;
         batchItems = [];
         batchCompletions = [];
       }
       batchCompletions.add(row);
     }
-    if (batchItems.isNotEmpty || batchCompletions.isNotEmpty) {
+    if (batchItems.isNotEmpty || batchCompletions.isNotEmpty || !yielded) {
       yield _RestoreBatch(batchItems, batchCompletions);
     }
   }

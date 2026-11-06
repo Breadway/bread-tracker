@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:io';
+
 import 'package:drift/drift.dart' show Value, driftRuntimeOptions;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -11,7 +14,12 @@ import 'package:tracker/data/sync.dart';
 
 /// A tiny in-memory stand-in for the server's last-write-wins sync.
 class FakeServer {
+  Completer<void>? requestStarted;
+  Completer<void>? releaseAuthLost;
   int seq = 0;
+  int uploadAttempts = 0;
+  int? failUploadAt;
+  static const int rowCap = 5000;
   final items = <String, Map<String, dynamic>>{};
   final comps = <String, Map<String, dynamic>>{};
   bool reject = false;
@@ -41,6 +49,17 @@ class FakeServer {
     outgoingCompletionCounts.add(pc.length);
     if (down) throw ApiException('Cannot reach the server');
     if (reject) throw AuthLost();
+    if (pi.length + pc.length > rowCap) {
+      throw ApiException('batch too large (max $rowCap rows)');
+    }
+    if (pi.isNotEmpty || pc.isNotEmpty) {
+      if (failUploadAt != null && uploadAttempts == failUploadAt) {
+        uploadAttempts++;
+        failUploadAt = null;
+        throw ApiException('temporary upload failure');
+      }
+      uploadAttempts++;
+    }
     if (!supportsEpoch) {
       for (final i in pi) {
         final old = items[i['id']];
@@ -63,6 +82,9 @@ class FakeServer {
       };
     }
     if (clientEpoch != null && clientEpoch != epoch) {
+      if (pi.isNotEmpty || pc.isNotEmpty) {
+        throw ApiException('sync generation changed');
+      }
       return {
         'cursor': seq,
         'epoch': epoch,
@@ -102,6 +124,11 @@ class FakeApi extends Api {
     List<Map<String, dynamic>> completions, {
     String? epoch,
   }) async {
+    if (server.releaseAuthLost != null) {
+      server.requestStarted!.complete();
+      await server.releaseAuthLost!.future;
+      throw AuthLost();
+    }
     if (!server.supportsEpoch) {
       return server.sync(since, items, completions);
     }
@@ -128,6 +155,17 @@ class MemStore extends Store {
   Future<void> saveToken(String t) async => _t = t;
   @override
   Future<void> clearToken() async => _t = null;
+  @override
+  Future<bool> clearTokenIfCurrentForGeneration(
+    String expected,
+    int expectedGeneration, {
+    String? expectedServer,
+  }) async {
+    if (_t != expected) return false;
+    _t = null;
+    return true;
+  }
+
   Future<void> seedEpoch(String value) => super.prefs.setString('epoch', value);
 }
 
@@ -231,7 +269,7 @@ void main() {
 
   test('offline keeps rows dirty; auth loss reports unpaired', () async {
     final server = FakeServer()..down = true;
-    final (db, sync, _) = await device(server);
+    final (db, sync, store) = await device(server);
     await db.upsertItem(
       ItemsCompanion.insert(
         id: id1,
@@ -252,8 +290,16 @@ void main() {
       ..down = false
       ..reject = true;
     expect(await sync.sync(), SyncStatus.unpaired);
+    expect(
+      await store.token,
+      isNull,
+      reason: 'a revoked token is forgotten, not retried forever',
+    );
+    expect(await sync.sync(), SyncStatus.unpaired, reason: 'nothing left to send');
 
     server.reject = false;
+    await store.saveToken('new');
+    sync.revalidate();
     expect(await sync.sync(), SyncStatus.idle);
     expect(
       await (db.select(db.items)..where((t) => t.dirty.equals(true))).get(),
@@ -532,35 +578,97 @@ void main() {
     expect(server.outgoingItemCounts.last, 1);
   });
 
-  test('restore reupload chunks data below the server row cap', () async {
+  test('an interrupted restore resumes in bounded batches after a restart', () async {
     final server = FakeServer();
-    final (db, sync, _) = await device(server);
-    for (var i = 0; i < 5001; i++) {
-      final id = '00000000-0000-4000-8000-${i.toString().padLeft(12, '0')}';
-      await db.upsertItem(
-        ItemsCompanion.insert(
-          id: id,
-          kind: 'chore',
-          name: 'bulk-$i',
-          points: 1,
-          updatedAt: i + 1,
-          dirty: const Value(true),
-        ),
-      );
-    }
-    expect(await sync.sync(), SyncStatus.idle);
-    final before = server.seq;
-    server.epoch = 'bulk-restore';
+    final (db, sync, store) = await device(server);
+    await db.batch((batch) {
+      for (var i = 0; i < 5001; i++) {
+        batch.insert(
+          db.items,
+          ItemsCompanion.insert(
+            id: '00000000-0000-4000-8000-${i.toString().padLeft(12, '0')}',
+            kind: 'chore',
+            name: 'bulk-$i',
+            points: 1,
+            updatedAt: i + 1,
+            dirty: const Value(true),
+          ),
+        );
+      }
+    });
     expect(await sync.sync(), SyncStatus.idle);
     expect(server.items.length, 5001);
-    expect(server.seq, before);
+    expect(store.epoch, server.epoch);
+    final cursorBeforeRestore = store.cursor;
+
+    // Rebuilt server: empty database, new generation, counter back at zero.
+    server.rebuild('bulk-restore');
+    // The first upload after the snapshot fails transiently (batch one of two).
+    server
+      ..uploadAttempts = 0
+      ..failUploadAt = 0;
+
+    expect(await sync.sync(), SyncStatus.offline);
     expect(
-      server.outgoingItemCounts
-          .where((n) => n > 0)
-          .skip(2)
-          .every((n) => n <= 5000),
-      isTrue,
+      store.epoch,
+      isNot('bulk-restore'),
+      reason: 'the new generation must not be committed before every batch succeeds',
     );
+    expect(
+      server.items,
+      isEmpty,
+      reason: 'the failed batch wrote nothing and later batches were not sent',
+    );
+    expect(
+      await (db.select(db.items)..where((t) => t.dirty.equals(true))).get(),
+      hasLength(5001),
+      reason: 'every row stays dirty for the retry',
+    );
+
+    // A fresh engine over the same database and preferences is a process restart.
+    final restarted = SyncEngine(db, store, apiFactory: (_, _) => FakeApi(server));
+    expect(await restarted.sync(), SyncStatus.idle);
+    expect(server.items.length, 5001, reason: 'all rows recovered');
+    expect(store.epoch, 'bulk-restore');
+    expect(store.cursor, greaterThanOrEqualTo(cursorBeforeRestore));
+    expect(
+      server.outgoingItemCounts.where((n) => n > 0).every((n) => n <= 5000),
+      isTrue,
+      reason: 'no upload may exceed the server row cap',
+    );
+  });
+
+  test('a restore interrupted on the last batch still converges', () async {
+    final server = FakeServer();
+    final (db, sync, store) = await device(server);
+    await db.batch((batch) {
+      for (var i = 0; i < 5001; i++) {
+        batch.insert(
+          db.items,
+          ItemsCompanion.insert(
+            id: '10000000-0000-4000-8000-${i.toString().padLeft(12, '0')}',
+            kind: 'chore',
+            name: 'tail-$i',
+            points: 1,
+            updatedAt: i + 1,
+            dirty: const Value(true),
+          ),
+        );
+      }
+    });
+    expect(await sync.sync(), SyncStatus.idle);
+    server.rebuild('tail-restore');
+    server
+      ..uploadAttempts = 0
+      ..failUploadAt = 1;
+
+    expect(await sync.sync(), SyncStatus.offline);
+    expect(store.epoch, isNot('tail-restore'));
+    expect(server.items.length, 5000, reason: 'the first batch did commit');
+
+    expect(await sync.sync(), SyncStatus.idle);
+    expect(server.items.length, 5001);
+    expect(store.epoch, 'tail-restore');
   });
 
   test('new app falls back to a server response without generation', () async {
@@ -881,4 +989,105 @@ void main() {
     expect((await db.select(db.items).getSingle()).name, 'B');
     expect(server.items[id1]!['name'], 'B');
   });
+  test('delayed old 401 cannot clear a newly paired token', () async {
+    final server = FakeServer()
+      ..requestStarted = Completer<void>()
+      ..releaseAuthLost = Completer<void>();
+    final (db, sync, store) = await device(server);
+    final pending = sync.sync();
+    await server.requestStarted!.future;
+    sync.invalidate();
+    await store.saveToken('new-token');
+    sync.revalidate();
+    server.releaseAuthLost!.complete();
+    expect(await pending, SyncStatus.unpaired);
+    expect(await store.token, 'new-token');
+    await db.close();
+  });
+
+
+  test('default Api instances share one http client instead of opening one per call', () async {
+    final seen = <String>[];
+    final shared = MockClient((r) async {
+      seen.add('${r.method} ${r.url.path}');
+      return http.Response(
+        '{"cursor": 0, "items": [], "completions": [], "server_time": 0}',
+        200,
+      );
+    });
+    Api.sharedClient = shared;
+    addTearDown(() => Api.sharedClient = null);
+
+    // Two separately built Apis (different base/token) use the same client.
+    await Api('http://a', token: 't1').sync(0, [], []);
+    await Api('http://b', token: 't2').sync(0, [], []);
+    expect(seen, ['POST /sync', 'POST /sync']);
+
+    // A default SyncEngine builds an Api per pass; every pass still goes through it.
+    SharedPreferences.setMockInitialValues({});
+    final db = AppDb(NativeDatabase.memory());
+    final engine = SyncEngine(
+      db,
+      MemStore(await SharedPreferences.getInstance()),
+    );
+    for (var i = 0; i < 3; i++) {
+      expect(await engine.sync(), SyncStatus.idle);
+    }
+    expect(seen.length, 8);
+    await db.close();
+
+    // An injected client is used instead of the shared one.
+    var injectedCalls = 0;
+    final own = MockClient((r) async {
+      injectedCalls++;
+      return http.Response('{}', 200);
+    });
+    await Api('http://c', token: 't', client: own).sync(0, [], []);
+    expect(seen.length, 8);
+    expect(injectedCalls, 1);
+    own.close(); // Injected clients remain caller-owned.
+    await Api('http://a', token: 't1').sync(0, [], []);
+    expect(
+      seen.length,
+      9,
+      reason: 'closing injected client does not close shared client',
+    );
+  });
+
+
+  test('a real TCP connection is reused across Api instances and rotated credentials', () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    server.autoCompress = false;
+    final ports = <int>[];
+    final tokens = <String?>[];
+    final subscription = server.listen((request) async {
+      ports.add(request.connectionInfo!.remotePort);
+      tokens.add(request.headers.value(HttpHeaders.authorizationHeader));
+      request.response
+        ..headers.contentType = ContentType.json
+        ..write('{"cursor":0,"items":[],"completions":[],"server_time":0}');
+      await request.response.close();
+    });
+    Api.sharedClient = null;
+    final shared = Api.sharedClient;
+    addTearDown(() async {
+      shared.close();
+      Api.sharedClient = null;
+      await subscription.cancel();
+      await server.close(force: true);
+    });
+
+    final base = 'http://${server.address.address}:${server.port}';
+    await Api(base, token: 'old-token').sync(0, [], []);
+    await Api(base, token: 'rotated-token').sync(0, [], []);
+    expect(ports, hasLength(2));
+    expect(
+      ports.toSet(),
+      hasLength(1),
+      reason: 'default Apis reuse the TCP socket',
+    );
+    expect(tokens, ['Bearer old-token', 'Bearer rotated-token']);
+  });
+
+
 }

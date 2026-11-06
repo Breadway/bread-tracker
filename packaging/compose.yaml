@@ -21,6 +21,7 @@ services:
       - "${BREADTRACKER_BIND:-127.0.0.1:7290}:7290"
     environment:
       BREADTRACKER_FCM_SERVICE_ACCOUNT: ${BREADTRACKER_FCM_SERVICE_ACCOUNT:-}
+      BREADTRACKER_ADMIN_NAME: ${BREADTRACKER_ADMIN_NAME:-}
     volumes:
       - bread-tracker-data:/var/lib/bread-tracker
       # FCM service account, mounted read-only when BREADTRACKER_FCM_KEY_FILE is set.

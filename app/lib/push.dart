@@ -47,11 +47,13 @@ class FcmPushService implements PushService {
     this.store, {
     PushDevice? device,
     Api Function(String, String)? apiFactory,
+    this.onAuthLost,
   }) : _device = device ?? FirebasePushDevice(),
        _apiFactory = apiFactory ?? ((base, token) => Api(base, token: token));
   final Store store;
   final PushDevice _device;
   final Api Function(String, String) _apiFactory;
+  final void Function()? onAuthLost;
   @override
   final ValueNotifier<PushStatus> status = ValueNotifier(
     PushStatus.unavailable,
@@ -74,6 +76,9 @@ class FcmPushService implements PushService {
   }
 
   Future<void> _register(bool requestPermission) async {
+    String? requestToken;
+    late final int authGeneration;
+    late final String server;
     status.value = PushStatus.registering;
     try {
       if (!_ready) {
@@ -88,7 +93,10 @@ class FcmPushService implements PushService {
         status.value = PushStatus.denied;
         return;
       }
-      final token = await store.token;
+      authGeneration = store.authGeneration;
+      final token = await store.readTokenForGeneration(authGeneration);
+      if (store.authGeneration != authGeneration) return;
+      requestToken = token;
       if (token == null) {
         status.value = PushStatus.unpaired;
         return;
@@ -98,10 +106,24 @@ class FcmPushService implements PushService {
         status.value = PushStatus.failed;
         return;
       }
-      await _apiFactory(store.serverUrl, token).setFcmToken(fcm);
+      server = store.serverUrl;
+      await _apiFactory(server, token).setFcmToken(fcm);
+      if (store.authGeneration != authGeneration || store.serverUrl != server) {
+        return;
+      }
       status.value = PushStatus.ready;
     } on AuthLost {
+      if (requestToken == null ||
+          !await store.clearTokenIfCurrentForGeneration(
+            requestToken,
+            authGeneration,
+            expectedServer: server,
+          )) {
+        return;
+      }
       status.value = PushStatus.unpaired;
+      _ready = false;
+      onAuthLost?.call();
     } catch (_) {
       status.value = PushStatus.failed;
     }

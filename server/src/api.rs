@@ -13,18 +13,33 @@ use serde::{Deserialize, Serialize};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::auth::{self, DeviceId};
+use crate::auth::{self, DeviceId, UserId};
 use crate::error::{ApiError, ApiResult};
 use crate::model::{SyncRequest, SyncResponse};
 use crate::push::{Message, SendOutcome};
-use crate::{store, xp, AppState};
+use crate::store::{PushError, UserDb, UserSettings};
+use crate::{xp, AppState};
 
 const MAX_BATCH: usize = 5000;
+
+/// Revoke only the authenticated caller's device within its owner scope.
+async fn sign_out(
+    State(st): State<AppState>,
+    Extension(DeviceId(id)): Extension<DeviceId>,
+    Extension(UserId(user_id)): Extension<UserId>,
+) -> ApiResult<Json<serde_json::Value>> {
+    sqlx::query("DELETE FROM devices WHERE id = ? AND user_id = ?")
+        .bind(id)
+        .bind(user_id)
+        .execute(&st.db)
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
 
 pub fn router(state: AppState) -> Router {
     let authed = Router::new()
         .route("/sync", get(pull).post(sync))
-        .route("/device", put(set_device))
+        .route("/device", put(set_device).delete(sign_out))
         .route("/stats", get(stats))
         .route("/settings", get(get_settings).put(put_settings))
         .route("/push/test", post(push_test))
@@ -79,20 +94,18 @@ struct PullQuery {
 
 async fn pull(
     State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
     Query(q): Query<PullQuery>,
 ) -> ApiResult<Json<SyncResponse>> {
-    let generation = st.generation.read().unwrap().clone();
-    let mut result = store::pull(&st.db, q.since, Some(&generation)).await?;
-    if q.since > result.cursor {
-        result.items = store::all_items(&st.db).await?;
-        result.completions = store::all_completions(&st.db).await?;
-    }
-    Ok(Json(result))
+    let mut response = UserDb::new(&st.db, uid).pull(q.since).await?;
+    response.epoch = Some(st.generation.read().unwrap().clone());
+    Ok(Json(response))
 }
 
 /// Push local changes, then return everything changed since `since` (one round trip).
 async fn sync(
     State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
     Json(req): Json<SyncRequest>,
 ) -> ApiResult<Json<SyncResponse>> {
     if req.items.len() + req.completions.len() > MAX_BATCH {
@@ -103,21 +116,23 @@ async fn sync(
     for it in &req.items {
         it.validate().map_err(ApiError::BadRequest)?;
     }
+    let today = Utc::now().date_naive();
     for c in &req.completions {
-        c.validate().map_err(ApiError::BadRequest)?;
+        c.validate(today).map_err(ApiError::BadRequest)?;
     }
+    let user = UserDb::new(&st.db, uid);
     let generation = st.generation.read().unwrap().clone();
-    let before = store::pull(&st.db, req.since, Some(&generation)).await?;
-    // New clients send an empty sync as preflight. On a true generation mismatch,
-    // return a full read-only snapshot without accepting writes. Legacy clients omit epoch.
-    let client_epoch = req.epoch.as_deref();
-    // Databases created before generation support have no settings row. Return no wire field
-    // so clients can use the legacy protocol without mistaking an unknown epoch for a restore.
-    // A missing generation keeps the historical push-then-pull contract for old clients.
-    if client_epoch.is_some_and(|epoch| Some(epoch) != before.epoch.as_deref()) {
-        let mut full = before;
-        full.items = store::all_items(&st.db).await?;
-        full.completions = store::all_completions(&st.db).await?;
+    // New clients send an empty sync as preflight. On a true generation mismatch, return a
+    // full read-only snapshot in one transaction without accepting writes, so a restore is
+    // detected before any push can advance the sequence and mask it. Legacy clients omit the
+    // epoch and keep the historical push-then-pull contract.
+    if req
+        .epoch
+        .as_deref()
+        .is_some_and(|epoch| epoch != generation)
+    {
+        let mut full = user.pull(0).await?;
+        full.epoch = Some(generation);
         if req.items.is_empty() && req.completions.is_empty() {
             return Ok(Json(full));
         }
@@ -125,12 +140,22 @@ async fn sync(
             "sync generation changed; apply snapshot before retrying uploads".into(),
         ));
     }
-    store::apply_push(&st.db, &req.items, &req.completions).await?;
-    let mut response = store::pull(&st.db, req.since, Some(&generation)).await?;
-    if req.since > response.cursor {
-        response.items = store::all_items(&st.db).await?;
-        response.completions = store::all_completions(&st.db).await?;
+
+    // Completion references are validated against the caller's own items inside the write
+    // transaction (tombstoned items count, so an old offline client still syncs after another
+    // device deleted the item). An unknown reference, or one that only another user holds,
+    // rejects the whole batch with nothing written.
+    match user.apply_push(&req.items, &req.completions).await {
+        Ok(()) => {}
+        Err(PushError::UnknownItem) => {
+            return Err(ApiError::BadRequest(
+                "completion references an unknown item".into(),
+            ))
+        }
+        Err(PushError::Db(e)) => return Err(e.into()),
     }
+    let mut response = user.pull(req.since).await?;
+    response.epoch = Some(generation);
     Ok(Json(response))
 }
 
@@ -139,9 +164,17 @@ struct DeviceReq {
     fcm_token: Option<String>,
 }
 
+/// Register (or clear) the calling device's FCM token.
+///
+/// A token identifies one app install, so it belongs to exactly one device across all users:
+/// registering a token another device holds takes it over, and only that column of the previous
+/// holder is cleared. The caller recheck, the takeover and the assignment run in one write
+/// transaction, so a failure anywhere leaves both devices exactly as they were, and two
+/// concurrent registrations of the same token end with one holder.
 async fn set_device(
     State(st): State<AppState>,
     Extension(DeviceId(id)): Extension<DeviceId>,
+    Extension(UserId(uid)): Extension<UserId>,
     Json(req): Json<DeviceReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let token = req.fcm_token.filter(|t| !t.is_empty());
@@ -149,18 +182,45 @@ async fn set_device(
         if t.len() > 4096 {
             return Err(ApiError::BadRequest("fcm_token too long".into()));
         }
-        // A token belongs to one device; a reinstall re-pairs and takes it over.
-        sqlx::query("UPDATE devices SET fcm_token = NULL WHERE fcm_token = ? AND id != ?")
-            .bind(t)
-            .bind(&id)
-            .execute(&st.db)
-            .await?;
     }
-    sqlx::query("UPDATE devices SET fcm_token = ? WHERE id = ?")
+    let mut tx = st.db.begin_with("BEGIN IMMEDIATE").await?;
+    // The device authenticated a moment ago; it may have signed out or been revoked since.
+    // Recheck it still exists and still belongs to this user before touching anyone else.
+    // This early check is defence in depth: the `assigned != 1` check below also refuses and rolls
+    // the transaction back, so removing it is not observable (an equivalent mutation). It stops the
+    // takeover before any row is changed.
+    let caller: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM devices WHERE id = ? AND user_id = ?")
+            .bind(&id)
+            .bind(uid)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if caller.is_none() {
+        return Err(ApiError::Unauthorized);
+    }
+    if let Some(t) = &token {
+        let taken =
+            sqlx::query("UPDATE devices SET fcm_token = NULL WHERE fcm_token = ? AND id != ?")
+                .bind(t)
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        if taken > 0 {
+            tracing::info!(user = uid, device = %id, taken, "fcm token moved to this device");
+        }
+    }
+    let assigned = sqlx::query("UPDATE devices SET fcm_token = ? WHERE id = ? AND user_id = ?")
         .bind(&token)
         .bind(&id)
-        .execute(&st.db)
-        .await?;
+        .bind(uid)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if assigned != 1 {
+        return Err(ApiError::Unauthorized);
+    }
+    tx.commit().await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -169,22 +229,21 @@ struct StatsQuery {
     date: Option<String>,
 }
 
-async fn timezone(st: &AppState) -> ApiResult<Tz> {
-    Ok(Tz::from_str(&store::get_setting(&st.db, "timezone").await?)
-        .unwrap_or(chrono_tz::Australia::Perth))
-}
-
 async fn stats(
     State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
     Query(q): Query<StatsQuery>,
 ) -> ApiResult<Json<xp::Stats>> {
     let today = match q.date {
         Some(d) => NaiveDate::parse_from_str(&d, "%Y-%m-%d")
             .map_err(|_| ApiError::BadRequest("date must be YYYY-MM-DD".into()))?,
-        None => Utc::now().with_timezone(&timezone(&st).await?).date_naive(),
+        None => Utc::now()
+            .with_timezone(&UserDb::new(&st.db, uid).settings().await?.tz())
+            .date_naive(),
     };
-    let items = store::all_items(&st.db).await?;
-    let completions = store::all_completions(&st.db).await?;
+    let user = UserDb::new(&st.db, uid);
+    let items = user.all_items().await?;
+    let completions = user.all_completions().await?;
     Ok(Json(xp::compute(&items, &completions, today)))
 }
 
@@ -200,26 +259,27 @@ struct Settings {
     utc_offset_minutes: i64,
 }
 
-async fn load_settings(st: &AppState) -> ApiResult<Settings> {
-    let timezone = store::get_setting(&st.db, "timezone").await?;
-    let tz = Tz::from_str(&timezone).unwrap_or(chrono_tz::Australia::Perth);
-    let utc_offset_minutes = Utc::now()
-        .with_timezone(&tz)
-        .offset()
-        .fix()
-        .local_minus_utc() as i64
-        / 60;
-    Ok(Settings {
-        utc_offset_minutes,
-        timezone,
-        quiet_start: store::get_setting(&st.db, "quiet_start").await?,
-        quiet_end: store::get_setting(&st.db, "quiet_end").await?,
-        reminders_enabled: store::get_setting(&st.db, "reminders_enabled").await? == "1",
-    })
+fn settings_response(s: &UserSettings) -> Settings {
+    Settings {
+        timezone: s.timezone.clone(),
+        quiet_start: s.quiet_start.clone(),
+        quiet_end: s.quiet_end.clone(),
+        reminders_enabled: s.reminders_enabled,
+        utc_offset_minutes: Utc::now()
+            .with_timezone(&s.tz())
+            .offset()
+            .fix()
+            .local_minus_utc() as i64
+            / 60,
+    }
 }
-
-async fn get_settings(State(st): State<AppState>) -> ApiResult<Json<Settings>> {
-    Ok(Json(load_settings(&st).await?))
+async fn get_settings(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+) -> ApiResult<Json<Settings>> {
+    Ok(Json(settings_response(
+        &UserDb::new(&st.db, uid).settings().await?,
+    )))
 }
 
 #[derive(Deserialize)]
@@ -236,83 +296,67 @@ fn valid_time_or_empty(t: &str) -> bool {
 
 async fn put_settings(
     State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
     Json(p): Json<SettingsPatch>,
 ) -> ApiResult<Json<Settings>> {
-    // Validate the complete resulting object before mutating any settings.
+    // Acquire the writer reservation BEFORE reading: disjoint partial patches serialize and
+    // merge with the last committed values, rather than replacing each other's stale snapshot.
     let mut tx = st.db.begin_with("BEGIN IMMEDIATE").await?;
-    let current: HashMap<String, String> = sqlx::query_as("SELECT key, value FROM settings")
-        .fetch_all(&mut *tx)
-        .await?
-        .into_iter()
-        .collect();
-    let cur = Settings {
-        timezone: current
-            .get("timezone")
-            .cloned()
-            .unwrap_or_else(|| "Australia/Perth".into()),
-        quiet_start: current.get("quiet_start").cloned().unwrap_or_default(),
-        quiet_end: current.get("quiet_end").cloned().unwrap_or_default(),
-        reminders_enabled: current.get("reminders_enabled").is_none_or(|v| v == "1"),
-        // This value is read-only response metadata, not persisted settings.
-        utc_offset_minutes: 0,
-    };
-    let start = p.quiet_start.clone().unwrap_or(cur.quiet_start);
-    let end = p.quiet_end.clone().unwrap_or(cur.quiet_end);
-    if start.is_empty() != end.is_empty() {
+    let mut s: UserSettings = sqlx::query_as("SELECT timezone, quiet_start, quiet_end, reminders_enabled FROM user_settings WHERE user_id = ?")
+        .bind(uid).fetch_one(&mut *tx).await?;
+    if let Some(tz) = p.timezone {
+        Tz::from_str(&tz).map_err(|_| ApiError::BadRequest("unknown timezone".into()))?;
+        s.timezone = tz;
+    }
+    if let Some(v) = p.quiet_start {
+        s.quiet_start = v;
+    }
+    if let Some(v) = p.quiet_end {
+        s.quiet_end = v;
+    }
+    if s.quiet_start.is_empty() != s.quiet_end.is_empty() {
         return Err(ApiError::BadRequest(
             "quiet_start and quiet_end must both be set or both be empty".into(),
         ));
     }
-    if !valid_time_or_empty(&start) || !valid_time_or_empty(&end) {
+    if !valid_time_or_empty(&s.quiet_start) || !valid_time_or_empty(&s.quiet_end) {
         return Err(ApiError::BadRequest(
             "quiet hours must be HH:MM or empty".into(),
         ));
     }
-    if let Some(tz) = &p.timezone {
-        Tz::from_str(tz).map_err(|_| ApiError::BadRequest("unknown timezone".into()))?;
+    if let Some(v) = p.reminders_enabled {
+        s.reminders_enabled = v;
     }
-
-    if let Some(tz) = &p.timezone {
-        sqlx::query("INSERT INTO settings (key, value) VALUES ('timezone', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-            .bind(tz).execute(&mut *tx).await?;
-    }
-    if p.quiet_start.is_some() {
-        sqlx::query("INSERT INTO settings (key, value) VALUES ('quiet_start', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-            .bind(&start).execute(&mut *tx).await?;
-    }
-    if p.quiet_end.is_some() {
-        sqlx::query("INSERT INTO settings (key, value) VALUES ('quiet_end', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-            .bind(&end).execute(&mut *tx).await?;
-    }
-    if let Some(on) = p.reminders_enabled {
-        sqlx::query("INSERT INTO settings (key, value) VALUES ('reminders_enabled', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-            .bind(if on { "1" } else { "0" }).execute(&mut *tx).await?;
-    }
+    sqlx::query("UPDATE user_settings SET timezone = ?, quiet_start = ?, quiet_end = ?, reminders_enabled = ? WHERE user_id = ?")
+        .bind(&s.timezone).bind(&s.quiet_start).bind(&s.quiet_end).bind(s.reminders_enabled).bind(uid).execute(&mut *tx).await?;
     tx.commit().await?;
-    Ok(Json(load_settings(&st).await?))
+    Ok(Json(settings_response(&s)))
 }
 
 /// Send a test notification to the calling device.
 async fn push_test(
     State(st): State<AppState>,
     Extension(DeviceId(id)): Extension<DeviceId>,
+    Extension(UserId(uid)): Extension<UserId>,
 ) -> ApiResult<Json<serde_json::Value>> {
     if !st.push.enabled() {
         return Err(ApiError::BadRequest(
             "push is not configured on the server".into(),
         ));
     }
-    let token: Option<String> = sqlx::query_scalar("SELECT fcm_token FROM devices WHERE id = ?")
-        .bind(&id)
-        .fetch_one(&st.db)
-        .await?;
+    let token: Option<String> =
+        sqlx::query_scalar("SELECT fcm_token FROM devices WHERE id = ? AND user_id = ?")
+            .bind(&id)
+            .bind(uid)
+            .fetch_one(&st.db)
+            .await?;
     let Some(token) = token.filter(|t| !t.is_empty()) else {
         return Err(ApiError::BadRequest(
             "this device has no fcm token registered".into(),
         ));
     };
     let msg = Message {
-        token,
+        token: token.clone(),
         title: "Bread Tracker".into(),
         body: "Test notification".into(),
         data: HashMap::from([("kind".to_string(), "test".to_string())]),
@@ -320,10 +364,16 @@ async fn push_test(
     match st.push.send(&msg).await? {
         SendOutcome::Sent => Ok(Json(serde_json::json!({ "sent": true }))),
         SendOutcome::Unregistered => {
-            sqlx::query("UPDATE devices SET fcm_token = NULL WHERE id = ?")
-                .bind(&id)
-                .execute(&st.db)
-                .await?;
+            // Clear only the token that FCM just rejected. If the device registered a new one
+            // while the send was in flight, that newer token stays.
+            sqlx::query(
+                "UPDATE devices SET fcm_token = NULL WHERE id = ? AND user_id = ? AND fcm_token = ?",
+            )
+            .bind(&id)
+            .bind(uid)
+            .bind(&token)
+            .execute(&st.db)
+            .await?;
             Err(ApiError::BadRequest(
                 "fcm token is no longer valid; re-register".into(),
             ))

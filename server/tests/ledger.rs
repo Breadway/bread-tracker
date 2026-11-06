@@ -327,7 +327,7 @@ fn published_migration_files_keep_their_checksums() {
     assert_eq!(checksum_of(SQL_0004), SHA_0004);
     // Versions are unique and strictly increasing; nothing collides with 0004.
     let versions: Vec<i64> = m.migrations.iter().map(|x| x.version).collect();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
 }
 
 #[tokio::test]
@@ -339,7 +339,11 @@ async fn upgrade_from_0001_only() {
     let pool = db::connect_with_migrator(&url(&path), None, &embedded())
         .await
         .unwrap();
-    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 5, 6, 7, 8, 9], false);
+    assert_ledger(
+        &ledger(&pool).await,
+        &[1, 2, 3, 5, 6, 7, 8, 9, 10, 11],
+        false,
+    );
     assert_upgraded_and_intact(&pool).await;
 }
 
@@ -380,7 +384,11 @@ async fn upgrade_from_0001_and_0003_restores_the_hygiene_indexes_0002_dropped() 
     let pool = db::connect_with_migrator(&url(&path), None, &embedded())
         .await
         .unwrap();
-    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 5, 6, 7, 8, 9], false);
+    assert_ledger(
+        &ledger(&pool).await,
+        &[1, 2, 3, 5, 6, 7, 8, 9, 10, 11],
+        false,
+    );
     assert_upgraded_and_intact(&pool).await;
 }
 
@@ -393,7 +401,11 @@ async fn upgrade_from_0001_0003_and_0004() {
     let pool = db::connect_with_migrator(&url(&path), None, &combined())
         .await
         .unwrap();
-    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 4, 5, 6, 7, 8, 9], true);
+    assert_ledger(
+        &ledger(&pool).await,
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        true,
+    );
     assert_upgraded_and_intact(&pool).await;
     // 0004's table was not touched by the rebuild.
     assert_eq!(
@@ -410,7 +422,11 @@ async fn upgrade_from_0001_and_0004_without_0003() {
     let pool = db::connect_with_migrator(&url(&path), None, &combined())
         .await
         .unwrap();
-    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 4, 5, 6, 7, 8, 9], true);
+    assert_ledger(
+        &ledger(&pool).await,
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        true,
+    );
     assert_upgraded_and_intact(&pool).await;
 }
 
@@ -423,7 +439,11 @@ async fn upgrade_from_the_published_pr43_head_0001_and_0002() {
     let pool = db::connect_with_migrator(&url(&path), None, &embedded())
         .await
         .unwrap();
-    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 5, 6, 7, 8, 9], false);
+    assert_ledger(
+        &ledger(&pool).await,
+        &[1, 2, 3, 5, 6, 7, 8, 9, 10, 11],
+        false,
+    );
     assert_upgraded_and_intact(&pool).await;
 }
 
@@ -436,7 +456,11 @@ async fn upgrade_from_0001_0002_0003_in_that_order() {
     let pool = db::connect_with_migrator(&url(&path), None, &embedded())
         .await
         .unwrap();
-    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 5, 6, 7, 8, 9], false);
+    assert_ledger(
+        &ledger(&pool).await,
+        &[1, 2, 3, 5, 6, 7, 8, 9, 10, 11],
+        false,
+    );
     assert_upgraded_and_intact(&pool).await;
 }
 
@@ -447,7 +471,11 @@ async fn fresh_database_gets_the_whole_set_in_version_order() {
     let pool = db::connect_with_migrator(&url(&path), None, &combined())
         .await
         .unwrap();
-    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 4, 5, 6, 7, 8, 9], true);
+    assert_ledger(
+        &ledger(&pool).await,
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        true,
+    );
     let names = index_names(&pool).await;
     for idx in HYGIENE_INDEXES {
         assert!(names.contains(&idx.to_string()), "{idx}");
@@ -613,7 +641,11 @@ async fn a_failed_0002_rolls_back_completely_and_a_retry_succeeds() {
     let pool = db::connect_with_migrator(&url(&path), None, &combined())
         .await
         .unwrap();
-    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 4, 5, 6, 7, 8, 9], true);
+    assert_ledger(
+        &ledger(&pool).await,
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        true,
+    );
     assert_upgraded_and_intact(&pool).await;
 }
 
@@ -651,7 +683,11 @@ async fn a_failed_0005_keeps_the_0002_result_and_a_retry_completes_the_repair() 
     let pool = db::connect_with_migrator(&url(&path), None, &embedded())
         .await
         .unwrap();
-    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 5, 6, 7, 8, 9], false);
+    assert_ledger(
+        &ledger(&pool).await,
+        &[1, 2, 3, 5, 6, 7, 8, 9, 10, 11],
+        false,
+    );
     assert_upgraded_and_intact(&pool).await;
 }
 
@@ -740,11 +776,11 @@ async fn a_database_already_upgraded_by_6f9986e_receives_only_the_new_0006() {
             .unwrap();
         let after = ledger(&pool).await;
         // Every existing migration is untouched; guard/settings/invites/admission are additive.
-        assert_eq!(after.len(), before.len() + 4, "{name}");
+        assert_eq!(after.len(), before.len() + 6, "{name}");
         for row in &before {
             assert!(after.contains(row), "{name}: {row:?} changed");
         }
-        assert_eq!(after.last().unwrap().0, 9);
+        assert_eq!(after.last().unwrap().0, 11);
         assert_upgraded_and_intact(&pool).await;
     }
 }
@@ -774,7 +810,11 @@ async fn a_failed_0006_keeps_everything_before_it_and_a_retry_completes() {
     let pool = db::connect_with_migrator(&url(&path), None, &embedded())
         .await
         .unwrap();
-    assert_ledger(&ledger(&pool).await, &[1, 2, 3, 5, 6, 7, 8, 9], false);
+    assert_ledger(
+        &ledger(&pool).await,
+        &[1, 2, 3, 5, 6, 7, 8, 9, 10, 11],
+        false,
+    );
     assert_upgraded_and_intact(&pool).await;
 }
 
@@ -850,11 +890,11 @@ async fn already_published_upstream_0006_gets_only_settings0007_with_values_pres
     pool.close().await;
     let pool = db::connect(&url(&path)).await.unwrap();
     let after = ledger(&pool).await;
-    assert_eq!(after.len(), before.len() + 3);
+    assert_eq!(after.len(), before.len() + 5);
     for row in before {
         assert!(after.contains(&row));
     }
-    assert_eq!(after.last().unwrap().0, 9);
+    assert_eq!(after.last().unwrap().0, 11);
     assert_upgraded_and_intact(&pool).await;
     let second = bread_tracker_server::users::create(&pool, "New user", false)
         .await

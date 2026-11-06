@@ -9,8 +9,9 @@ class AuthLost implements Exception {
 }
 
 class ApiException implements Exception {
-  ApiException(this.message);
+  ApiException(this.message, {this.statusCode});
   final String message;
+  final int? statusCode;
   @override
   String toString() => message;
 }
@@ -136,6 +137,7 @@ class Api {
       throw ApiException(
         (parsed && decoded is Map ? decoded['error'] : null)?.toString() ??
             'Server error ${res.statusCode}',
+        statusCode: res.statusCode,
       );
     }
     if (!parsed || decoded is! Map) {

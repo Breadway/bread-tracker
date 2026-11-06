@@ -4,7 +4,7 @@ import 'api.dart';
 import 'database.dart';
 import 'store.dart';
 
-enum SyncStatus { idle, syncing, offline, unpaired }
+enum SyncStatus { idle, syncing, offline, unpaired, rejected }
 
 class SyncEngine {
   SyncEngine(
@@ -21,6 +21,7 @@ class SyncEngine {
   bool _invalidated = false;
   String? _token;
   String? _server;
+  String? rejectionMessage;
 
   void invalidate() {
     _generation++;
@@ -59,6 +60,7 @@ class SyncEngine {
   }
 
   Future<SyncStatus> _once() async {
+    rejectionMessage = null;
     if (_invalidated) return SyncStatus.unpaired;
     final storeGeneration = store.authGeneration;
     final token = await store.readTokenForGeneration(storeGeneration);
@@ -104,7 +106,13 @@ class SyncEngine {
         return SyncStatus.unpaired;
       }
       return SyncStatus.unpaired;
-    } on ApiException {
+    } on ApiException catch (error) {
+      if (error.statusCode != null &&
+          error.statusCode! >= 400 &&
+          error.statusCode! < 500) {
+        rejectionMessage = error.message;
+        return SyncStatus.rejected;
+      }
       return SyncStatus.offline;
     }
 

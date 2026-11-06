@@ -377,6 +377,11 @@ async fn scheduler_queries_use_indexes_and_keep_any_date_todo_completion() {
         "reminder selection should use the partial index, got {item_plan:?}"
     );
     for _ in 0..100 {
+        // This test measures scheduler query semantics, not request admission.
+        sqlx::query("DELETE FROM authenticated_rate_limits")
+            .execute(&h.state.db)
+            .await
+            .unwrap();
         let id = uuid::Uuid::new_v4().to_string();
         call(
             &h.app,
@@ -755,6 +760,164 @@ async fn push_test_route_needs_a_registered_token() {
     let (s, v) = call(&h.app, "POST", "/push/test", Some(&tok), None).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(h.mock.sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn failed_pair_attempts_from_one_source_do_not_block_another() {
+    let h = harness().await;
+    let bad = json!({"code": "AAAA-BBBB"});
+    for _ in 0..5 {
+        assert_eq!(
+            call_from(&h.app, "203.0.113.9:5000", None, "/pair", bad.clone()).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        call_from(&h.app, "203.0.113.9:5001", None, "/pair", bad.clone()).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    // A different source can still pair with a valid code.
+    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    let ok = call_from(
+        &h.app,
+        "198.51.100.7:4000",
+        None,
+        "/pair",
+        json!({"code": code}),
+    )
+    .await;
+    assert_eq!(ok, StatusCode::OK);
+
+    // The blocked source is refused even with a valid code until its window passes.
+    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    let blocked = call_from(
+        &h.app,
+        "203.0.113.9:5002",
+        None,
+        "/pair",
+        json!({"code": code}),
+    )
+    .await;
+    assert_eq!(blocked, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn successful_pairings_do_not_count_against_the_limit() {
+    let h = harness().await;
+    for _ in 0..8 {
+        let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+        let s = call_from(
+            &h.app,
+            "203.0.113.9:5000",
+            None,
+            "/pair",
+            json!({"code": code}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn forwarded_for_is_only_believed_from_a_trusted_proxy() {
+    use bread_tracker_server::public_auth::TrustedProxy;
+    let bad = json!({"code": "AAAA-BBBB"});
+
+    // Untrusted peer: it cannot dodge the limit by rotating X-Forwarded-For.
+    let h = harness().await;
+    for i in 0..5 {
+        let xff = format!("10.9.9.{i}");
+        call_from(&h.app, "203.0.113.9:5000", Some(&xff), "/pair", bad.clone()).await;
+    }
+    assert_eq!(
+        call_from(
+            &h.app,
+            "203.0.113.9:5000",
+            Some("10.9.9.99"),
+            "/pair",
+            bad.clone()
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    // Trusted proxy (100.64.0.0/10): the client in X-Forwarded-For is the key.
+    let db = db::connect_memory().await.unwrap();
+    let mut config = Config::from_env();
+    config.trusted_proxies = vec![TrustedProxy::parse("100.64.0.0/10").unwrap()];
+    let state = AppState::new(db, config, Arc::new(MockSender::default()));
+    let app = api::router(state.clone());
+    for _ in 0..5 {
+        call_from(
+            &app,
+            "100.100.1.1:4000",
+            Some("203.0.113.50"),
+            "/pair",
+            bad.clone(),
+        )
+        .await;
+    }
+    assert_eq!(
+        call_from(
+            &app,
+            "100.100.1.1:4000",
+            Some("203.0.113.50"),
+            "/pair",
+            bad.clone()
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let code = auth::create_pairing_code(&state.db).await.unwrap();
+    let other = call_from(
+        &app,
+        "100.100.1.1:4000",
+        Some("203.0.113.51"),
+        "/pair",
+        json!({"code": code}),
+    )
+    .await;
+    assert_eq!(
+        other,
+        StatusCode::OK,
+        "the real user behind the same proxy is unaffected"
+    );
+}
+
+#[test]
+fn client_ip_resolution() {
+    use bread_tracker_server::public_auth::{client_ip, TrustedProxy};
+    let trusted = [
+        TrustedProxy::parse("10.0.0.0/8").unwrap(),
+        TrustedProxy::parse("::1").unwrap(),
+    ];
+    let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    assert_eq!(
+        client_ip(ip("1.2.3.4"), Some("9.9.9.9"), &trusted),
+        ip("1.2.3.4"),
+        "untrusted peer"
+    );
+    assert_eq!(
+        client_ip(ip("10.0.0.2"), None, &trusted),
+        ip("10.0.0.2"),
+        "no header"
+    );
+    assert_eq!(
+        client_ip(ip("10.0.0.2"), Some("5.5.5.5"), &trusted),
+        ip("5.5.5.5")
+    );
+    assert_eq!(
+        client_ip(ip("10.0.0.2"), Some("6.6.6.6, 5.5.5.5, 10.0.0.9"), &trusted),
+        ip("5.5.5.5"),
+        "spoofed left entry ignored"
+    );
+    assert_eq!(
+        client_ip(ip("10.0.0.2"), Some("garbage"), &trusted),
+        ip("10.0.0.2")
+    );
+    assert!(TrustedProxy::parse("10.0.0.0/33").is_none());
+    assert!(TrustedProxy::parse("nope").is_none());
 }
 
 #[tokio::test]
@@ -3050,7 +3213,7 @@ async fn concurrent_double_redeem_creates_exactly_one_user() {
         for i in 0..8 {
             let (pool, code) = (pool.clone(), code.clone());
             tasks.push(tokio::spawn(async move {
-                invites::signup(&pool, &code, &format!("R{round}U{i}"), "phone", None)
+                invites::signup(&pool, &code, &format!("R{round}U{i}"), "phone", None, 1000)
                     .await
                     .unwrap()
             }));
@@ -4156,4 +4319,497 @@ async fn the_request_cannot_choose_the_user() {
     assert_eq!(owners[0], (1, "Alice chore".to_string()));
     assert_eq!(owners[1].1, "forged");
     assert_ne!(owners[1].0, 1);
+}
+
+// ---- limits and abuse protection ----
+
+use bread_tracker_server::config::Limits;
+
+async fn limited(limits: Limits) -> Harness {
+    let db = db::connect_memory().await.unwrap();
+    sqlx::query("UPDATE user_settings SET timezone = 'Australia/Perth' WHERE user_id = 1")
+        .execute(&db)
+        .await
+        .unwrap();
+    let mock = Arc::new(MockSender::default());
+    let mut config = Config::from_env();
+    config.limits = limits;
+    let state = AppState::new(db, config, mock.clone());
+    Harness {
+        app: api::router(state.clone()),
+        state,
+        mock,
+    }
+}
+
+fn uuid_n(n: usize) -> String {
+    format!("{:08x}-aaaa-4aaa-8aaa-aaaaaaaaaaaa", n)
+}
+
+async fn count(h: &Harness, sql: &str) -> i64 {
+    sqlx::query_scalar(sql)
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn item_ceiling_is_per_user_counts_tombstones_and_rolls_the_batch_back() {
+    let h = limited(Limits {
+        max_items: 5,
+        ..Limits::default()
+    })
+    .await;
+    let alice = paired(&h).await;
+    let (_, bob) = user_with_device(&h, "Bob").await;
+    let now = store::now_ms();
+    let batch = |from: usize, n: usize| json!({"items": (from..from + n).map(|i| item(&uuid_n(i), "chore", "c", 127, None, now)).collect::<Vec<_>>()});
+
+    assert_eq!(
+        call(&h.app, "POST", "/sync", Some(&alice), Some(batch(0, 5)))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    // One more is refused with a clear message, and a batch that crosses the line stores nothing.
+    let (s, v) = call(&h.app, "POST", "/sync", Some(&alice), Some(batch(5, 1))).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(v["error"].as_str().unwrap().contains("item limit"), "{v}");
+    let (s, _) = call(&h.app, "POST", "/sync", Some(&bob), Some(batch(100, 3))).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = call(&h.app, "POST", "/sync", Some(&bob), Some(batch(200, 3))).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        count(&h, "SELECT COUNT(*) FROM items WHERE user_id != 1").await,
+        3,
+        "Bob's crossing batch stored none of its rows"
+    );
+
+    // The ceiling is per user: Alice being full did not affect Bob (above), and Bob can still fill his own.
+    assert_eq!(
+        call(&h.app, "POST", "/sync", Some(&bob), Some(batch(300, 2)))
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    // Updating and deleting existing rows is always allowed at the ceiling.
+    let mut edit = item(&uuid_n(0), "chore", "renamed", 127, None, now + 1000);
+    edit["deleted_at"] = json!(now + 1000);
+    assert_eq!(
+        call(
+            &h.app,
+            "POST",
+            "/sync",
+            Some(&alice),
+            Some(json!({"items": [edit]}))
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    // A tombstone still counts, so deleting does not make room until it is pruned.
+    assert_eq!(
+        call(&h.app, "POST", "/sync", Some(&alice), Some(batch(5, 1)))
+            .await
+            .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    // Re-sending rows already stored is not "new" and is fine.
+    assert_eq!(
+        call(&h.app, "POST", "/sync", Some(&alice), Some(batch(1, 4)))
+            .await
+            .0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn completion_ceiling_is_per_user_and_replacing_a_tick_is_allowed() {
+    let h = limited(Limits {
+        max_completions: 3,
+        ..Limits::default()
+    })
+    .await;
+    let alice = paired(&h).await;
+    let now = store::now_ms();
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&alice),
+        Some(json!({"items": [item(C1, "habit", "h", 127, None, now)]})),
+    )
+    .await;
+    let days = |range: std::ops::Range<u32>| json!({"completions": range.map(|d| comp(C1, &format!("2026-10-{:02}", d + 1), now, None)).collect::<Vec<_>>()});
+    assert_eq!(
+        call(&h.app, "POST", "/sync", Some(&alice), Some(days(0..3)))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (s, v) = call(&h.app, "POST", "/sync", Some(&alice), Some(days(3..4))).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        v["error"].as_str().unwrap().contains("history limit"),
+        "{v}"
+    );
+    // Un-ticking an existing day (an update) still works at the ceiling.
+    let (s, _) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&alice),
+        Some(json!({"completions": [comp(C1, "2026-10-01", now + 500, Some(now + 500))]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, bob) = user_with_device(&h, "Bob").await;
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&bob),
+        Some(json!({"items": [item(C1, "habit", "h", 127, None, now)]})),
+    )
+    .await;
+    assert_eq!(
+        call(&h.app, "POST", "/sync", Some(&bob), Some(days(0..3)))
+            .await
+            .0,
+        StatusCode::OK,
+        "Bob has his own allowance"
+    );
+}
+
+#[tokio::test]
+async fn completions_for_items_the_user_does_not_own_are_rejected_atomically() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (bob_id, bob) = user_with_device(&h, "Bob").await;
+    let now = store::now_ms();
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&alice),
+        Some(json!({"items": [item(C1, "chore", "A's", 127, None, now)]})),
+    )
+    .await;
+    // Bob ticks Alice's item id, which he does not have, and an id that exists nowhere.
+    let (s, _) = call(&h.app, "POST", "/sync", Some(&bob), Some(json!({"completions": [comp(C1, "2026-10-19", now, None), comp(H1, "2026-10-19", now, None)]}))).await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "unknown owner references reject the entire request"
+    );
+    assert_eq!(
+        count(
+            &h,
+            &format!("SELECT COUNT(*) FROM completions WHERE user_id = {bob_id}")
+        )
+        .await,
+        0
+    );
+    // Within one batch an item may precede its completion; that is normal and stored.
+    let (_, v) = call(&h.app, "POST", "/sync", Some(&bob), Some(json!({"items": [item(C1, "chore", "B's", 127, None, now)], "completions": [comp(C1, "2026-10-19", now, None)]}))).await;
+    assert_eq!(v["completions"].as_array().unwrap().len(), 1);
+    // A deleted item (tombstone) still accepts its un-tick, so offline edits sync.
+    let mut gone = item(C1, "chore", "B's", 127, None, now + 10);
+    gone["deleted_at"] = json!(now + 10);
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&bob),
+        Some(json!({"items": [gone]})),
+    )
+    .await;
+    let (s, _) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&bob),
+        Some(json!({"completions": [comp(C1, "2026-10-19", now + 20, Some(now + 20))]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM completions WHERE user_id = {bob_id} AND deleted_at IS NOT NULL")).await, 1);
+}
+
+#[tokio::test]
+async fn the_device_limit_stops_pairing_and_pair_codes_without_spending_the_code() {
+    let h = limited(Limits {
+        max_devices: 2,
+        ..Limits::default()
+    })
+    .await;
+    let (bob_id, bob) = user_with_device(&h, "Bob").await; // device 1
+    let (s, p) = call(&h.app, "POST", "/pair-code", Some(&bob), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = call(
+        &h.app,
+        "POST",
+        "/pair",
+        None,
+        Some(json!({"code": p["code"]})),
+    )
+    .await; // device 2
+    assert_eq!(s, StatusCode::OK);
+
+    // At the limit: no new pair code, and a code that already existed is refused but not consumed.
+    let spare = auth::create_pairing_code_for(&h.state.db, bob_id)
+        .await
+        .unwrap();
+    let (s, v) = call(&h.app, "POST", "/pair-code", Some(&bob), None).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("maximum of 2 devices"),
+        "{v}"
+    );
+    let (s, _) = call(&h.app, "POST", "/pair", None, Some(json!({"code": spare}))).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        count(&h, "SELECT COUNT(*) FROM pairing_codes").await,
+        1,
+        "the code survived"
+    );
+    // Signing a device out frees a slot and the same code now works.
+    call(&h.app, "DELETE", "/device", Some(&bob), None).await;
+    let (s, _) = call(&h.app, "POST", "/pair", None, Some(json!({"code": spare}))).await;
+    assert_eq!(s, StatusCode::OK);
+    // The limit is per user: another user is unaffected.
+    let (_, cy) = user_with_device(&h, "Cy").await;
+    assert_eq!(
+        call(&h.app, "POST", "/pair-code", Some(&cy), None).await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn the_user_cap_refuses_signup_without_spending_the_invite() {
+    let h = limited(Limits {
+        max_users: 2,
+        ..Limits::default()
+    })
+    .await; // admin + one more
+    let first = invite(&h).await;
+    assert_eq!(signup(&h, &first, "One").await.0, StatusCode::OK);
+    let second = invite(&h).await;
+    let (s, v) = signup(&h, &second, "Two").await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("not accepting new accounts"),
+        "{v}"
+    );
+    assert_eq!(count(&h, "SELECT COUNT(*) FROM users").await, 2);
+    let active = invites::list(&h.state.db)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|i| i.status == invites::InviteStatus::Active)
+        .count();
+    assert_eq!(active, 1, "the refused invite is still valid for later");
+    // A refusal is not a bad-invite failure, so it does not count toward the rate limit.
+    for _ in 0..12 {
+        assert_eq!(
+            signup(&h, &second, "Two").await.0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+    // Removing a user makes room and the same invite works.
+    bread_tracker_server::users::remove(&h.state.db, 2)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(signup(&h, &second, "Two").await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn request_rate_is_limited_per_token_and_does_not_affect_others() {
+    let h = limited(Limits {
+        requests_per_minute: 5,
+        ..Limits::default()
+    })
+    .await;
+    let alice = paired(&h).await;
+    let (_, bob) = user_with_device(&h, "Bob").await;
+    for i in 0..5 {
+        assert_eq!(
+            call(&h.app, "GET", "/me", Some(&alice), None).await.0,
+            StatusCode::OK,
+            "request {i}"
+        );
+    }
+    assert_eq!(
+        call(&h.app, "GET", "/me", Some(&alice), None).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        call(&h.app, "GET", "/sync", Some(&alice), None).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "all authenticated routes share it"
+    );
+    assert_eq!(
+        call(&h.app, "GET", "/me", Some(&bob), None).await.0,
+        StatusCode::OK,
+        "another token is unaffected"
+    );
+    // Public routes are not counted against a token.
+    assert_eq!(
+        call(&h.app, "GET", "/healthz", None, None).await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn a_disabled_user_is_refused_everywhere_keeps_their_data_and_gets_no_reminders() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (bob_id, bob) = perth_user_with_device(&h, "Bob").await;
+    let now = store::now_ms();
+    for tok in [&alice, &bob] {
+        call(
+            &h.app,
+            "POST",
+            "/sync",
+            Some(tok),
+            Some(json!({"items": [item(C1, "chore", "Dishes", 127, Some("17:15"), now)]})),
+        )
+        .await;
+    }
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&alice),
+        Some(json!({"fcm_token": "fcm-alice"})),
+    )
+    .await;
+    call(
+        &h.app,
+        "PUT",
+        "/device",
+        Some(&bob),
+        Some(json!({"fcm_token": "fcm-bob"})),
+    )
+    .await;
+    let before = snapshot(&h, bob_id).await;
+
+    let disabled_code = auth::create_pairing_code_for(&h.state.db, bob_id)
+        .await
+        .unwrap();
+
+    assert!(
+        bread_tracker_server::users::set_disabled(&h.state.db, bob_id, true)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        call(
+            &h.app,
+            "POST",
+            "/pair",
+            None,
+            Some(json!({"code": disabled_code}))
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let still_usable: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pairing_codes WHERE code_hash = ?")
+            .bind(auth::hash(&auth::normalize_code(&disabled_code)))
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        still_usable, 1,
+        "disabled pairing refusal must not consume the code"
+    );
+    for (m, p) in ALL_AUTHED.iter().chain([("POST", "/pair-code")].iter()) {
+        let body = if *m == "GET" || *m == "DELETE" {
+            None
+        } else {
+            Some(json!({}))
+        };
+        assert_eq!(
+            call(&h.app, m, p, Some(&bob), body).await.0,
+            StatusCode::FORBIDDEN,
+            "{m} {p}"
+        );
+    }
+    assert_eq!(
+        snapshot(&h, bob_id).await,
+        before,
+        "nothing was deleted or changed"
+    );
+    assert_eq!(
+        call(&h.app, "GET", "/me", Some(&alice), None).await.0,
+        StatusCode::OK
+    );
+
+    // Only Alice is reminded while Bob is disabled.
+    assert_eq!(push::tick(&h.state, perth(17, 16)).await.unwrap(), 1);
+    let sent: Vec<String> = h
+        .mock
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| m.token.clone())
+        .collect();
+    assert_eq!(sent, vec!["fcm-alice".to_string()]);
+
+    // Enabling restores everything, including the reminder that was waiting.
+    assert!(
+        bread_tracker_server::users::set_disabled(&h.state.db, bob_id, false)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        call(&h.app, "GET", "/me", Some(&bob), None).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(push::tick(&h.state, perth(17, 17)).await.unwrap(), 1);
+
+    // Admins cannot be disabled; unknown ids are not found.
+    assert!(
+        !bread_tracker_server::users::set_disabled(&h.state.db, 1, true)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !bread_tracker_server::users::set_disabled(&h.state.db, 999, true)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        call(&h.app, "GET", "/me", Some(&alice), None).await.0,
+        StatusCode::OK
+    );
+}
+
+#[test]
+fn limits_come_from_the_environment_with_sane_fallbacks() {
+    let env: std::collections::HashMap<&str, &str> = [
+        ("BREADTRACKER_MAX_USERS", "3"),
+        ("BREADTRACKER_MAX_ITEMS_PER_USER", "0"),
+        ("BREADTRACKER_MAX_DEVICES_PER_USER", "abc"),
+        ("BREADTRACKER_REQUESTS_PER_MINUTE", "7"),
+    ]
+    .into_iter()
+    .collect();
+    let l = Config::from_lookup(|k| env.get(k).map(|v| v.to_string())).limits;
+    let d = Limits::default();
+    assert_eq!((l.max_users, l.requests_per_minute), (3, 7));
+    assert_eq!(l.max_items, d.max_items, "zero is not a valid limit");
+    assert_eq!(l.max_devices, d.max_devices, "garbage falls back");
+    assert_eq!(l.max_completions, d.max_completions);
 }

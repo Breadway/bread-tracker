@@ -149,6 +149,8 @@ pub enum SignupError {
     /// learn which codes exist.
     BadInvite,
     NameTaken,
+    /// The server already has the maximum number of users. The invite is not spent.
+    ServerFull,
 }
 
 /// Redeem `code` and create the user, their settings and their first device atomically.
@@ -162,9 +164,10 @@ pub async fn signup(
     name: &str,
     device_name: &str,
     timezone: Option<&str>,
+    max_users: i64,
 ) -> Result<Result<SignedUp, SignupError>, sqlx::Error> {
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
-    let result = signup_in(&mut tx, code, name, device_name, timezone).await?;
+    let result = signup_in_limited(&mut tx, code, name, device_name, timezone, max_users).await?;
     if result.is_ok() {
         tx.commit().await?;
     }
@@ -177,6 +180,17 @@ pub async fn signup_in(
     name: &str,
     device_name: &str,
     timezone: Option<&str>,
+) -> Result<Result<SignedUp, SignupError>, sqlx::Error> {
+    signup_in_limited(tx, code, name, device_name, timezone, i64::MAX).await
+}
+
+pub async fn signup_in_limited(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    code: &str,
+    name: &str,
+    device_name: &str,
+    timezone: Option<&str>,
+    max_users: i64,
 ) -> Result<Result<SignedUp, SignupError>, sqlx::Error> {
     let now = now_ms();
 
@@ -193,6 +207,13 @@ pub async fn signup_in(
     let Some(invite_id) = claimed else {
         return Ok(Err(SignupError::BadInvite));
     };
+
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&mut **tx)
+        .await?;
+    if users >= max_users {
+        return Ok(Err(SignupError::ServerFull));
+    }
 
     let inserted = sqlx::query_scalar::<_, i64>("INSERT INTO users (name, name_key, name_confirmed, is_admin, created_at) VALUES (?, ?, 1, 0, ?) RETURNING id")
         .bind(name)

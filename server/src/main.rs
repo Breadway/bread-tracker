@@ -6,6 +6,8 @@
 //!   bread-tracker-server revoke <id>   remove a device (id or unique prefix, from `devices`)
 //!   bread-tracker-server user list             list users
 //!   bread-tracker-server user remove <name> --yes   delete a user and all their data
+//!   bread-tracker-server user disable <name>   refuse a user's devices and stop their reminders, keeping data
+//!   bread-tracker-server user enable <name>
 //!   bread-tracker-server invite create [--ttl 7d]   print a single-use signup code
 //!   bread-tracker-server invite list                list invites and their state
 //!   bread-tracker-server invite revoke <id>         cancel an unused invite
@@ -104,14 +106,23 @@ async fn main() -> anyhow::Result<()> {
                     for u in users::list(&db).await? {
                         let devices = devices::list(&db, Some(u.id)).await?.len();
                         println!(
-                            "{:<4}  {:<20}  {}  {} device(s)  since {}",
+                            "{:<4}  {:<20}  {}  {} device(s)  since {}{}",
                             u.id,
                             u.name,
                             if u.is_admin { "admin" } else { "user " },
                             devices,
-                            fmt_ms(u.created_at)
+                            fmt_ms(u.created_at),
+                            if u.disabled_at.is_some() { "  DISABLED" } else { "" }
                         );
                     }
+                }
+                Some(which @ ("disable" | "enable")) => {
+                    let name = args.get(2).context("usage: bread-tracker-server user disable|enable <name>")?;
+                    let Some(user) = users::find(&db, name).await? else { anyhow::bail!("no user named {name:?}") };
+                    if !users::set_disabled(&db, user.id, which == "disable").await? {
+                        anyhow::bail!("{} is an admin and cannot be disabled", user.name);
+                    }
+                    println!("{} {}d.", user.name, which);
                 }
                 Some("remove") => {
                     let name = args
@@ -140,9 +151,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                _ => anyhow::bail!(
-                    "usage: bread-tracker-server user list | user remove <name> --yes"
-                ),
+                _ => anyhow::bail!("usage: bread-tracker-server user list | remove <name> --yes | disable <name> | enable <name>"),
             }
             return Ok(());
         }

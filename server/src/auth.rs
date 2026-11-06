@@ -108,6 +108,15 @@ pub async fn insert_device(
     let id = uuid::Uuid::new_v4().to_string();
     let token = random_token();
     let now = now_ms();
+    let disabled: Option<i64> = sqlx::query_scalar("SELECT disabled_at FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_one(&mut *conn)
+        .await?;
+    if disabled.is_some() {
+        return Err(sqlx::Error::Protocol(
+            "cannot issue a device for a disabled account".into(),
+        ));
+    }
     sqlx::query("INSERT INTO devices (id, user_id, name, token_hash, created_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)")
         .bind(&id)
         .bind(user_id)
@@ -181,12 +190,31 @@ pub async fn require_auth(
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(ApiError::Unauthorized)?
         .to_string();
-    let row: Option<(String, i64, i64)> =
-        sqlx::query_as("SELECT id, last_seen, user_id FROM devices WHERE token_hash = ?")
-            .bind(hash(&token))
-            .fetch_optional(&st.db)
-            .await?;
-    let (id, last_seen, user_id) = row.ok_or(ApiError::Unauthorized)?;
+    let row: Option<(String, i64, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT d.id, d.last_seen, d.user_id, u.disabled_at
+         FROM devices d JOIN users u ON u.id = d.user_id WHERE d.token_hash = ?",
+    )
+    .bind(hash(&token))
+    .fetch_optional(&st.db)
+    .await?;
+    let (id, last_seen, user_id, disabled_at) = row.ok_or(ApiError::Unauthorized)?;
+    if disabled_at.is_some() {
+        return Err(ApiError::Disabled);
+    }
+    // Per token, so one noisy device cannot use up the server for everyone else.
+    if !allow_request(&st.db, &id, st.config.limits.requests_per_minute).await? {
+        let still_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM devices WHERE id = ? AND user_id = ?)")
+                .bind(&id)
+                .bind(user_id)
+                .fetch_one(&st.db)
+                .await?;
+        if !still_exists {
+            return Err(ApiError::Unauthorized);
+        }
+        tracing::warn!(user = user_id, device = %id, "request rate limit hit");
+        return Err(ApiError::TooManyRequests);
+    }
     // last_seen is informational, so write it at most once per interval, not per request.
     let now = now_ms();
     if now - last_seen >= LAST_SEEN_INTERVAL_MS {
@@ -200,7 +228,27 @@ pub async fn require_auth(
         .execute(&st.db)
         .await?;
     }
+    // The user id goes in the log so abuse can be traced to an account. Never the token, and
+    // only the path (no query string).
+    let (method, path) = (req.method().clone(), req.uri().path().to_string());
     req.extensions_mut().insert(DeviceId(id));
     req.extensions_mut().insert(UserId(user_id));
-    Ok(next.run(req).await)
+    let resp = next.run(req).await;
+    tracing::info!(user = user_id, %method, %path, status = resp.status().as_u16(), "request");
+    Ok(resp)
+}
+
+pub async fn allow_request(db: &Db, device_id: &str, limit: i64) -> Result<bool, sqlx::Error> {
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    let now = now_ms();
+    sqlx::query("DELETE FROM authenticated_rate_limits WHERE window_started_at <= ?")
+        .bind(now.saturating_sub(60_000))
+        .execute(&mut *tx)
+        .await?;
+    let admitted: Option<i64> = sqlx::query_scalar(
+        "INSERT INTO authenticated_rate_limits(device_id, requests, window_started_at) SELECT ?, 1, ? WHERE EXISTS(SELECT 1 FROM devices WHERE id = ?) ON CONFLICT(device_id) DO UPDATE SET requests = requests + 1 WHERE requests < ? RETURNING requests")
+        .bind(device_id).bind(now).bind(device_id).bind(limit)
+        .fetch_optional(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(admitted.is_some())
 }

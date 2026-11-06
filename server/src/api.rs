@@ -100,7 +100,7 @@ async fn pair(
     };
     let name: String = name.chars().take(80).collect();
     let owner: Option<i64> = sqlx::query_scalar(
-        "DELETE FROM pairing_codes WHERE code_hash = ? AND expires_at > ? RETURNING user_id",
+        "SELECT user_id FROM pairing_codes WHERE code_hash = ? AND expires_at > ?",
     )
     .bind(auth::hash(&auth::normalize_code(&req.code)))
     .bind(crate::store::now_ms())
@@ -108,6 +108,27 @@ async fn pair(
     .await?;
     match owner {
         Some(owner) => {
+            let disabled: bool =
+                sqlx::query_scalar("SELECT disabled_at IS NOT NULL FROM users WHERE id = ?")
+                    .bind(owner)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if disabled {
+                return Err(ApiError::Disabled);
+            }
+            let devices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE user_id = ?")
+                .bind(owner)
+                .fetch_one(&mut *tx)
+                .await?;
+            if devices >= st.config.limits.max_devices {
+                return Err(ApiError::LimitReached(
+                    "device limit reached; sign out of another device first".into(),
+                ));
+            }
+            sqlx::query("DELETE FROM pairing_codes WHERE code_hash = ?")
+                .bind(auth::hash(&auth::normalize_code(&req.code)))
+                .execute(&mut *tx)
+                .await?;
             let (device_id, token) = auth::insert_device(&mut tx, owner, &name).await?;
             let name: String = sqlx::query_scalar("SELECT name FROM users WHERE id = ?")
                 .bind(owner)
@@ -162,6 +183,16 @@ async fn new_pair_code(
     State(st): State<AppState>,
     Extension(UserId(uid)): Extension<UserId>,
 ) -> ApiResult<Json<PairCodeResp>> {
+    let devices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE user_id = ?")
+        .bind(uid)
+        .fetch_one(&st.db)
+        .await?;
+    if devices >= st.config.limits.max_devices {
+        return Err(ApiError::LimitReached(format!(
+            "this account already has the maximum of {} devices; sign out of one first",
+            st.config.limits.max_devices
+        )));
+    }
     let code = auth::create_pairing_code_limited(&st.db, uid).await?;
     tracing::info!(user = uid, "pairing code issued");
     Ok(Json(PairCodeResp {
@@ -228,7 +259,16 @@ async fn signup(
     sqlx::query("SAVEPOINT signup_redemption")
         .execute(&mut *tx)
         .await?;
-    match invites::signup_in(&mut tx, &req.invite, name, &device_name, timezone).await? {
+    match invites::signup_in_limited(
+        &mut tx,
+        &req.invite,
+        name,
+        &device_name,
+        timezone,
+        st.config.limits.max_users,
+    )
+    .await?
+    {
         Ok(s) => {
             tx.commit().await?;
             tracing::info!(user = s.user_id, "signed up");
@@ -253,6 +293,9 @@ async fn signup(
             public_auth::fail(tx, src).await?;
             Err(ApiError::Conflict("that name is already taken".into()))
         }
+        Err(invites::SignupError::ServerFull) => Err(ApiError::LimitReached(
+            "this server is not accepting new accounts right now".into(),
+        )),
     }
 }
 
@@ -293,7 +336,10 @@ async fn sync(
     // device deleted the item). An unknown reference, or one that only another user holds,
     // rejects the whole batch with nothing written.
     let user = UserDb::new(&st.db, uid);
-    match user.apply_push(&req.items, &req.completions).await {
+    match user
+        .apply_push_limited(&req.items, &req.completions, &st.config.limits)
+        .await
+    {
         Ok(()) => {}
         Err(PushError::UnknownItem) => {
             return Err(ApiError::BadRequest(
@@ -301,6 +347,7 @@ async fn sync(
             ))
         }
         Err(PushError::Db(e)) => return Err(e.into()),
+        Err(PushError::LimitReached(message)) => return Err(ApiError::LimitReached(message)),
     }
     Ok(Json(user.pull(req.since).await?))
 }

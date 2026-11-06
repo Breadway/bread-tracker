@@ -66,7 +66,9 @@ SQLx identifies a migration by its numeric version and the SHA-384 of its file, 
 | 0007 | `0007_user_settings.sql` | this PR45 | per-user settings and owner/date/partial scheduler indexes |
 | 0008 | `0008_invites.sql` | PR46 | single-use invite codes |
 | 0009 | `0009_public_auth_limits.sql` | PR46 | shared durable pairing/signup admission |
-| 0010 and up | | coordinate downstream before integration | later multi-user and family migrations |
+| 0010 | `0010_user_disabled.sql` | PR51 | non-destructive account disabling |
+| 0011 | `0011_authenticated_rate_limits.sql` | PR51 | durable per-device request admission |
+| 0012 and up | | coordinate downstream before integration | later multi-user and family migrations |
 
 Why 0005 exists. 0003 was applied on deployments before 0002 can run, and 0002 rebuilds `items` and `completions`, which drops every index on them. SQLx will not rerun the recorded 0003, so those indexes would silently disappear and the scheduler would scan the whole history again. 0005 recreates them with `IF NOT EXISTS`, so it is a no-op wherever they survived (a fresh database, where 0002 runs before 0003). It also adds `completions_item_date (item_id, date)`, because the primary key `(user_id, item_id, date)` cannot serve the to-do suppression lookup by item id.
 
@@ -116,4 +118,25 @@ The phone's database is one store, shared by whichever account signs in, so the 
 
 ### Defaults for new users
 
+Nothing of the original owner's setup is offered to anyone else. A new user's timezone is the phone's at signup, or UTC; the app's empty Today screen asks the user to create their own first item, with a secondary "Add a few examples" that adds six generic chores (bins, plants, laundry, bathroom, tidying, dishes) only when tapped. The owner's household list is gone from the app; if the owner wants it back it is a matter of creating those items (a seed or import file was considered and not added, since nothing in the repository should be personal). The pairing screen no longer names a specific host or container. Migration 0001 still seeds Australia/Perth because shipped migrations are not edited; migration 0005 resets the admin to UTC only on a database that has never had a device (a fresh installation), so a deployment in use keeps its timezone. The default server URL stays, since a second user uses the same server.
+
+### Limits and abuse protection
+
+A server that strangers can hold accounts on needs ceilings, all configurable with environment variables (a value that is not a positive integer falls back to the default):
+
+| Limit | Default | Variable |
+| --- | --- | --- |
+| Users on the server | 20 | `BREADTRACKER_MAX_USERS` |
+| Items per user (tombstones count) | 2000 | `BREADTRACKER_MAX_ITEMS_PER_USER` |
+| Completions per user (tombstones count) | 50000 | `BREADTRACKER_MAX_COMPLETIONS_PER_USER` |
+| Devices per user | 10 | `BREADTRACKER_MAX_DEVICES_PER_USER` |
+| Authenticated requests per device token per minute | 120 | `BREADTRACKER_REQUESTS_PER_MINUTE` |
+
+- **Row ceilings.** `apply_push` counts the user's rows inside its write transaction, so concurrent requests cannot both slip under the limit. Only new rows count: updating, deleting or re-sending existing rows always works. A batch that would cross a ceiling stores nothing and gets HTTP 422 with a message naming the limit. The per-request batch (5000 rows) and body (2 MiB) limits still apply. Tombstones count and are retained until a safe acknowledgement/resync protocol exists.
+- **Completions need an item.** A completion for an item the user does not hold (live or tombstoned, or in the same batch) rejects the entire batch with HTTP 400 and no writes. Own tombstoned references remain compatible with old clients. Dates far in the future or before 2020 were already refused.
+- **Devices.** Pairing and `POST /pair-code` stop at the device limit (422). A pairing code is only consumed when the device is created, so a refused code is not wasted.
+- **Users.** Signup stops at the user cap (422 "not accepting new accounts") and rolls the invite claim back, so the invite is still valid later. This is not counted as a bad-invite failure for the rate limit.
+- **Request rate.** Every authenticated request counts against its device token in a SQLite-backed one-minute window shared by processes and retained across restart; over the limit gets 429. Public pairing and signup share the durable per-source budget described above. Expired device windows are swept and revocation cascades their rows. The app distinguishes reachable 4xx policy refusals from network/offline errors and keeps local changes.
+- **Disabling.** `user disable <name>` and `user enable <name>` toggle `users.disabled_at`. A disabled user's devices get 403 on every authenticated route, the scheduler skips them, and nothing is deleted. Admins cannot be disabled.
+- **Logging.** Each authenticated request logs the user id, method, path and status (never the token, the query string or any code), and limit hits log the user id, so abuse can be traced to an account.
 Nothing of the original owner's setup is offered to anyone else. A new user's timezone is the phone's at signup, or UTC; the app's empty Today screen asks the user to create their own first item, with a secondary "Add a few examples" that adds six generic chores (bins, plants, laundry, bathroom, tidying, dishes) only when tapped. The owner's household list is gone from the app; if the owner wants it back it is a matter of creating those items (a seed or import file was considered and not added, since nothing in the repository should be personal). The pairing screen no longer names a specific host or container. Migration 0001 still seeds Australia/Perth because shipped migrations are not edited; startup selects UTC for the admin only when the database has no application tables before migrations. It never infers freshness from the number of currently paired devices, so established households retain their timezone even after every device is revoked. All applied migration files remain unchanged. The default server URL stays, since a second user uses the same server.

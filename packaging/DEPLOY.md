@@ -159,7 +159,7 @@ step 2 and step 4 and phones retry on their own.
    is called `admin` and can still be named by a later start. A name another user already
    holds stops startup with a message.
 
-   This release ships migrations `1`, `2`, `3`, `5`, `6`, `7`, `8` and `9`. A database that has already
+   This release ships migrations `1`, `2`, `3`, `5`, `6`, `7`, `8`, `9`, `10` and `11`. A database that has already
    recorded `4` (the durable pairing limiter, PR31) is refused at start with a missing
    migration error and is not served. Supporting `4` needs a separately accepted PR31 that is
    integrated with this change so its migration and runtime ship together; this release does
@@ -173,7 +173,7 @@ step 2 and step 4 and phones retry on their own.
    WORK=$(mktemp -d)
    docker run --rm --user "$(id -u):$(id -g)" -v "$BACKUP_DIR":/b:ro -v "$WORK":/o \
      litestream/litestream:0.3.13 restore -o /o/replica.db file:///b/litestream
-   python3 scripts/db-evidence.py check "$WORK/replica.db" --ledger-exact 1,2,3,5,6,7,8,9
+   python3 scripts/db-evidence.py check "$WORK/replica.db" --ledger-exact 1,2,3,5,6,7,8,9,10,11
    ```
 
    Expect `CHECK PASSED` and the same counts for `items`, `completions`, `devices`,
@@ -231,3 +231,7 @@ docker exec bread-tracker bread-tracker-server user remove NAME --yes # deletes 
 ```
 
 Without `--user`, `pair` makes a code for the admin. Users add their own second device from the app (Settings), which calls `POST /pair-code`; you do not need to be involved. `user remove` cannot be undone, so take a backup first if in doubt; it refuses to remove an admin.
+
+## Limits
+
+The defaults suit a small shared server (20 users, 2000 items and 50000 completions each, 10 devices each, 120 requests a minute per device). Change them in `.env` with `BREADTRACKER_MAX_USERS`, `BREADTRACKER_MAX_ITEMS_PER_USER`, `BREADTRACKER_MAX_COMPLETIONS_PER_USER`, `BREADTRACKER_MAX_DEVICES_PER_USER` and `BREADTRACKER_REQUESTS_PER_MINUTE`. The existing deployment is well below them. To stop someone without deleting their data: `user disable NAME` (and `user enable NAME`).

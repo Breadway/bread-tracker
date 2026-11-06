@@ -33,6 +33,9 @@ class SettingsScreen extends ConsumerWidget {
       SyncStatus.syncing => 'Syncing...',
       SyncStatus.offline =>
         'Cannot reach the server. Changes are saved here and will sync later.',
+      SyncStatus.rejected =>
+        ref.read(syncEngineProvider).rejectionMessage ??
+            'The server refused this sync. Local changes are kept.',
       SyncStatus.unpaired =>
         paired
             ? 'This phone is no longer paired. Pair it again.'

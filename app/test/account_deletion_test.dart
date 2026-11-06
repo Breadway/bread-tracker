@@ -125,8 +125,12 @@ void main() {
   test(
     'delayed account deletion cannot clear replacement credentials or rows',
     () async {
-      final directory = await Directory('/tmp/opencode')
-          .createTemp('track26-delete-');
+      final directory = await Directory.systemTemp.createTemp(
+        'track26-delete-',
+      );
+      addTearDown(() async {
+        if (directory.existsSync()) await directory.delete(recursive: true);
+      });
       final databaseFile = File('${directory.path}/local.db');
       final (container, store, db, fake) = await setup(
         databaseFile: databaseFile,
@@ -159,7 +163,6 @@ void main() {
       expect(await reopened.select(reopened.items).get(), hasLength(1));
       expect(await reopened.select(reopened.completions).get(), hasLength(1));
       await reopened.close();
-      addTearDown(() => directory.delete(recursive: true));
     },
   );
   test(

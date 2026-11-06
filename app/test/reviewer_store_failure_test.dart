@@ -370,6 +370,9 @@ void main() {
       final prefs = await SharedPreferences.getInstance();
       final store = Store(prefs);
       final dir = await Directory.systemTemp.createTemp('secure-fail-');
+      addTearDown(() async {
+        if (dir.existsSync()) await dir.delete(recursive: true);
+      });
       final file = File('${dir.path}/db.sqlite');
       final db = AppDb(NativeDatabase(file));
       await db.upsertItem(

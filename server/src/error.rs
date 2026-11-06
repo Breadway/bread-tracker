@@ -21,6 +21,8 @@ pub enum ApiError {
     Disabled,
     #[error("{0}")]
     Forbidden(String),
+    #[error("server is busy, try again")]
+    Unavailable,
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
 }
@@ -41,6 +43,7 @@ impl IntoResponse for ApiError {
             ApiError::LimitReached(m) => (StatusCode::UNPROCESSABLE_ENTITY, m.clone()),
             ApiError::Disabled => (StatusCode::FORBIDDEN, self.to_string()),
             ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m.clone()),
+            ApiError::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             ApiError::Internal(e) => {
                 tracing::error!(error = ?e, "internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())

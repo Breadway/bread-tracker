@@ -25,11 +25,41 @@ async fn independent_pools_share_a_device_budget_and_expiry_reopens_it() {
         count += usize::from(task.await.unwrap());
     }
     assert_eq!(count, 5);
+
+    // Denied requests must not keep incrementing the stored counter.
+    let stored: i64 =
+        sqlx::query_scalar("SELECT requests FROM authenticated_rate_limits WHERE device_id = ?")
+            .bind(&device)
+            .fetch_one(&first)
+            .await
+            .unwrap();
+    assert_eq!(stored, 5);
+
+    // A second device token has its own budget even while the first is exhausted.
+    let other_code = auth::create_pairing_code(&first).await.unwrap();
+    let (other_device, _) = auth::redeem(&first, &other_code, "tablet")
+        .await
+        .unwrap()
+        .unwrap();
+    for _ in 0..5 {
+        assert!(auth::allow_request(&second, &other_device, 5)
+            .await
+            .unwrap());
+    }
+    assert!(!auth::allow_request(&first, &device, 5).await.unwrap());
+
     sqlx::query("UPDATE authenticated_rate_limits SET window_started_at = 0")
         .execute(&first)
         .await
         .unwrap();
     assert!(auth::allow_request(&second, &device, 5).await.unwrap());
+    let stored: i64 =
+        sqlx::query_scalar("SELECT requests FROM authenticated_rate_limits WHERE device_id = ?")
+            .bind(&device)
+            .fetch_one(&first)
+            .await
+            .unwrap();
+    assert_eq!(stored, 1, "an expired window restarts at one");
     sqlx::query("DELETE FROM devices WHERE id = ?")
         .bind(&device)
         .execute(&first)
@@ -39,5 +69,5 @@ async fn independent_pools_share_a_device_budget_and_expiry_reopens_it() {
         .fetch_one(&first)
         .await
         .unwrap();
-    assert_eq!(rows, 0);
+    assert_eq!(rows, 1, "the deleted device's row cascades away");
 }

@@ -276,17 +276,45 @@ pub async fn require_auth(
     Ok(resp)
 }
 
+/// Fixed one-minute window for the per-device request budget.
+const REQUEST_WINDOW_MS: i64 = 60_000;
+
+/// Admit one request for `device_id` and report whether it fit the budget.
+///
+/// The counter lives in SQLite, so every server process using the same database
+/// shares one budget instead of each process allowing the full amount. The
+/// upsert runs inside `BEGIN IMMEDIATE`: concurrent processes serialize before
+/// reading the count, so the increment cannot lose a race. An expired window is
+/// reset in the same statement, which keeps expiry work O(1) per request and
+/// leaves at most one row per device. Once the counter reaches `limit` the
+/// `WHERE` clause stops updating it, so the stored value saturates instead of
+/// growing without bound.
 pub async fn allow_request(db: &Db, device_id: &str, limit: i64) -> Result<bool, sqlx::Error> {
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
     let now = now_ms();
-    sqlx::query("DELETE FROM authenticated_rate_limits WHERE window_started_at <= ?")
-        .bind(now.saturating_sub(60_000))
-        .execute(&mut *tx)
-        .await?;
+    let expired_before = now.saturating_sub(REQUEST_WINDOW_MS);
     let admitted: Option<i64> = sqlx::query_scalar(
-        "INSERT INTO authenticated_rate_limits(device_id, requests, window_started_at) SELECT ?, 1, ? WHERE EXISTS(SELECT 1 FROM devices WHERE id = ?) ON CONFLICT(device_id) DO UPDATE SET requests = requests + 1 WHERE requests < ? RETURNING requests")
-        .bind(device_id).bind(now).bind(device_id).bind(limit)
-        .fetch_optional(&mut *tx).await?;
+        "INSERT INTO authenticated_rate_limits(device_id, requests, window_started_at)
+         SELECT ?, 1, ? WHERE EXISTS(SELECT 1 FROM devices WHERE id = ?)
+         ON CONFLICT(device_id) DO UPDATE SET
+           requests = CASE WHEN authenticated_rate_limits.window_started_at <= ?
+                           THEN 1 ELSE authenticated_rate_limits.requests + 1 END,
+           window_started_at = CASE WHEN authenticated_rate_limits.window_started_at <= ?
+                                    THEN excluded.window_started_at
+                                    ELSE authenticated_rate_limits.window_started_at END
+         WHERE authenticated_rate_limits.window_started_at <= ?
+            OR authenticated_rate_limits.requests < ?
+         RETURNING requests",
+    )
+    .bind(device_id)
+    .bind(now)
+    .bind(device_id)
+    .bind(expired_before)
+    .bind(expired_before)
+    .bind(expired_before)
+    .bind(limit)
+    .fetch_optional(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(admitted.is_some())
 }

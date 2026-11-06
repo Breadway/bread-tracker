@@ -52,13 +52,27 @@ class SettingsScreen extends ConsumerWidget {
       }
     }
 
+    final rejection = ref.read(syncEngineProvider).rejectionMessage;
+    String policy(String recovery) => rejection == null || rejection.isEmpty
+        ? recovery
+        : '$recovery $rejection';
     final statusText = switch (status) {
       SyncStatus.syncing => 'Syncing...',
       SyncStatus.offline =>
         'Cannot reach the server. Changes are saved here and will sync later.',
+      SyncStatus.quotaExhausted => policy(
+        'Sync paused: this account reached a server limit. Remove older items or history, '
+        'or ask the server owner to raise the limit, then retry.',
+      ),
+      SyncStatus.accountDisabled => policy(
+        'Sync paused: this account is disabled on the server. Ask the server owner to '
+        're-enable it, then retry.',
+      ),
+      SyncStatus.rateLimited => policy(
+        'Sync paused: the server is rate limiting this device. Wait a minute, then retry.',
+      ),
       SyncStatus.rejected =>
-        ref.read(syncEngineProvider).rejectionMessage ??
-            'The server refused this sync. Local changes are kept.',
+        rejection ?? 'The server refused this sync. Local changes are kept.',
       SyncStatus.unpaired =>
         paired
             ? 'This phone is no longer paired. Pair it again.'
@@ -77,22 +91,38 @@ class SettingsScreen extends ConsumerWidget {
           ),
           const SectionHeader('Sync'),
           Panel(
-            child: Row(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                StatusDot(ok: paired && status == SyncStatus.idle),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(syncLabel(store, paired)),
-                      Text(
-                        statusText,
-                        style: TextStyle(color: p.dim, fontSize: 12),
+                Row(
+                  children: [
+                    StatusDot(ok: paired && status == SyncStatus.idle),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(syncLabel(store, paired)),
+                          Text(
+                            statusText,
+                            style: TextStyle(color: p.dim, fontSize: 12),
+                          ),
+                        ],
                       ),
-                    ],
-                  ),
+                    ),
+                  ],
                 ),
+                if (paired && status.isPolicyRejection)
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton(
+                      onPressed: () async {
+                        await ctl.syncNow();
+                        toast('Sync retried');
+                      },
+                      child: const Text('Retry sync'),
+                    ),
+                  ),
               ],
             ),
           ),

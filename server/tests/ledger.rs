@@ -9,6 +9,7 @@
 use std::borrow::Cow;
 use std::path::Path;
 use std::str::FromStr;
+use std::time::Duration;
 
 use bread_tracker_server::db;
 use sha2::{Digest, Sha384};
@@ -93,6 +94,18 @@ fn url(path: &Path) -> String {
     format!("sqlite://{}", path.display())
 }
 
+/// Close a pool and make sure no connection it owned is left for the next open to race.
+///
+/// `SqlitePool::close()` in sqlx 0.8.6 can return while a connection is still closing, and can
+/// leave an idle connection untouched until the pool itself is dropped (launchbadge/sqlx#3217,
+/// fixed only in sqlx 0.9). Dropping the pool here forces those connections through their WAL
+/// checkpoint instead of letting the next open race them. A reopening that still meets a busy
+/// database is absorbed by the bounded retry in `db::connect_with_migrator`.
+async fn close_pool(pool: SqlitePool) {
+    pool.close().await;
+    drop(pool);
+}
+
 /// Fill a 0001 database the way a live single-user server would.
 async fn populate_0001(pool: &SqlitePool) {
     let q = |sql: &'static str| sqlx::query(sql);
@@ -143,7 +156,7 @@ async fn deployed(path: &Path, then: &[i64], with_0004: bool) {
         versions.extend_from_slice(then);
         migrator(&versions, with_0004).run(&pool).await.unwrap();
     }
-    pool.close().await;
+    close_pool(pool).await;
 }
 
 async fn scalar(pool: &SqlitePool, sql: &str) -> i64 {
@@ -359,7 +372,7 @@ async fn upgrade_from_0001_and_0003_restores_the_hygiene_indexes_0002_dropped() 
     for idx in HYGIENE_INDEXES {
         assert!(before.contains(&idx.to_string()), "{idx}");
     }
-    pool.close().await;
+    close_pool(pool).await;
 
     // The unrepaired late 0002 (this branch without 0005) drops them, and SQLx will never
     // rerun the recorded 0003. This documents the defect the forward repair exists for.
@@ -379,7 +392,7 @@ async fn upgrade_from_0001_and_0003_restores_the_hygiene_indexes_0002_dropped() 
     assert!(index_names(&pool)
         .await
         .contains(&"items_kind_id".to_string()));
-    pool.close().await;
+    close_pool(pool).await;
 
     let pool = db::connect_with_migrator(&url(&path), None, &embedded())
         .await
@@ -502,7 +515,7 @@ async fn a_second_start_is_a_no_op_on_every_ledger() {
             .fetch_one(&pool)
             .await
             .unwrap();
-        pool.close().await;
+        close_pool(pool).await;
         let pool = db::connect_with_migrator(&url(&path), Some("Riley"), &m)
             .await
             .unwrap();
@@ -513,6 +526,61 @@ async fn a_second_start_is_a_no_op_on_every_ledger() {
             .unwrap();
         assert_eq!(users, again, "{name}");
         assert_upgraded_and_intact(&pool).await;
+    }
+}
+
+#[tokio::test]
+async fn reopening_after_close_retries_while_a_writer_holds_the_lock() {
+    // TRACK-92: the second start reopened the file immediately after `pool.close().await` and,
+    // on a stalled CI disk, hit `(code: 5) database is locked` because the previous connection
+    // was still closing and checkpointing the WAL. `close_pool` now drops the pool so no
+    // connection is left behind, and the open path retries BUSY with bounded backoff. Force
+    // both halves here: a writer holds the write lock past the 5s connection busy timeout
+    // while the reopen runs, so an unretried open fails, then a loop exercises the ordinary
+    // close/reopen path.
+    use sqlx::Connection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("locked.db");
+    deployed(&path, &[3], false).await;
+
+    let mut writer = sqlx::SqliteConnection::connect_with(
+        &SqliteConnectOptions::from_str(&url(&path))
+            .unwrap()
+            .busy_timeout(Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut writer)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE meta SET val = val WHERE key = 'seq'")
+        .execute(&mut writer)
+        .await
+        .unwrap();
+
+    let release = tokio::spawn(async move {
+        // Longer than the 5s busy_timeout, so the first open attempt cannot wait it out.
+        tokio::time::sleep(Duration::from_millis(5_600)).await;
+        sqlx::query("COMMIT").execute(&mut writer).await.unwrap();
+    });
+
+    let reopened = db::connect_with_migrator(&url(&path), None, &embedded()).await;
+    release.await.unwrap();
+    let pool = reopened.expect(
+        "a reopen racing a held write lock must retry SQLITE_BUSY, not fail the second start",
+    );
+    let expected = ledger(&pool).await;
+    assert_eq!(expected.len(), 10);
+    close_pool(pool).await;
+
+    for round in 0..24 {
+        let pool = db::connect_with_migrator(&url(&path), None, &embedded())
+            .await
+            .unwrap_or_else(|err| panic!("reopen {round} failed: {err:#}"));
+        assert_eq!(ledger(&pool).await, expected, "round {round}");
+        close_pool(pool).await;
     }
 }
 
@@ -636,7 +704,7 @@ async fn a_failed_0002_rolls_back_completely_and_a_retry_succeeds() {
         .await,
         0
     );
-    pool.close().await;
+    close_pool(pool).await;
 
     let pool = db::connect_with_migrator(&url(&path), None, &combined())
         .await
@@ -678,7 +746,7 @@ async fn a_failed_0005_keeps_the_0002_result_and_a_retry_completes_the_repair() 
         scalar(&pool, "SELECT COUNT(*) FROM items WHERE user_id = 1").await,
         3
     );
-    pool.close().await;
+    close_pool(pool).await;
 
     let pool = db::connect_with_migrator(&url(&path), None, &embedded())
         .await
@@ -743,7 +811,7 @@ async fn items_belong_to_their_user_and_removing_one_user_keeps_the_rest() {
 async fn upgrade_like_6f9986e(path: &Path, with_0004: bool) {
     let pool = open(path).await;
     migrator(&[1, 2, 3, 5], with_0004).run(&pool).await.unwrap();
-    pool.close().await;
+    close_pool(pool).await;
 }
 
 #[tokio::test]
@@ -768,7 +836,7 @@ async fn a_database_already_upgraded_by_6f9986e_receives_only_the_new_0006() {
                 .into_iter()
                 .collect::<Vec<_>>()
         );
-        pool.close().await;
+        close_pool(pool).await;
 
         let m = if with_0004 { combined() } else { embedded() };
         let pool = db::connect_with_migrator(&url(&path), None, &m)
@@ -805,7 +873,7 @@ async fn a_failed_0006_keeps_everything_before_it_and_a_retry_completes() {
         1
     );
     assert_eq!(scalar(&pool, "SELECT COUNT(*) FROM items").await, 3);
-    pool.close().await;
+    close_pool(pool).await;
 
     let pool = db::connect_with_migrator(&url(&path), None, &embedded())
         .await
@@ -828,7 +896,7 @@ async fn experimental_invites004_is_rejected_without_rewriting_data() {
     sqlx::query("INSERT INTO _sqlx_migrations(version, description, success, checksum, execution_time) VALUES (4, 'invites', 1, ?, 0)")
         .bind(checksum).execute(&pool).await.unwrap();
     let before = ledger(&pool).await;
-    pool.close().await;
+    close_pool(pool).await;
     let error = db::connect(&url(&path)).await.unwrap_err();
     assert!(error.to_string().contains("experimental invites004"));
     let pool = open(&path).await;
@@ -859,7 +927,7 @@ async fn experimental_settings003_is_rejected_without_rewriting_any_ledger_or_da
             .fetch_one(&pool)
             .await
             .unwrap();
-    pool.close().await;
+    close_pool(pool).await;
     let err = db::connect(&url(&path)).await.unwrap_err().to_string();
     assert!(
         err.contains("unsupported experimental settings003 ledger")
@@ -887,7 +955,7 @@ async fn already_published_upstream_0006_gets_only_settings0007_with_values_pres
     deployed(&path, &[2, 3, 5, 6], false).await;
     let pool = open(&path).await;
     let before = ledger(&pool).await;
-    pool.close().await;
+    close_pool(pool).await;
     let pool = db::connect(&url(&path)).await.unwrap();
     let after = ledger(&pool).await;
     assert_eq!(after.len(), before.len() + 5);
@@ -949,7 +1017,7 @@ async fn failed_settings0007_rolls_back_the_drop_copy_and_indexes_and_retry_succ
         .await,
         0
     );
-    pool.close().await;
+    close_pool(pool).await;
     let pool = db::connect(&url(&path)).await.unwrap();
     assert_upgraded_and_intact(&pool).await;
 }

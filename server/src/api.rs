@@ -203,7 +203,7 @@ async fn delete_account(
     let u = users::find_by_id(&st.db, uid)
         .await?
         .ok_or(ApiError::Unauthorized)?;
-    if !req.confirm.trim().eq_ignore_ascii_case(&u.name) {
+    if users::name_key(req.confirm.trim()) != users::name_key(&u.name) {
         return Err(ApiError::BadRequest(
             "confirmation does not match the account name".into(),
         ));

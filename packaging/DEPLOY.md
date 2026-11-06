@@ -244,8 +244,8 @@ docker logs bread-tracker-litestream | tail
 the only rollback path: restore the frozen copy over the data files, put the recorded old image
 ID back under the name compose uses, and start without building. Do not repair the
 post-failure database in place. If you are in a new shell, set `RUN` to the directory printed
-in step 1 and `COPY=$RUN/volume` first. Before deleting anything, re-check the recovery point
-and the target volume:
+in step 1, `COPY=$RUN/volume`, and `VOL` to the volume printed in step 1 first. Before deleting
+anything, re-check the recovery point and the target volume:
 
 ```sh
 test -s "$RUN/old-image-id" && PREV_IMAGE_ID=$(cat "$RUN/old-image-id")

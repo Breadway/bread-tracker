@@ -50,6 +50,20 @@ cargo run -p bread-tracker-server -- pair
 Enter it in the app. The server returns a bearer token once and stores only its hash. When no device
 is paired yet, the server also prints a code at startup.
 
+## Join with an invite, or add a device
+
+There are two ways to put the app on an account:
+
+- **A new account.** The server owner makes a single-use invite code
+  (`bread-tracker-server invite create`) and gives it to you with the server address. In the app
+  choose **Join with an invite**, then enter the server, your name and the code.
+- **Another device for an account you already have.** Ask the owner for a code
+  (`bread-tracker-server pair --user <name>`), or on a phone that is already signed in use
+  **Settings, Add another device**. On the new phone choose **Pair with a code**.
+
+[docs/ONBOARDING.md](docs/ONBOARDING.md) covers installing the APK, joining, adding a second
+device, signing out and deleting your account.
+
 ## Build the app
 
 ```sh

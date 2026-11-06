@@ -3162,6 +3162,98 @@ async fn new_client_optional_wire_fields_are_ignored_and_legacy_rows_survive() {
     assert!(response["epoch"].as_str().is_some());
 }
 
+/// Generous deadline for a debug-build server binary to open its database, migrate,
+/// take the generation lock and bind on a loaded CI runner. It only bounds how long
+/// a broken child can wedge the suite; the tests still assert the real behaviour.
+const STARTUP_DEADLINE: StdDuration = StdDuration::from_secs(60);
+
+/// A spawned server binary whose stderr is captured to a file in the test's temp
+/// directory. The child is always killed and reaped when this value drops, so a
+/// failed assertion cannot leave a server (or its database handle) behind.
+struct ServerProcess {
+    child: std::process::Child,
+    log_path: std::path::PathBuf,
+}
+
+impl ServerProcess {
+    fn spawn(mut command: Command, log_path: std::path::PathBuf) -> Self {
+        let log = std::fs::File::create(&log_path).unwrap();
+        let child = command
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap();
+        Self { child, log_path }
+    }
+
+    fn stderr_output(&self) -> String {
+        std::fs::read_to_string(&self.log_path).unwrap_or_default()
+    }
+
+    /// Polls until `address` accepts a connection. Panics with the captured stderr
+    /// if the child exits first or the startup deadline passes.
+    fn wait_until_listening(&mut self, address: std::net::SocketAddr) {
+        let deadline = std::time::Instant::now() + STARTUP_DEADLINE;
+        loop {
+            if std::net::TcpStream::connect_timeout(&address, StdDuration::from_millis(50)).is_ok()
+            {
+                return;
+            }
+            if let Some(status) = self.child.try_wait().unwrap() {
+                panic!(
+                    "server exited during startup with {status} before listening on {address}:\n{}",
+                    self.stderr_output()
+                );
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "server did not become ready on {address} within {STARTUP_DEADLINE:?}:\n{}",
+                    self.stderr_output()
+                );
+            }
+            thread::sleep(StdDuration::from_millis(20));
+        }
+    }
+
+    /// Waits for the child to exit. Panics with the captured stderr if it starts
+    /// listening instead, or if it neither starts nor exits before the deadline.
+    fn wait_for_fail_closed(
+        &mut self,
+        address: std::net::SocketAddr,
+        timeout: StdDuration,
+    ) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            if std::net::TcpStream::connect_timeout(&address, StdDuration::from_millis(50)).is_ok()
+            {
+                let _ = self.child.kill();
+                panic!(
+                    "server accepted connections on {address} although the generation lock is held; stderr:\n{}",
+                    self.stderr_output()
+                );
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = self.child.kill();
+                panic!(
+                    "server neither failed closed nor started within {timeout:?}; stderr:\n{}",
+                    self.stderr_output()
+                );
+            }
+            thread::sleep(StdDuration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for ServerProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[tokio::test]
 async fn pair_cli_completes_while_the_http_server_holds_generation_lock() {
     let dir = tempfile::tempdir().unwrap();
@@ -3170,24 +3262,14 @@ async fn pair_cli_completes_while_the_http_server_holds_generation_lock() {
     let address = listener.local_addr().unwrap();
     drop(listener);
     let binary = env!("CARGO_BIN_EXE_bread-tracker-server");
-    let mut server = Command::new(binary)
+    let mut server_command = Command::new(binary);
+    server_command
         .env("BREADTRACKER_DATABASE_PATH", &database)
         .env("BREADTRACKER_LISTEN", address.to_string())
-        .env("BREADTRACKER_FCM_SERVICE_ACCOUNT", "")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
-    let mut ready = false;
-    while std::time::Instant::now() < deadline {
-        if std::net::TcpStream::connect_timeout(&address, StdDuration::from_millis(50)).is_ok() {
-            ready = true;
-            break;
-        }
-        std::thread::sleep(StdDuration::from_millis(20));
-    }
-    assert!(ready, "server did not become ready");
+        .env("BREADTRACKER_FCM_SERVICE_ACCOUNT", "");
+    let mut server =
+        ServerProcess::spawn(server_command, dir.path().join("pair-process.stderr.log"));
+    server.wait_until_listening(address);
     let mut pair = Command::new(binary)
         .arg("pair")
         .env("BREADTRACKER_DATABASE_PATH", &database)
@@ -3197,15 +3279,13 @@ async fn pair_cli_completes_while_the_http_server_holds_generation_lock() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let pair_deadline = std::time::Instant::now() + StdDuration::from_secs(5);
+    let pair_deadline = std::time::Instant::now() + STARTUP_DEADLINE;
     while std::time::Instant::now() < pair_deadline && pair.try_wait().unwrap().is_none() {
         thread::sleep(StdDuration::from_millis(10));
     }
     if pair.try_wait().unwrap().is_none() {
         let _ = pair.kill();
         let output = pair.wait_with_output().unwrap();
-        let _ = server.kill();
-        let _ = server.wait();
         panic!(
             "pair CLI hung against running server: {}",
             String::from_utf8_lossy(&output.stderr)
@@ -3255,8 +3335,9 @@ async fn pair_cli_completes_while_the_http_server_holds_generation_lock() {
         std::fs::read_to_string(&sidecar).unwrap().trim(),
         sidecar_before
     );
-    let _ = server.kill();
-    let _ = server.wait();
+    // Dropping the guard kills and reaps the server before the database is
+    // reopened by the marker processes below.
+    drop(server);
     let failed_marker = Command::new(binary)
         .arg("mark-restored")
         .env("BREADTRACKER_DATABASE_PATH", &database)
@@ -3346,47 +3427,27 @@ fn second_server_startup_fails_closed_while_first_owns_generation_lock() {
         .local_addr()
         .unwrap();
     let binary = env!("CARGO_BIN_EXE_bread-tracker-server");
-    let spawn = |address: std::net::SocketAddr| {
-        Command::new(binary)
+    let command = |address: std::net::SocketAddr| {
+        let mut command = Command::new(binary);
+        command
             .env("BREADTRACKER_DATABASE_PATH", &database)
             .env("BREADTRACKER_LISTEN", address.to_string())
-            .env("BREADTRACKER_FCM_SERVICE_ACCOUNT", "")
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap()
+            .env("BREADTRACKER_FCM_SERVICE_ACCOUNT", "");
+        command
     };
-    let mut first = spawn(address1);
-    let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        if std::net::TcpStream::connect_timeout(&address1, StdDuration::from_millis(50)).is_ok() {
-            break;
-        }
-        if first.try_wait().unwrap().is_some() {
-            panic!("first server exited during startup");
-        }
-        thread::sleep(StdDuration::from_millis(20));
-    }
-    let mut second = spawn(address2);
-    let second_deadline = std::time::Instant::now() + StdDuration::from_secs(5);
-    let mut failed = false;
-    while std::time::Instant::now() < second_deadline {
-        if second.try_wait().unwrap().is_some() {
-            failed = true;
-            break;
-        }
-        thread::sleep(StdDuration::from_millis(20));
-    }
-    if !failed {
-        let _ = second.kill();
-    }
-    let output = second.wait_with_output().unwrap();
-    let _ = first.kill();
-    let _ = first.wait();
+    let mut first = ServerProcess::spawn(command(address1), dir.path().join("first.stderr.log"));
+    first.wait_until_listening(address1);
+    let mut second = ServerProcess::spawn(command(address2), dir.path().join("second.stderr.log"));
+    let status = second.wait_for_fail_closed(address2, STARTUP_DEADLINE);
     assert!(
-        failed && !output.status.success(),
-        "second server must fail closed promptly while first holds generation lock"
+        !status.success(),
+        "second server must fail closed promptly while first holds generation lock; stderr:\n{}",
+        second.stderr_output()
     );
+    // Both guards are dropped here, killing and reaping either child if it is
+    // somehow still alive.
+    drop(first);
+    drop(second);
 }
 
 #[tokio::test]

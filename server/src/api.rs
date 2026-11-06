@@ -6,7 +6,7 @@ use std::str::FromStr;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Query, State};
 use axum::middleware;
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
 use chrono::{NaiveDate, NaiveTime, Offset, Utc};
 use chrono_tz::Tz;
@@ -45,6 +45,8 @@ pub fn router(state: AppState) -> Router {
         .route("/device", put(set_device).delete(sign_out))
         .route("/pair-code", post(new_pair_code))
         .route("/me", get(me))
+        .route("/export", get(export))
+        .route("/account", delete(delete_account))
         .route("/stats", get(stats))
         .route("/settings", get(get_settings).put(put_settings))
         .route("/push/test", post(push_test))
@@ -169,6 +171,53 @@ async fn me(
         name: u.name,
         is_admin: u.is_admin,
     }))
+}
+
+/// Everything the server holds for the caller, as JSON they can keep: the account, settings,
+/// items and completions (tombstones included, marked by `deleted_at`). Scoped like every other
+/// route: only the caller's own rows.
+async fn export(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let doc = users::export(&st.db, uid)
+        .await?
+        .ok_or(ApiError::Unauthorized)?;
+    tracing::info!(user = uid, "data export");
+    Ok(Json(doc))
+}
+
+#[derive(Deserialize)]
+struct DeleteAccountReq {
+    /// Must equal the account name (ignoring case), so a stray request cannot delete anything.
+    confirm: String,
+}
+
+/// Delete the caller's account and every row they own, in one transaction, through the same
+/// code as the CLI's `user remove`. Admin accounts cannot be removed this way.
+async fn delete_account(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+    Json(req): Json<DeleteAccountReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let u = users::find_by_id(&st.db, uid)
+        .await?
+        .ok_or(ApiError::Unauthorized)?;
+    if !req.confirm.trim().eq_ignore_ascii_case(&u.name) {
+        return Err(ApiError::BadRequest(
+            "confirmation does not match the account name".into(),
+        ));
+    }
+    match users::remove(&st.db, uid).await? {
+        Ok(r) => {
+            tracing::info!(user = uid, devices = r.devices, items = r.items, completions = r.completions, "account deleted by its owner");
+            Ok(Json(serde_json::json!({ "deleted": true })))
+        }
+        Err(users::RemoveError::IsAdmin) => Err(ApiError::Forbidden(
+            "the admin account cannot be deleted from the app; the server owner can remove it on the server".into(),
+        )),
+        Err(users::RemoveError::NotFound) => Err(ApiError::Unauthorized),
+    }
 }
 
 #[derive(Serialize)]

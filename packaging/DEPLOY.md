@@ -227,6 +227,7 @@ docker exec bread-tracker bread-tracker-server user list
 docker exec bread-tracker bread-tracker-server devices [--user NAME]
 docker exec bread-tracker bread-tracker-server pair [--user NAME]    # a code for that user's new device
 docker exec bread-tracker bread-tracker-server revoke <device id>
+docker exec bread-tracker bread-tracker-server user export NAME     # everything stored for a user, as JSON
 docker exec bread-tracker bread-tracker-server user remove NAME --yes # deletes the user and all their data
 ```
 

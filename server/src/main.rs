@@ -6,6 +6,7 @@
 //!   bread-tracker-server revoke <id>   remove a device (id or unique prefix, from `devices`)
 //!   bread-tracker-server user list             list users
 //!   bread-tracker-server user remove <name> --yes   delete a user and all their data
+//!   bread-tracker-server user export <name>    print everything stored for a user as JSON
 //!   bread-tracker-server user disable <name>   refuse a user's devices and stop their reminders, keeping data
 //!   bread-tracker-server user enable <name>
 //!   bread-tracker-server invite create [--ttl 7d]   print a single-use signup code
@@ -116,6 +117,11 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                 }
+                Some("export") => {
+                    let name = args.get(2).context("usage: bread-tracker-server user export <name>")?;
+                    let Some(user) = users::find(&db, name).await? else { anyhow::bail!("no user named {name:?}") };
+                    println!("{}", serde_json::to_string_pretty(&users::export(&db, user.id).await?)?);
+                }
                 Some(which @ ("disable" | "enable")) => {
                     let name = args.get(2).context("usage: bread-tracker-server user disable|enable <name>")?;
                     let Some(user) = users::find(&db, name).await? else { anyhow::bail!("no user named {name:?}") };
@@ -151,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                _ => anyhow::bail!("usage: bread-tracker-server user list | remove <name> --yes | disable <name> | enable <name>"),
+                _ => anyhow::bail!("usage: bread-tracker-server user list | export <name> | remove <name> --yes | disable <name> | enable <name>"),
             }
             return Ok(());
         }

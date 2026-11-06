@@ -330,6 +330,57 @@ pub async fn remove(db: &Db, user_id: i64) -> Result<Result<Removed, RemoveError
     }))
 }
 
+/// Everything stored for a user as one JSON document: the account, settings, devices (names
+/// and times only, never tokens), items and completions with their tombstones. The server
+/// route and the CLI both use this, so they cannot drift. `None` when the user does not exist.
+pub async fn export(db: &Db, user_id: i64) -> Result<Option<serde_json::Value>, sqlx::Error> {
+    // All export sections come from one SQLite read snapshot, not independent
+    // reads that can straddle a concurrent sync or deletion.
+    let mut tx = db.begin().await?;
+    let Some(u): Option<User> = sqlx::query_as(
+        "SELECT id, name, is_admin, created_at, disabled_at FROM users WHERE id = ?",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let settings: crate::store::UserSettings = sqlx::query_as("SELECT timezone, quiet_start, quiet_end, reminders_enabled FROM user_settings WHERE user_id = ?")
+        .bind(user_id).fetch_one(&mut *tx).await?;
+    let devices: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT name, created_at, last_seen FROM devices WHERE user_id = ? ORDER BY created_at, id",
+    )
+    .bind(user_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut items: Vec<crate::model::Item> = sqlx::query_as("SELECT id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, seq FROM items WHERE user_id = ?")
+        .bind(user_id).fetch_all(&mut *tx).await?;
+    items.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut completions: Vec<crate::model::Completion> = sqlx::query_as("SELECT item_id, date, completed_at, updated_at, deleted_at, seq FROM completions WHERE user_id = ?")
+        .bind(user_id).fetch_all(&mut *tx).await?;
+    completions.sort_by(|a, b| (&a.item_id, &a.date).cmp(&(&b.item_id, &b.date)));
+    tx.commit().await?;
+    Ok(Some(serde_json::json!({
+        "format": "bread-tracker-export",
+        "version": 1,
+        "exported_at": crate::store::now_ms(),
+        "account": { "name": u.name, "created_at": u.created_at },
+        "settings": {
+            "timezone": settings.timezone,
+            "quiet_start": settings.quiet_start,
+            "quiet_end": settings.quiet_end,
+            "reminders_enabled": settings.reminders_enabled,
+        },
+        "devices": devices
+            .into_iter()
+            .map(|(name, created_at, last_seen)| serde_json::json!({"name": name, "created_at": created_at, "last_seen": last_seen}))
+            .collect::<Vec<_>>(),
+        "items": items,
+        "completions": completions,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{name_key, valid_name};

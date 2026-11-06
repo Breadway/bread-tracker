@@ -249,17 +249,44 @@ pub async fn require_auth(
         return Err(ApiError::TooManyRequests);
     }
     // last_seen is informational, so write it at most once per interval, not per request.
+    // A writer that stays busy past the shared retry must not turn an already admitted
+    // request into an error (and 503 would imply the budget was not spent), so log and
+    // carry on; the next request in this interval tries the update again.
     let now = now_ms();
     if now - last_seen >= LAST_SEEN_INTERVAL_MS {
-        sqlx::query(
-            "UPDATE devices SET last_seen = ? WHERE id = ? AND user_id = ? AND last_seen < ?",
+        let db = st.db.clone();
+        let device_id = id.clone();
+        let result = crate::db::retry_busy(
+            crate::db::is_busy_database_error,
+            move || {
+                let db = db.clone();
+                let device_id = device_id.clone();
+                async move {
+                    sqlx::query(
+                        "UPDATE devices SET last_seen = ? WHERE id = ? AND user_id = ? AND last_seen < ?",
+                    )
+                    .bind(now)
+                    .bind(&device_id)
+                    .bind(user_id)
+                    .bind(now - LAST_SEEN_INTERVAL_MS)
+                    .execute(&db)
+                    .await
+                }
+            },
         )
-        .bind(now)
-        .bind(&id)
-        .bind(user_id)
-        .bind(now - LAST_SEEN_INTERVAL_MS)
-        .execute(&st.db)
-        .await?;
+        .await;
+        match result {
+            Ok(_) => {}
+            Err(err) if crate::db::is_busy_database_error(&err) => {
+                tracing::warn!(
+                    error = %err,
+                    user = user_id,
+                    device = %id,
+                    "last_seen update stayed busy after retry"
+                );
+            }
+            Err(err) => return Err(err.into()),
+        }
     }
     // The user id goes in the log so abuse can be traced to an account. Never the token, and
     // only the path (no query string).
@@ -289,7 +316,31 @@ const REQUEST_WINDOW_MS: i64 = 60_000;
 /// leaves at most one row per device. Once the counter reaches `limit` the
 /// `WHERE` clause stops updating it, so the stored value saturates instead of
 /// growing without bound.
-pub async fn allow_request(db: &Db, device_id: &str, limit: i64) -> Result<bool, sqlx::Error> {
+///
+/// A writer that holds the lock past `busy_timeout` is retried under the shared
+/// one-retry policy. If it is still busy the caller gets [`ApiError::Unavailable`]
+/// (503), which a client can retry, instead of a 500. A failed attempt is rolled
+/// back before the retry, so the budget is either unchanged or incremented once.
+pub async fn allow_request(db: &Db, device_id: &str, limit: i64) -> Result<bool, ApiError> {
+    let db = db.clone();
+    let device_id = device_id.to_owned();
+    let result = crate::db::retry_busy(crate::db::is_busy_database_error, move || {
+        let db = db.clone();
+        let device_id = device_id.clone();
+        async move { try_allow_request(&db, &device_id, limit).await }
+    })
+    .await;
+    match result {
+        Ok(admitted) => Ok(admitted),
+        Err(err) if crate::db::is_busy_database_error(&err) => {
+            tracing::warn!(error = %err, "request admission stayed busy after retry");
+            Err(ApiError::Unavailable)
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+async fn try_allow_request(db: &Db, device_id: &str, limit: i64) -> Result<bool, sqlx::Error> {
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
     let now = now_ms();
     let expired_before = now.saturating_sub(REQUEST_WINDOW_MS);

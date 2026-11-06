@@ -398,6 +398,10 @@ async fn sync(
                 "completion references an unknown item".into(),
             ))
         }
+        Err(PushError::Db(e)) if crate::db::is_busy_database_error(&e) => {
+            tracing::warn!(error = %e, "sync transaction stayed busy after retry");
+            return Err(ApiError::Unavailable);
+        }
         Err(PushError::Db(e)) => return Err(e.into()),
         Err(PushError::LimitReached(message)) => return Err(ApiError::LimitReached(message)),
     }

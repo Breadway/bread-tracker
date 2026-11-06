@@ -6,7 +6,7 @@ use axum::Router;
 use bread_tracker_server::config::Config;
 use bread_tracker_server::push::{self, MockSender};
 use bread_tracker_server::store::UserDb;
-use bread_tracker_server::{api, auth, db, store, AppState};
+use bread_tracker_server::{api, auth, db, devices, store, AppState};
 use chrono::{Duration, TimeZone, Utc};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
@@ -757,7 +757,7 @@ async fn revoked_device_loses_access_immediately() {
     let h = harness().await;
     let phone = paired(&h).await;
     let tablet = paired(&h).await;
-    let list = devices::list(&h.state.db).await.unwrap();
+    let list = devices::list(&h.state.db, None).await.unwrap();
     assert_eq!(list.len(), 2);
 
     let (s, _) = call(&h.app, "GET", "/sync", Some(&phone), None).await;
@@ -771,7 +771,7 @@ async fn revoked_device_loses_access_immediately() {
         devices::revoke(&h.state.db, "zzzzzzzz").await.unwrap(),
         Revoked::NotFound
     );
-    assert_eq!(devices::list(&h.state.db).await.unwrap().len(), 2);
+    assert_eq!(devices::list(&h.state.db, None).await.unwrap().len(), 2);
 
     // Revoke the first device by a unique prefix of its id.
     let victim = &list[0];
@@ -801,14 +801,14 @@ async fn ambiguous_prefix_revokes_nothing() {
         devices::revoke(&h.state.db, "aaaa1111").await.unwrap(),
         Revoked::Ambiguous(2)
     );
-    assert_eq!(devices::list(&h.state.db).await.unwrap().len(), 4);
+    assert_eq!(devices::list(&h.state.db, None).await.unwrap().len(), 4);
     assert_eq!(
         devices::revoke(&h.state.db, "aaaa1111-0000-4000-8000-000000000002")
             .await
             .unwrap(),
         Revoked::Removed("d2".into())
     );
-    assert_eq!(devices::list(&h.state.db).await.unwrap().len(), 3);
+    assert_eq!(devices::list(&h.state.db, None).await.unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -3223,4 +3223,309 @@ async fn reviewer_file_scheduler_cross_user_todo_quiet_disabled() {
         .await
         .unwrap();
     assert_eq!(markers, 0);
+}
+
+// ---- user administration and adding your own device ----
+
+use bread_tracker_server::users;
+
+async fn rows_of(h: &Harness, uid: i64) -> [i64; 6] {
+    let mut out = [0i64; 6];
+    for (i, t) in [
+        "devices",
+        "items",
+        "completions",
+        "reminders_sent",
+        "pairing_codes",
+        "user_settings",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        out[i] = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {t} WHERE user_id = ?"))
+            .bind(uid)
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+    }
+    out
+}
+
+#[tokio::test]
+async fn pair_for_a_user_binds_the_device_to_that_user() {
+    let h = harness().await;
+    let (bob_id, _) = user_with_device(&h, "Bob").await;
+    let code = auth::create_pairing_code_for(&h.state.db, bob_id)
+        .await
+        .unwrap();
+    let (s, v) = call(
+        &h.app,
+        "POST",
+        "/pair",
+        None,
+        Some(json!({"code": code, "device_name": "Bob's tablet"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let owner: i64 = sqlx::query_scalar("SELECT user_id FROM devices WHERE id = ?")
+        .bind(v["device_id"].as_str().unwrap())
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(owner, bob_id);
+    assert_eq!(devices_of(&h, bob_id).await, 2);
+    assert_eq!(devices_of(&h, 1).await, 0, "nothing landed on the admin");
+}
+
+#[tokio::test]
+async fn pair_code_route_adds_a_device_to_the_callers_own_account() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (bob_id, bob) = user_with_device(&h, "Bob").await;
+
+    let (s, v) = call(&h.app, "POST", "/pair-code", Some(&bob), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let code = v["code"].as_str().unwrap().to_string();
+    assert_eq!(v["expires_in_secs"], 900);
+
+    // The new device joins Bob, sees Bob's data, and cannot see Alice's.
+    let now = store::now_ms();
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&bob),
+        Some(json!({"items": [item(H1, "habit", "Bob's habit", 127, None, now)]})),
+    )
+    .await;
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&alice),
+        Some(json!({"items": [item(C1, "chore", "Alice's chore", 127, None, now)]})),
+    )
+    .await;
+    let (s, p) = call(
+        &h.app,
+        "POST",
+        "/pair",
+        None,
+        Some(json!({"code": code, "device_name": "Bob tablet"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let tablet = p["token"].as_str().unwrap().to_string();
+    let (_, pulled) = call(&h.app, "GET", "/sync?since=0", Some(&tablet), None).await;
+    let names: Vec<&str> = pulled["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["Bob's habit"]);
+    assert_eq!(devices_of(&h, bob_id).await, 2);
+
+    // Single use, and it needs a token.
+    let (s, _) = call(&h.app, "POST", "/pair", None, Some(json!({"code": code}))).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _) = call(&h.app, "POST", "/pair-code", None, None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn pair_code_route_keeps_only_a_few_open_codes_per_user() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (_, bob) = user_with_device(&h, "Bob").await;
+    let mut codes = Vec::new();
+    for _ in 0..6 {
+        let (_, v) = call(&h.app, "POST", "/pair-code", Some(&bob), None).await;
+        codes.push(v["code"].as_str().unwrap().to_string());
+        // distinct timestamps so "oldest" is well defined
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+    let open_bob: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pairing_codes WHERE user_id != 1")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(open_bob, 3);
+    // A newest code still works; the oldest was replaced.
+    assert_eq!(
+        call(
+            &h.app,
+            "POST",
+            "/pair",
+            None,
+            Some(json!({"code": codes[5]}))
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(
+            &h.app,
+            "POST",
+            "/pair",
+            None,
+            Some(json!({"code": codes[0]}))
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    // Alice's codes are not touched by Bob's churn.
+    let (_, a) = call(&h.app, "POST", "/pair-code", Some(&alice), None).await;
+    assert!(a["code"].is_string());
+    let alice_open: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pairing_codes WHERE user_id = 1")
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(alice_open, 1);
+}
+
+#[tokio::test]
+async fn removing_a_user_deletes_all_of_their_data_and_nobody_elses() {
+    let h = harness().await;
+    let alice = paired(&h).await;
+    let (bob_id, bob) = user_with_device(&h, "Bob").await;
+    let now = store::now_ms();
+    for tok in [&alice, &bob] {
+        call(&h.app, "POST", "/sync", Some(tok), Some(json!({
+            "items": [item(C1, "chore", "Dishes", 127, Some("17:15"), now)], "completions": [comp(C1, "2026-10-19", now, None)]
+        }))).await;
+        call(
+            &h.app,
+            "PUT",
+            "/device",
+            Some(tok),
+            Some(json!({"fcm_token": format!("fcm-{}", &tok[..6])})),
+        )
+        .await;
+    }
+    call(
+        &h.app,
+        "PUT",
+        "/settings",
+        Some(&bob),
+        Some(json!({"timezone": "Europe/Berlin"})),
+    )
+    .await;
+    auth::create_pairing_code_for(&h.state.db, bob_id)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO reminders_sent (user_id, item_id, date, sent_at) VALUES (?, ?, '2026-10-19', 0)").bind(bob_id).bind(C1).execute(&h.state.db).await.unwrap();
+    let code = invite(&h).await;
+    let (_, v) = signup(&h, &code, "Cy").await;
+    let cy = v["token"].as_str().unwrap().to_string();
+
+    let alice_before = rows_of(&h, 1).await;
+    let cy_before = rows_of(&h, v["user_id"].as_i64().unwrap()).await;
+    assert!(
+        rows_of(&h, bob_id).await.iter().all(|n| *n >= 1),
+        "Bob owns something in every table: {:?}",
+        rows_of(&h, bob_id).await
+    );
+
+    let removed = users::remove(&h.state.db, bob_id).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            removed.name.as_str(),
+            removed.devices,
+            removed.items,
+            removed.completions
+        ),
+        ("Bob", 1, 1, 1)
+    );
+    assert_eq!(rows_of(&h, bob_id).await, [0; 6]);
+    assert_eq!(rows_of(&h, 1).await, alice_before);
+    assert_eq!(rows_of(&h, v["user_id"].as_i64().unwrap()).await, cy_before);
+
+    // Bob's token is dead immediately; the others still work.
+    assert_eq!(
+        call(&h.app, "GET", "/sync", Some(&bob), None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(&h.app, "GET", "/sync", Some(&alice), None).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&h.app, "GET", "/sync", Some(&cy), None).await.0,
+        StatusCode::OK
+    );
+    let (_, a) = call(&h.app, "GET", "/sync?since=0", Some(&alice), None).await;
+    assert_eq!(a["items"].as_array().unwrap().len(), 1);
+
+    assert!(users::find(&h.state.db, "Bob").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn the_invite_of_a_removed_user_keeps_its_record_and_the_name_can_be_reused() {
+    let h = harness().await;
+    let code = invite(&h).await;
+    let (_, v) = signup(&h, &code, "Dee").await;
+    let dee = v["user_id"].as_i64().unwrap();
+    assert_eq!(
+        invites::list(&h.state.db).await.unwrap()[0].status,
+        invites::InviteStatus::Used("Dee".into())
+    );
+    users::remove(&h.state.db, dee).await.unwrap().unwrap();
+    let invs = invites::list(&h.state.db).await.unwrap();
+    assert_eq!(invs.len(), 1, "the record stays");
+    assert_eq!(
+        invs[0].status,
+        invites::InviteStatus::Used("(removed user)".into())
+    );
+    assert_eq!(
+        signup(&h, &invite(&h).await, "Dee").await.0,
+        StatusCode::OK,
+        "the name is free again"
+    );
+}
+
+#[tokio::test]
+async fn admins_and_unknown_users_cannot_be_removed() {
+    let h = harness().await;
+    paired(&h).await;
+    assert_eq!(
+        users::remove(&h.state.db, 1).await.unwrap(),
+        Err(users::RemoveError::IsAdmin)
+    );
+    assert_eq!(
+        users::remove(&h.state.db, 999).await.unwrap(),
+        Err(users::RemoveError::NotFound)
+    );
+    assert_eq!(devices_of(&h, 1).await, 1);
+}
+
+#[tokio::test]
+async fn device_list_can_be_filtered_by_user_and_names_the_owner() {
+    let h = harness().await;
+    paired(&h).await;
+    let (bob_id, _) = user_with_device(&h, "Bob").await;
+    let all = devices::list(&h.state.db, None).await.unwrap();
+    assert_eq!(all.len(), 2);
+    let bob = devices::list(&h.state.db, Some(bob_id)).await.unwrap();
+    assert_eq!(bob.len(), 1);
+    assert_eq!(bob[0].user, "Bob");
+    assert!(devices::list(&h.state.db, Some(999))
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn first_run_check_ignores_other_users_devices() {
+    let h = harness().await;
+    user_with_device(&h, "Bob").await;
+    assert_eq!(
+        auth::admin_device_count(&h.state.db).await.unwrap(),
+        0,
+        "the owner still needs a pairing code"
+    );
+    paired(&h).await;
+    assert_eq!(auth::admin_device_count(&h.state.db).await.unwrap(), 1);
 }

@@ -236,6 +236,81 @@ pub async fn list(db: &Db) -> Result<Vec<User>, sqlx::Error> {
         .await
 }
 
+/// Find a user by name (case-insensitive, as names are unique that way).
+pub async fn find(db: &Db, name: &str) -> Result<Option<User>, sqlx::Error> {
+    find_by_name(db, name).await
+}
+
+pub async fn find_by_id(db: &Db, id: i64) -> Result<Option<User>, sqlx::Error> {
+    sqlx::query_as("SELECT id, name, is_admin, created_at FROM users WHERE id = ?")
+        .bind(id)
+        .fetch_optional(db)
+        .await
+}
+
+/// What [`remove`] deleted, counted inside the same transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Removed {
+    pub name: String,
+    pub devices: i64,
+    pub items: i64,
+    pub completions: i64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RemoveError {
+    NotFound,
+    /// Admins cannot be removed: `pair` without a user, invite ownership and first-run setup
+    /// all rely on them.
+    IsAdmin,
+}
+
+/// Delete a user and everything they own in one transaction: devices (their tokens stop
+/// working at once), items, completions, settings, reminder markers and pairing codes. Other
+/// users are untouched. Invites keep their row; the reference to the user is cleared.
+/// This is the one deletion path: the CLI uses it, and so will self-service account deletion.
+pub async fn remove(db: &Db, user_id: i64) -> Result<Result<Removed, RemoveError>, sqlx::Error> {
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    let Some((name, is_admin)): Option<(String, bool)> =
+        sqlx::query_as("SELECT name, is_admin FROM users WHERE id = ?")
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?
+    else {
+        return Ok(Err(RemoveError::NotFound));
+    };
+    if is_admin {
+        return Ok(Err(RemoveError::IsAdmin));
+    }
+    // Table names come from this fixed list, never from input.
+    let mut counts = [0i64; 3];
+    for (i, sql) in [
+        "SELECT COUNT(*) FROM devices WHERE user_id = ?",
+        "SELECT COUNT(*) FROM items WHERE user_id = ?",
+        "SELECT COUNT(*) FROM completions WHERE user_id = ?",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        counts[i] = sqlx::query_scalar(sql)
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    }
+    // Every owned table references users(id) ON DELETE CASCADE, so this removes it all.
+    sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Ok(Removed {
+        name,
+        devices: counts[0],
+        items: counts[1],
+        completions: counts[2],
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{name_key, valid_name};

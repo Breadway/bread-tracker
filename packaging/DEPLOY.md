@@ -219,3 +219,15 @@ be merged first.
 ## Invite signup admission
 
 This candidate adds migration 0008 for invites and 0009 for shared pairing/signup failure budgets. Set `BREADTRACKER_TRUSTED_PROXIES` only to the verified transport peer IPs or CIDRs of your sanitizing proxy. By default forwarded headers are ignored. Check the actual application peer and effective header chain before deployment; do not trust a client-supplied forwarded address. Pairing and signup share five failures per source per ten minutes and a 1,024-source admission cap. Successful attempts do not spend failures. Old experimental invite004 ledgers are unsupported; preserve their evidence and use a new path only for positively identified disposable experiments. Never rewrite an applied production migration ledger.
+
+## Users and devices
+
+```sh
+docker exec bread-tracker bread-tracker-server user list
+docker exec bread-tracker bread-tracker-server devices [--user NAME]
+docker exec bread-tracker bread-tracker-server pair [--user NAME]    # a code for that user's new device
+docker exec bread-tracker bread-tracker-server revoke <device id>
+docker exec bread-tracker bread-tracker-server user remove NAME --yes # deletes the user and all their data
+```
+
+Without `--user`, `pair` makes a code for the admin. Users add their own second device from the app (Settings), which calls `POST /pair-code`; you do not need to be involved. `user remove` cannot be undone, so take a backup first if in doubt; it refuses to remove an admin.

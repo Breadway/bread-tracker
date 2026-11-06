@@ -43,6 +43,7 @@ pub fn router(state: AppState) -> Router {
     let authed = Router::new()
         .route("/sync", get(pull).post(sync))
         .route("/device", put(set_device).delete(sign_out))
+        .route("/pair-code", post(new_pair_code))
         .route("/stats", get(stats))
         .route("/settings", get(get_settings).put(put_settings))
         .route("/push/test", post(push_test))
@@ -111,6 +112,26 @@ async fn pair(
             Err(ApiError::Unauthorized)
         }
     }
+}
+
+#[derive(Serialize)]
+struct PairCodeResp {
+    code: String,
+    expires_in_secs: i64,
+}
+
+/// Authenticated: a short-lived code that adds another device to the caller's own account.
+/// It is bound to the caller's user id, taken from their token, never from the request.
+async fn new_pair_code(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+) -> ApiResult<Json<PairCodeResp>> {
+    let code = auth::create_pairing_code_limited(&st.db, uid).await?;
+    tracing::info!(user = uid, "pairing code issued");
+    Ok(Json(PairCodeResp {
+        code,
+        expires_in_secs: auth::pairing_code_ttl_secs(),
+    }))
 }
 
 #[derive(Deserialize)]

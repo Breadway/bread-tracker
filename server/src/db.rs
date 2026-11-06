@@ -20,9 +20,19 @@ const OPEN_RETRY_BUDGET: Duration = Duration::from_secs(30);
 const OPEN_RETRY_FIRST: Duration = Duration::from_millis(250);
 /// Upper bound on a single backoff between open attempts.
 const OPEN_RETRY_MAX: Duration = Duration::from_secs(2);
-/// SQLite primary result code for `SQLITE_BUSY`, plus the extended busy codes that can be
-/// reported when extended result codes are enabled.
-const SQLITE_BUSY_CODES: [&str; 4] = ["5", "261", "517", "773"];
+/// SQLite result codes for `SQLITE_BUSY` and `SQLITE_LOCKED`, plus their extended forms.
+/// Extended codes are reported when the connection enables them, and the lock can appear
+/// either directly or wrapped by the migrator.
+const SQLITE_BUSY_CODES: [&str; 8] = ["5", "261", "517", "773", "6", "262", "518", "774"];
+
+/// Attempts for one operation that SQLite reports busy or locked for after its own
+/// `busy_timeout` has already elapsed. Two attempts means a single retry.
+///
+/// The bound is shared by the sync transaction, request admission and the informational
+/// last-seen update, so a caller must not wrap another retry around it.
+const BUSY_RETRY_ATTEMPTS: usize = 2;
+/// Delay before the single busy retry, short enough to stay inside a client's request timeout.
+const BUSY_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 pub async fn connect(database_url: &str) -> anyhow::Result<Db> {
     connect_with_admin(database_url, None).await
@@ -167,6 +177,33 @@ pub(crate) fn is_busy_database_error(err: &sqlx::Error) -> bool {
             .as_deref()
             .is_some_and(|code| SQLITE_BUSY_CODES.contains(&code)),
         _ => false,
+    }
+}
+
+/// Run `operation` and retry it once when it fails because SQLite is busy or locked.
+///
+/// `operation` must start from scratch on every attempt: a failed `BEGIN IMMEDIATE`
+/// transaction is rolled back when it is dropped, so no partial write from the first attempt
+/// can survive into the retry. The one-retry bound is shared with the other callers, so this
+/// helper must not be nested inside another retry.
+pub(crate) async fn retry_busy<T, E, F, Fut>(
+    is_busy: fn(&E) -> bool,
+    mut operation: F,
+) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut attempt = 1;
+    loop {
+        match operation().await {
+            Err(err) if attempt < BUSY_RETRY_ATTEMPTS && is_busy(&err) => {
+                tracing::warn!(attempt, "database is busy; retrying once");
+                tokio::time::sleep(BUSY_RETRY_DELAY).await;
+                attempt += 1;
+            }
+            result => return result,
+        }
     }
 }
 

@@ -18,9 +18,9 @@ who has been invited to a server run by somebody else. If you run the server you
   until they rotate out.
 - There is a limit on how many accounts the server accepts, how many items and history entries each
   account may hold, how many devices you can have, and how fast the app may call the server. Normal
-  use is far below these. If you do hit one, the app does not yet explain it well: syncing may
-  just show "cannot reach the server" in Settings. Ask the server owner, who can see the real
-  reason in the server log.
+  use is far below these. If you do hit one, Settings shows the server's own message (for
+  example that the item limit was reached) and the app keeps your local changes; ask the server
+  owner if it is unclear, since they can also see it in the server log.
 
 ## What you need
 

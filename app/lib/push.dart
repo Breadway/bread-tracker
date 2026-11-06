@@ -7,17 +7,12 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
 import 'data/api.dart';
 import 'data/store.dart';
-import 'reminders.dart';
 
 /// Reminder delivery. The server sends standard FCM notification messages, which Android
 /// shows itself when the app is closed; this class registers the device token with the
 /// server and shows the same notification when the app is open in the foreground.
 abstract class PushService {
   ValueListenable<PushStatus> get status;
-
-  /// Reminders the user opened by tapping the notification body. Includes the one that
-  /// launched the app, delivered once after [init].
-  Stream<ReminderPayload> get taps;
   Future<void> init();
 
   /// Send the current FCM token to the server. Safe to call whenever; does nothing when
@@ -33,8 +28,6 @@ class NoPushService implements PushService {
     PushStatus.unavailable,
   );
   @override
-  Stream<ReminderPayload> get taps => const Stream.empty();
-  @override
   Future<void> init() async {}
   @override
   Future<void> register({bool requestPermission = false}) async {}
@@ -46,9 +39,6 @@ abstract class PushDevice {
   Future<bool> permitted({required bool request});
   Future<String?> token();
   Stream<String> get tokens;
-
-  /// Reminders opened from a notification, while running or from a cold start.
-  Stream<ReminderPayload> get taps;
   void dispose();
 }
 
@@ -57,11 +47,13 @@ class FcmPushService implements PushService {
     this.store, {
     PushDevice? device,
     Api Function(String, String)? apiFactory,
+    this.onAuthLost,
   }) : _device = device ?? FirebasePushDevice(),
        _apiFactory = apiFactory ?? ((base, token) => Api(base, token: token));
   final Store store;
   final PushDevice _device;
   final Api Function(String, String) _apiFactory;
+  final void Function()? onAuthLost;
   @override
   final ValueNotifier<PushStatus> status = ValueNotifier(
     PushStatus.unavailable,
@@ -69,9 +61,6 @@ class FcmPushService implements PushService {
   bool _ready = false;
   Future<void>? _pending;
   StreamSubscription<String>? _refresh;
-
-  @override
-  Stream<ReminderPayload> get taps => _device.taps;
 
   @override
   Future<void> init() => register();
@@ -87,6 +76,9 @@ class FcmPushService implements PushService {
   }
 
   Future<void> _register(bool requestPermission) async {
+    String? requestToken;
+    late final int authGeneration;
+    late final String server;
     status.value = PushStatus.registering;
     try {
       if (!_ready) {
@@ -101,20 +93,42 @@ class FcmPushService implements PushService {
         status.value = PushStatus.denied;
         return;
       }
-      final token = await store.token;
+      authGeneration = store.authGeneration;
+      server = store.serverUrl;
+      final token = await store.readTokenForGeneration(authGeneration);
+      if (store.authGeneration != authGeneration || store.serverUrl != server) {
+        return;
+      }
+      requestToken = token;
       if (token == null) {
         status.value = PushStatus.unpaired;
         return;
       }
       final fcm = await _device.token();
+      if (store.authGeneration != authGeneration || store.serverUrl != server) {
+        return;
+      }
       if (fcm == null || fcm.isEmpty) {
         status.value = PushStatus.failed;
         return;
       }
-      await _apiFactory(store.serverUrl, token).setFcmToken(fcm);
+      await _apiFactory(server, token).setFcmToken(fcm);
+      if (store.authGeneration != authGeneration || store.serverUrl != server) {
+        return;
+      }
       status.value = PushStatus.ready;
     } on AuthLost {
+      if (requestToken == null ||
+          !await store.clearTokenIfCurrentForGeneration(
+            requestToken,
+            authGeneration,
+            expectedServer: server,
+          )) {
+        return;
+      }
       status.value = PushStatus.unpaired;
+      _ready = false;
+      onAuthLost?.call();
     } catch (_) {
       status.value = PushStatus.failed;
     }
@@ -127,25 +141,17 @@ class FcmPushService implements PushService {
 }
 
 class FirebasePushDevice implements PushDevice {
-  static const channelId = reminderChannelId;
+  static const channelId = 'reminders';
   final _local = FlutterLocalNotificationsPlugin();
-  final _taps = StreamController<ReminderPayload>.broadcast();
-  StreamSubscription<RemoteMessage>? _foreground, _opened;
-
-  @override
-  Stream<ReminderPayload> get taps => _taps.stream;
+  StreamSubscription<RemoteMessage>? _foreground;
 
   @override
   Future<void> initialize() async {
     await Firebase.initializeApp();
-    await initLocalNotifications(
-      _local,
-      // Tap on the body of a notification we built (foreground or data mode).
-      onResponse: (r) {
-        if (r.actionId != null && r.actionId!.isNotEmpty) return;
-        final p = ReminderPayload.decode(r.payload);
-        if (p != null) _taps.add(p);
-      },
+    await _local.initialize(
+      settings: const InitializationSettings(
+        android: AndroidInitializationSettings('@drawable/ic_stat_bread'),
+      ),
     );
     final android = _local
         .resolvePlatformSpecificImplementation<
@@ -159,7 +165,6 @@ class FirebasePushDevice implements PushDevice {
         importance: Importance.high,
       ),
     );
-
     await _foreground?.cancel();
     _foreground = FirebaseMessaging.onMessage.listen((message) async {
       try {
@@ -168,27 +173,6 @@ class FirebasePushDevice implements PushDevice {
         debugPrint('Could not display foreground reminder: $error');
       }
     });
-
-    // Tap on a notification Android showed itself (notification mode), app in background.
-    await _opened?.cancel();
-    _opened = FirebaseMessaging.onMessageOpenedApp.listen((m) {
-      final p = ReminderPayload.fromData(m.data);
-      if (p != null) _taps.add(p);
-    });
-
-    // App launched by a notification tap while it was not running.
-    final fcmLaunch = await FirebaseMessaging.instance.getInitialMessage();
-    final fromFcm = fcmLaunch == null
-        ? null
-        : ReminderPayload.fromData(fcmLaunch.data);
-    final local = await _local.getNotificationAppLaunchDetails();
-    final fromLocal =
-        (local?.didNotificationLaunchApp ?? false) &&
-            (local?.notificationResponse?.actionId ?? '').isEmpty
-        ? ReminderPayload.decode(local?.notificationResponse?.payload)
-        : null;
-    final launch = fromFcm ?? fromLocal;
-    if (launch != null) scheduleMicrotask(() => _taps.add(launch));
   }
 
   @override
@@ -210,34 +194,26 @@ class FirebasePushDevice implements PushDevice {
   Stream<String> get tokens => FirebaseMessaging.instance.onTokenRefresh;
 
   Future<void> _showForeground(RemoteMessage m) async {
-    final p = ReminderPayload.fromData(m.data);
     final n = m.notification;
-    if (p != null) {
-      await showReminderNotification(
-        _local,
-        ReminderPayload(
-          itemId: p.itemId,
-          date: p.date,
-          kind: p.kind,
-          title: n?.title ?? p.title,
-          body: n?.body ?? p.body,
-        ),
-      );
-      return;
-    }
     if (n == null) return;
     await _local.show(
       id: m.hashCode,
       title: n.title,
       body: n.body,
-      notificationDetails: reminderNotificationDetails(),
+      notificationDetails: const NotificationDetails(
+        android: AndroidNotificationDetails(
+          channelId,
+          'Reminders',
+          importance: Importance.high,
+          priority: Priority.high,
+          icon: '@drawable/ic_stat_bread',
+        ),
+      ),
     );
   }
 
   @override
   void dispose() {
     _foreground?.cancel();
-    _opened?.cancel();
-    _taps.close();
   }
 }

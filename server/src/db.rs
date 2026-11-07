@@ -116,11 +116,6 @@ async fn prepare(
     )
     .fetch_one(pool)
     .await?;
-    // Establish freshness from the schema before migrations, never from the
-    // current device count. Revoked devices do not make an old household new.
-    let fresh: bool = sqlx::query_scalar(
-        "SELECT NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%')",
-    ).fetch_one(pool).await?;
     if old {
         let checksum: Option<Vec<u8>> =
             sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 3")
@@ -134,17 +129,73 @@ async fn prepare(
                 .await?;
         anyhow::ensure!(invite_checksum.as_ref().map(hex::encode).as_deref() != Some("ea989dda2ed972c914b78d423bc7dff9f81f5043252d7b616c287c8cbd82c1645ff96462022c625bd3e286c110bb1ed6"),
             "unsupported experimental invites004 ledger: preserve this database and recreate ONLY your positively identified disposable task-owned fixture; never rewrite the ledger or remove production/reviewer data");
+        // TRACK-82: the rejected PR49 head shipped a 0005 that reset the owner to UTC from the
+        // current device count. Nothing can recover a value it overwrote, and its checksum is
+        // not the published 0005, so SQLx would refuse with a generic mismatch. Name it.
+        let neutral_timezone_checksum: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 5")
+                .fetch_optional(pool)
+                .await?;
+        anyhow::ensure!(neutral_timezone_checksum.as_ref().map(hex::encode).as_deref() != Some("401b8424ab749e4d1644fee4ea86f401143869ed8e2f227f46475ae519bf92b5fd59c3106f4be298bc57f92f58d7ae11"),
+            "unsupported experimental neutral-timezone 0005 ledger: this database recorded the rejected migration that reset an owner to UTC from the device count alone, and that value cannot be reconstructed; preserve this database and recreate ONLY your positively identified disposable task-owned fixture with the current migrations");
     }
+    record_install_provenance(pool).await?;
     migrator.run(pool).await?;
-    if fresh {
-        sqlx::query("UPDATE user_settings SET timezone = 'UTC' WHERE user_id = 1")
-            .execute(pool)
-            .await?;
-    }
     crate::users::reconcile_name_keys(pool).await?;
     if let Some(name) = admin_name {
         crate::users::apply_admin_name(pool, name).await?;
     }
+    Ok(())
+}
+
+/// Record, once and before any migration applies, whether this database was an empty file.
+///
+/// This is the only reliable fresh-vs-populated provenance (TRACK-82). The current device count
+/// is not: a household can revoke or lose every device and still keep its timezone, quiet hours
+/// and reminder history. Only the "fresh" answer needs recording here; an existing database
+/// without a marker is classified as populated by migration 0012, which keeps whatever 0007
+/// adopted from it. Recording before the migration run also means a first start that fails
+/// inside 0001 (rolled back, but the marker table already committed) is still fresh on retry
+/// instead of being mistaken for a populated schema.
+async fn record_install_provenance(pool: &Db) -> anyhow::Result<()> {
+    let marker_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='install_provenance')",
+    )
+    .fetch_one(pool)
+    .await?;
+    let recorded: Option<String> = if marker_exists {
+        sqlx::query_scalar("SELECT value FROM install_provenance WHERE key = 'install_kind'")
+            .fetch_optional(pool)
+            .await?
+    } else {
+        None
+    };
+    if recorded.is_some() {
+        return Ok(());
+    }
+    let empty: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' \
+         AND name NOT LIKE 'sqlite_%' AND name <> 'install_provenance')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !empty {
+        // Existing database: 0012 records it as populated and preserves its settings.
+        return Ok(());
+    }
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS install_provenance (\
+           key TEXT PRIMARY KEY, \
+           value TEXT NOT NULL CHECK (value IN ('fresh', 'populated'))\
+         )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO install_provenance (key, value) VALUES ('install_kind', 'fresh')",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -214,9 +265,6 @@ pub async fn connect_memory() -> anyhow::Result<Db> {
         .max_connections(1)
         .connect_with(opts)
         .await?;
-    sqlx::migrate!("../migrations").run(&pool).await?;
-    sqlx::query("UPDATE user_settings SET timezone = 'UTC' WHERE user_id = 1")
-        .execute(&pool)
-        .await?;
+    prepare(&pool, None, &sqlx::migrate!("../migrations")).await?;
     Ok(pool)
 }

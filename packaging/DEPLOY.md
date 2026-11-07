@@ -39,13 +39,16 @@ sqlite3 /tmp/restored.db 'select count(*) from items;'
 
 This stack adds migrations `0002_users.sql`, `0005_users_forward_repair.sql`,
 `0006_users_name_key_guard.sql`, `0007_user_settings.sql`, `0008_invites.sql`,
-`0009_public_auth_limits.sql`, `0010_user_disabled.sql` and
-`0011_authenticated_rate_limits.sql`. They are applied automatically at server start, each in
-its own transaction. The embedded set is `1,2,3,5,6,7,8,9,10,11`; `0004` is reserved for a
-separate pairing limiter and is not shipped. 0002 adds a `users` table, gives all existing data
-to the first user (the admin) and rebuilds `items`, `completions`, `devices`, `reminders_sent`
-and `pairing_codes` with a `user_id`. 0005 restores the scheduler indexes the rebuild drops and
-adds a name key. 0006 tightens the name-key guard. Phones keep working without an app update:
+`0009_public_auth_limits.sql`, `0010_user_disabled.sql`,
+`0011_authenticated_rate_limits.sql` and `0012_install_provenance.sql`. They are applied
+automatically at server start, each in its own transaction. The embedded set is
+`1,2,3,5,6,7,8,9,10,11,12`; `0004` is reserved for a separate pairing limiter and is not
+shipped. 0002 adds a `users` table, gives all existing data to the first user (the admin) and
+rebuilds `items`, `completions`, `devices`, `reminders_sent` and `pairing_codes` with a
+`user_id`. 0005 restores the scheduler indexes the rebuild drops and adds a name key. 0006
+tightens the name-key guard. 0012 records whether the database was an empty file before this
+run and gives only a genuinely new installation the neutral UTC default; an existing household
+keeps its timezone even when it has no devices left. Phones keep working without an app update:
 the sync API did not change.
 
 **This source branch is not a deployment approval.** Routes, reminder settings and scheduler

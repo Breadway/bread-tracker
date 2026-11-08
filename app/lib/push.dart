@@ -53,7 +53,7 @@ abstract class PushDevice {
   Stream<String> get tokens;
 
   /// Reminders opened from a notification, while running or from a cold start.
-  Stream<ReminderPayload> get taps;
+  Stream<ReminderPayload> get taps => const Stream.empty();
   void dispose();
 }
 
@@ -62,11 +62,13 @@ class FcmPushService implements PushService {
     this.store, {
     PushDevice? device,
     Api Function(String, String)? apiFactory,
-  }) : device = device ?? FirebasePushDevice(),
+    this.onAuthLost,
+  }) : _device = device ?? FirebasePushDevice(),
        _apiFactory = apiFactory ?? ((base, token) => Api(base, token: token));
   final Store store;
-  final PushDevice device;
+  final PushDevice _device;
   final Api Function(String, String) _apiFactory;
+  final void Function()? onAuthLost;
   @override
   final ValueNotifier<PushStatus> status = ValueNotifier(
     PushStatus.unavailable,
@@ -76,21 +78,21 @@ class FcmPushService implements PushService {
   StreamSubscription<String>? _refresh;
 
   @override
-  Stream<ReminderPayload> get taps => device.taps;
+  Stream<ReminderPayload> get taps => _device.taps;
 
   void acknowledgeTap(ReminderPayload payload) {
-    final d = device;
+    final d = _device;
     if (d is FirebasePushDevice) d.acknowledgeTap(payload);
   }
 
   void replayPendingTap() {
-    final d = device;
+    final d = _device;
     if (d is FirebasePushDevice) d.replayPendingTap();
   }
 
   @override
   void releaseTapDelivery() {
-    final d = device;
+    final d = _device;
     if (d is FirebasePushDevice) d.releaseTapDelivery();
   }
 
@@ -108,35 +110,59 @@ class FcmPushService implements PushService {
   }
 
   Future<void> _register(bool requestPermission) async {
+    String? requestToken;
+    late final int authGeneration;
+    late final String server;
     status.value = PushStatus.registering;
     try {
       if (!_ready) {
-        await device.initialize();
-        _refresh = device.tokens.listen(
+        await _device.initialize();
+        _refresh = _device.tokens.listen(
           (_) => unawaited(register()),
           onError: (Object _) => status.value = PushStatus.failed,
         );
         _ready = true;
       }
-      if (!await device.permitted(request: requestPermission)) {
+      if (!await _device.permitted(request: requestPermission)) {
         status.value = PushStatus.denied;
         return;
       }
-      final token = await store.token;
+      authGeneration = store.authGeneration;
+      server = store.serverUrl;
+      final token = await store.readTokenForGeneration(authGeneration);
+      if (store.authGeneration != authGeneration || store.serverUrl != server) {
+        return;
+      }
+      requestToken = token;
       if (token == null) {
         status.value = PushStatus.unpaired;
         return;
       }
-      final fcm = await device.token();
+      final fcm = await _device.token();
+      if (store.authGeneration != authGeneration || store.serverUrl != server) {
+        return;
+      }
       if (fcm == null || fcm.isEmpty) {
         status.value = PushStatus.failed;
         return;
       }
-      await _apiFactory(store.serverUrl, token).setFcmToken(fcm);
+      await _apiFactory(server, token).setFcmToken(fcm);
+      if (store.authGeneration != authGeneration || store.serverUrl != server) {
+        return;
+      }
       status.value = PushStatus.ready;
     } on AuthLost {
-      await store.clearToken();
+      if (requestToken == null ||
+          !await store.clearTokenIfCurrentForGeneration(
+            requestToken,
+            authGeneration,
+            expectedServer: server,
+          )) {
+        return;
+      }
       status.value = PushStatus.unpaired;
+      _ready = false;
+      onAuthLost?.call();
     } catch (_) {
       status.value = PushStatus.failed;
     }
@@ -144,7 +170,7 @@ class FcmPushService implements PushService {
 
   void dispose() {
     _refresh?.cancel();
-    device.dispose();
+    _device.dispose();
   }
 }
 

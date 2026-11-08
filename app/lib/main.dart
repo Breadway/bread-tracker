@@ -18,19 +18,23 @@ Future<void> main() async {
     ..sound = store.sound
     ..haptics = store.haptics;
   await sfx.init();
-  final push = FcmPushService(store);
   // Data-only reminders (server BREADTRACKER_PUSH_MODE=data) are turned into notifications
   // with a Mark done action by this top-level handler, in a background isolate.
   FirebaseMessaging.onBackgroundMessage(reminderBackgroundMessage);
+  late final ProviderContainer container;
+  final push = FcmPushService(
+    store,
+    onAuthLost: () =>
+        container.read(pairedStateRevisionProvider.notifier).refresh(),
+  );
+  container = createAppContainer(
+    prefs: prefs,
+    store: store,
+    sfx: sfx,
+    push: push,
+  );
   runApp(
-    ProviderScope(
-      overrides: [
-        prefsProvider.overrideWithValue(prefs),
-        sfxProvider.overrideWithValue(sfx),
-        pushProvider.overrideWithValue(push),
-      ],
-      child: const TrackerApp(),
-    ),
+    UncontrolledProviderScope(container: container, child: const TrackerApp()),
   );
   // Never hold the first frame behind Firebase or a network request.
   push.init();

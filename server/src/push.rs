@@ -2,19 +2,20 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use async_trait::async_trait;
-use chrono::{DateTime, Datelike, NaiveTime, TimeZone, Utc};
+use chrono::{
+    DateTime, Datelike, Duration as ChronoDuration, NaiveDateTime, NaiveTime, TimeZone, Utc,
+};
 use chrono_tz::Tz;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{Completion, Item};
-use crate::store::{self, now_ms};
+use crate::store::{self, now_ms, UserDb};
 use crate::AppState;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -148,12 +149,12 @@ pub fn fcm_payload(msg: &Message, mode: PushMode) -> serde_json::Value {
 }
 
 pub struct Fcm {
-    mode: PushMode,
     client: reqwest::Client,
     project_id: String,
     client_email: String,
     key: EncodingKey,
     token_uri: String,
+    mode: PushMode,
     cached: tokio::sync::Mutex<Option<(String, Instant)>>,
 }
 
@@ -268,8 +269,26 @@ pub fn in_quiet_hours(now: NaiveTime, quiet: Option<(NaiveTime, NaiveTime)>) -> 
     }
 }
 
+/// When a reminder at `at` may first be sent: `at` itself, or the end of the quiet window
+/// it fell inside (it is held back during quiet hours and released when they end).
+fn release_time(at: NaiveDateTime, quiet: Option<(NaiveTime, NaiveTime)>) -> NaiveDateTime {
+    let Some((s, e)) = quiet else { return at };
+    if !in_quiet_hours(at.time(), quiet) {
+        return at;
+    }
+    let day = at.date();
+    if s <= e || at.time() < e {
+        day.and_time(e)
+    } else {
+        (day + ChronoDuration::days(1)).and_time(e) // window wraps midnight and we are before it
+    }
+}
+
 /// Reminders that should go out now. A reminder is due once its local time has passed,
-/// until `grace_mins` later; it is skipped when already done today or already sent.
+/// until `grace_mins` later. A reminder whose time falls inside quiet hours is held until
+/// the quiet window ends and then gets its full grace from that moment, so a long quiet
+/// window cannot swallow it. Yesterday's held reminders are considered too, because they
+/// are released the next morning. Skipped when done or already sent.
 pub fn due_reminders(
     now: DateTime<Tz>,
     items: &[Item],
@@ -279,48 +298,64 @@ pub fn due_reminders(
     quiet: Option<(NaiveTime, NaiveTime)>,
 ) -> Vec<Due> {
     let local = now.naive_local();
-    let today = local.date();
-    let date = today.format("%Y-%m-%d").to_string();
     if in_quiet_hours(local.time(), quiet) {
         return Vec::new();
     }
-    let done: HashSet<&str> = completions
+    let today = local.date();
+    // Chores and habits are done per day. A to-do is done once, on whichever day it was
+    // ticked (the app records the tick date, which can be before the due date).
+    let todo_ids: HashSet<&str> = items
         .iter()
-        .filter(|c| c.date == date && c.deleted_at.is_none())
-        .map(|c| c.item_id.as_str())
+        .filter(|i| i.kind == "todo")
+        .map(|i| i.id.as_str())
         .collect();
-
     let mut out = Vec::new();
-    for it in items.iter().filter(|i| i.active && i.deleted_at.is_none()) {
-        let Some(rt) = it
-            .remind_time
-            .as_deref()
-            .and_then(|t| NaiveTime::parse_from_str(t, "%H:%M").ok())
-        else {
-            continue;
-        };
-        let applies = match it.kind.as_str() {
-            "chore" | "habit" => it.weekdays & (1 << today.weekday().num_days_from_monday()) != 0,
-            "todo" => it.due_date.as_deref() == Some(date.as_str()),
-            _ => false,
-        };
-        if !applies
-            || done.contains(it.id.as_str())
-            || sent.contains(&(it.id.clone(), date.clone()))
-        {
-            continue;
+    for day in [today - ChronoDuration::days(1), today] {
+        let date = day.format("%Y-%m-%d").to_string();
+        let done: HashSet<&str> = completions
+            .iter()
+            .filter(|c| {
+                c.deleted_at.is_none() && (c.date == date || todo_ids.contains(c.item_id.as_str()))
+            })
+            .map(|c| c.item_id.as_str())
+            .collect();
+        for it in items.iter().filter(|i| i.active && i.deleted_at.is_none()) {
+            let Some(rt) = it
+                .remind_time
+                .as_deref()
+                .and_then(|t| NaiveTime::parse_from_str(t, "%H:%M").ok())
+            else {
+                continue;
+            };
+            let applies = match it.kind.as_str() {
+                "chore" | "habit" => it.weekdays & (1 << day.weekday().num_days_from_monday()) != 0,
+                "todo" => it.due_date.as_deref() == Some(date.as_str()),
+                _ => false,
+            };
+            if !applies
+                || done.contains(it.id.as_str())
+                || sent.contains(&(it.id.clone(), date.clone()))
+            {
+                continue;
+            }
+            let at = day.and_time(rt);
+            let from = release_time(at, quiet);
+            // Yesterday's reminders only matter when quiet hours held them over midnight;
+            // an ordinary missed one is still dropped at the day boundary.
+            if day < today && from == at {
+                continue;
+            }
+            let late = (local - from).num_minutes();
+            if late < 0 || late > grace_mins {
+                continue;
+            }
+            out.push(Due {
+                item_id: it.id.clone(),
+                name: it.name.clone(),
+                kind: it.kind.clone(),
+                date: date.clone(),
+            });
         }
-        let at = today.and_time(rt);
-        let late = (local - at).num_minutes();
-        if late < 0 || late > grace_mins {
-            continue;
-        }
-        out.push(Due {
-            item_id: it.id.clone(),
-            name: it.name.clone(),
-            kind: it.kind.clone(),
-            date: date.clone(),
-        });
     }
     out
 }
@@ -339,34 +374,43 @@ fn parse_quiet(start: &str, end: &str) -> Option<(NaiveTime, NaiveTime)> {
     Some((s, e))
 }
 
-/// One scheduler pass. Returns the number of reminders sent.
+/// One scheduler pass over every user. Returns the number of reminders sent.
+///
+/// Each user's timezone, quiet hours, enabled switch, rows and devices are scoped independently.
+/// An error for one user is logged and never prevents the next user's pass.
 pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize> {
-    if !st.push.enabled() || store::get_setting(&st.db, "reminders_enabled").await? != "1" {
+    if !st.push.enabled() {
         return Ok(0);
     }
-    let tz = Tz::from_str(&store::get_setting(&st.db, "timezone").await?)
-        .unwrap_or(chrono_tz::Australia::Perth);
-    let quiet = parse_quiet(
-        &store::get_setting(&st.db, "quiet_start").await?,
-        &store::get_setting(&st.db, "quiet_end").await?,
-    );
-    let now = tz.from_utc_datetime(&now_utc.naive_utc());
-    let date = now.format("%Y-%m-%d").to_string();
+    let users: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM users WHERE disabled_at IS NULL ORDER BY id")
+            .fetch_all(&st.db)
+            .await?;
+    let mut count = 0;
+    for uid in users {
+        match tick_user(st, UserDb::new(&st.db, uid), now_utc).await {
+            Ok(n) => count += n,
+            Err(e) => tracing::error!(user = uid, error = ?e, "reminder tick failed for user"),
+        }
+    }
+    Ok(count)
+}
 
-    let items = store::all_items(&st.db).await?;
-    let completions: Vec<Completion> = store::all_completions(&st.db)
-        .await?
-        .into_iter()
-        .filter(|c| c.date == date)
-        .collect();
-    let sent: HashSet<(String, String)> = sqlx::query_as::<_, (String, String)>(
-        "SELECT item_id, date FROM reminders_sent WHERE date = ?",
-    )
-    .bind(&date)
-    .fetch_all(&st.db)
-    .await?
-    .into_iter()
-    .collect();
+async fn tick_user(st: &AppState, user: UserDb, now_utc: DateTime<Utc>) -> anyhow::Result<usize> {
+    let settings = user.settings().await?;
+    if !settings.reminders_enabled {
+        return Ok(0);
+    }
+    let quiet = parse_quiet(&settings.quiet_start, &settings.quiet_end);
+    let now = settings.tz().from_utc_datetime(&now_utc.naive_utc());
+    let date = now.format("%Y-%m-%d").to_string();
+    let yesterday = (now.date_naive() - ChronoDuration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+
+    let items = user.reminder_items().await?;
+    let completions = user.reminder_completions(&date, &yesterday).await?;
+    let sent = user.sent_reminders(&date, &yesterday).await?;
 
     let due = due_reminders(
         now,
@@ -380,8 +424,9 @@ pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize
         return Ok(0);
     }
     let devices: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, fcm_token FROM devices WHERE fcm_token IS NOT NULL AND fcm_token != ''",
+        "SELECT id, fcm_token FROM devices WHERE user_id = ? AND fcm_token IS NOT NULL AND fcm_token != ''",
     )
+    .bind(user.user_id())
     .fetch_all(&st.db)
     .await?;
     if devices.is_empty() {
@@ -405,38 +450,54 @@ pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize
             match st.push.send(&msg).await {
                 Ok(SendOutcome::Sent) => delivered = true,
                 Ok(SendOutcome::Unregistered) => {
-                    tracing::info!(device = %device_id, "fcm token unregistered, clearing");
-                    sqlx::query("UPDATE devices SET fcm_token = NULL WHERE id = ?")
-                        .bind(device_id)
-                        .execute(&st.db)
-                        .await?;
+                    tracing::info!(user = user.user_id(), device = %device_id, "fcm token unregistered, clearing");
+                    // Clear only the token FCM rejected: a delayed answer must not wipe a
+                    // newer token the device registered while the send was in flight.
+                    sqlx::query(
+                        "UPDATE devices SET fcm_token = NULL WHERE id = ? AND user_id = ? AND fcm_token = ?",
+                    )
+                    .bind(device_id)
+                    .bind(user.user_id())
+                    .bind(token)
+                    .execute(&st.db)
+                    .await?;
                 }
-                Err(e) => tracing::warn!(error = ?e, item = %d.item_id, "reminder send failed"),
+                Err(e) => tracing::warn!(
+                    user = user.user_id(),
+                    error = ?e,
+                    item = %d.item_id,
+                    "reminder send failed"
+                ),
             }
         }
         if delivered {
-            sqlx::query(
-                "INSERT OR IGNORE INTO reminders_sent (item_id, date, sent_at) VALUES (?, ?, ?)",
-            )
-            .bind(&d.item_id)
-            .bind(&d.date)
-            .bind(now_ms())
-            .execute(&st.db)
-            .await?;
+            user.mark_reminder_sent(&d.item_id, &d.date).await?;
             count += 1;
         }
     }
     Ok(count)
 }
 
+/// Ticks between cleanup passes (30 s each, so about an hour).
+const PRUNE_EVERY_TICKS: u64 = 120;
+
 pub fn spawn_scheduler(st: AppState) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
+        let mut n: u64 = 0;
         loop {
             interval.tick().await;
             if let Err(e) = tick(&st, Utc::now()).await {
                 tracing::error!(error = ?e, "reminder tick failed");
             }
+            if n.is_multiple_of(PRUNE_EVERY_TICKS) {
+                match store::prune(&st.db, now_ms()).await {
+                    Ok(p) if p != store::Pruned::default() => tracing::info!(?p, "pruned old rows"),
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(error = ?e, "cleanup failed"),
+                }
+            }
+            n = n.wrapping_add(1);
         }
     });
 }

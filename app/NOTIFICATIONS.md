@@ -17,9 +17,10 @@ The APK is `app/build/app/outputs/flutter-apk/app-debug.apk` relative to the
 repository root. It is a debug build, not a signed production release.
 
 Android builds require the gitignored `android/app/google-services.json` for
-Firebase project `bread-tracker-df441`, package `dev.breadway.tracker`. This client
-configuration is not the server service-account private key. Never put the
-service-account key in the app or repository.
+the operator's Firebase project configured for the app package name
+`dev.breadway.tracker`. This client configuration is not the server
+service-account private key. Never put the service-account key in the app or
+repository.
 
 ## Pairing and notifications
 
@@ -64,7 +65,7 @@ Repeat reminders, overdue to-dos and snooze are not implemented.
 - Deny notification permission, then enable it in Android settings and retry.
 - Pair without notification permission, then enable it and confirm registration.
 - Complete an item offline and verify sync after reconnecting.
-- Confirm scheduled reminders use Perth time and skip completed items.
+- Confirm scheduled reminders use the server's configured timezone and skip completed items.
 - With `BREADTRACKER_PUSH_MODE=data`: reminders arrive and show Mark done with
   the app foregrounded, backgrounded, swiped away and after a reboot; check
   battery optimisation settings on the phone.

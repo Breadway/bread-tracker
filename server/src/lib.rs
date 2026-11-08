@@ -10,6 +10,7 @@ pub mod invites;
 pub mod model;
 pub mod public_auth;
 pub mod push;
+pub mod stats;
 pub mod store;
 pub mod users;
 pub mod xp;

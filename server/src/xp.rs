@@ -33,19 +33,67 @@ pub struct Stats {
     pub streaks: BTreeMap<String, i64>,
 }
 
+impl Stats {
+    /// Assemble a result from parts whose XP is already complete (base plus perfect bonuses).
+    /// Keeping the level/rank arithmetic here means a stats aggregate cannot fork the rules.
+    pub fn from_parts(xp: i64, perfect_days: Vec<String>, streaks: BTreeMap<String, i64>) -> Stats {
+        let level = xp / XP_PER_LEVEL + 1;
+        Stats {
+            xp,
+            level,
+            rank: rank_for(level).to_string(),
+            into_level: xp % XP_PER_LEVEL,
+            per_level: XP_PER_LEVEL,
+            perfect_days,
+            streaks,
+        }
+    }
+}
+
 pub fn rank_for(level: i64) -> &'static str {
     RANKS[((level - 1).max(0) as usize).min(RANKS.len() - 1)]
 }
 
-fn parse(d: &str) -> Option<NaiveDate> {
+pub(crate) fn parse(d: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()
+}
+
+/// Weekdays on which an item counts as scheduled, as a 7-bit mask (bit 0 = Monday).
+///
+/// An item only contributes to a day's schedule while it is live, active and a chore or habit.
+/// The incremental stats ledger stores the same mask for an item, so a schedule change is a
+/// mask difference and a day's scheduled count is one bit test. `scheduled_on` and the ledger
+/// therefore cannot disagree.
+pub(crate) fn scheduled_weekday_bits(kind: &str, weekdays: i64, active: bool, deleted: bool) -> u8 {
+    if deleted || !active || (kind != "chore" && kind != "habit") {
+        return 0;
+    }
+    (weekdays as u8) & 0x7f
 }
 
 /// A chore or habit is scheduled on `date` when its weekday bit is set.
 fn scheduled_on(item: &Item, date: NaiveDate) -> bool {
-    item.active
-        && (item.kind == "chore" || item.kind == "habit")
-        && item.weekdays & (1 << date.weekday().num_days_from_monday()) != 0
+    scheduled_on_parts(
+        &item.kind,
+        item.weekdays,
+        item.active,
+        item.deleted_at.is_some(),
+        date,
+    )
+}
+
+/// [`scheduled_on`] from already-extracted item fields, so the incremental ledger and the
+/// full-history reference evaluate the same predicate instead of two similar ones.
+pub(crate) fn scheduled_on_parts(
+    kind: &str,
+    weekdays: i64,
+    active: bool,
+    deleted: bool,
+    date: NaiveDate,
+) -> bool {
+    scheduled_weekday_bits(kind, weekdays, active, deleted)
+        & (1 << date.weekday().num_days_from_monday())
+        != 0
 }
 
 pub fn compute(items: &[Item], completions: &[Completion], today: NaiveDate) -> Stats {
@@ -98,16 +146,7 @@ pub fn compute(items: &[Item], completions: &[Completion], today: NaiveDate) -> 
         streaks.insert(item.id.clone(), n);
     }
 
-    let level = xp / XP_PER_LEVEL + 1;
-    Stats {
-        xp,
-        level,
-        rank: rank_for(level).to_string(),
-        into_level: xp % XP_PER_LEVEL,
-        per_level: XP_PER_LEVEL,
-        perfect_days,
-        streaks,
-    }
+    Stats::from_parts(xp, perfect_days, streaks)
 }
 
 #[cfg(test)]

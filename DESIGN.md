@@ -21,7 +21,20 @@ below).
 - `POST /sync {since, items, completions}` pushes local changes then returns every row with `seq > since` plus the new `cursor`, in one round trip. `GET /sync?since=` is pull only.
 - Conflicts: last write wins by `updated_at`; ties keep the server row. Timestamps more than a day in the future are clamped.
 - Batches are limited to 5000 rows and 2 MiB. A completion dated more than 7 days ahead of the server's UTC date, or before 2020, is rejected; `completed_at` is clamped like `updated_at`.
-- Housekeeping runs hourly in the scheduler: `reminders_sent` older than two days and expired pairing codes are deleted. Tombstoned items and completions are retained because the current cursor protocol has no per-device acknowledgement or forced-full-resync contract; pruning them could strand an offline client. XP and streak statistics use all retained history. A bounded-history or retention policy requires an explicit backward-compatible protocol/product decision before implementation.
+- Housekeeping runs hourly in the scheduler: `reminders_sent` older than two days and expired pairing codes are deleted. Tombstoned items and completions are retained because the current cursor protocol has no per-device acknowledgement or forced-full-resync contract; pruning them could strand an offline client. A bounded-history or retention policy requires an explicit backward-compatible protocol/product decision before implementation.
+
+## Statistics
+
+XP, perfect days and streaks are defined over all retained history, so they are never truncated. `GET /stats` instead reads an incremental ledger that stores exactly the aggregates those rules produce (migration 0014):
+
+- `stats_item_date` is the set of calendar dates on which an item has at least one live completion, with the number of live stored rows behind each canonical date. Two stored encodings of one date count once, matching the rule's date set.
+- `stats_day.done_scheduled` counts, per date, the distinct live active chore/habit items that are scheduled that weekday and done. `stats_schedule` holds the per-weekday count of live scheduled items. A date is perfect when its count is positive and equals its weekday's scheduled count.
+- `stats_user.xp_base` is `points * completed dates` over live items. The perfect-day bonus is added at read time, and level/rank come from `xp::Stats::from_parts`, so read aggregation cannot fork the rules.
+- Streaks are counted by walking `stats_item_date` backwards from today (or yesterday when today is not done), so the work is the streak length, not the history length.
+
+The ledger changes in the same `BEGIN IMMEDIATE` transaction as every accepted sync write. A completion tick or tombstone updates one item-date and its day; an item create, edit, deactivate, delete or resurrection updates base XP, the schedule mask and only that item's affected dates. An update that loses last-write-wins changes nothing. `/stats` reads base XP, days, schedule counts and habits in one deferred read transaction, so it sees one committed snapshot even while a sync writes, and it never scans `completions`.
+
+A database upgraded from before 0014 is built once, per account, by the server before it listens: `stats_state` marks accounts not yet built, the rebuild reads retained history inside one transaction per account, and an interrupted rebuild stays pending for the next start. `UserDb::rebuild_stats` is the same path as an explicit repair. Nothing user-visible is changed, and history is never deleted. The ledger is maintained only by `UserDb::apply_push`; any future writer of `items` or `completions` must update it too or call the rebuild.
 
 ## Auth
 
@@ -86,7 +99,9 @@ SQLx identifies a migration by its numeric version and the SHA-384 of its file, 
 | 0010 | `0010_user_disabled.sql` | PR51 | non-destructive account disabling |
 | 0011 | `0011_authenticated_rate_limits.sql` | PR51 | durable per-device request admission |
 | 0012 | `0012_install_provenance.sql` | default (TRACK-82) | records fresh-vs-populated provenance and gives only a genuinely new installation the neutral UTC default |
-| 0013 and up | | coordinate downstream before integration | later multi-user and family migrations |
+| 0013 | `0013_item_created_on.sql` | PR115 (TRACK-65), in review | immutable item creation date for perfect-day scoring |
+| 0014 | `0014_stats_ledger.sql` | TRACK-72 | incremental XP, perfect-day and streak ledger, rebuilt once per account on upgrade |
+| 0015 and up | | coordinate downstream before integration | later multi-user and family migrations |
 
 Why 0005 exists. 0003 was applied on deployments before 0002 can run, and 0002 rebuilds `items` and `completions`, which drops every index on them. SQLx will not rerun the recorded 0003, so those indexes would silently disappear and the scheduler would scan the whole history again. 0005 recreates them with `IF NOT EXISTS`, so it is a no-op wherever they survived (a fresh database, where 0002 runs before 0003). It also adds `completions_item_date (item_id, date)`, because the primary key `(user_id, item_id, date)` cannot serve the to-do suppression lookup by item id.
 

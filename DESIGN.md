@@ -14,7 +14,7 @@ Without a link there is no sharing, and a child is fully usable with no parent.
 - 120 XP per level; level = xp / 120 + 1. Ranks, one per level and clamped at the last: Flour, Dough, Proofing, Rising, Baked, Golden Crust, Sourdough Master.
 - A habit **streak** is the run of consecutive completed days ending today, or ending yesterday when today is not done yet.
 - Un-ticked completions and completions of deleted items earn nothing.
-- Perfect days are evaluated against the current item definitions, not the schedule as it was in the past. TRACK-65 changes this: an item joins a day's schedule from the day after its immutable creation date, so adding an item cannot revoke a perfect day that was already earned (see Family).
+- Perfect days are evaluated against the current item definitions, not the schedule as it was in the past.
 
 ## Sync
 

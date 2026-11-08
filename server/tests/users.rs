@@ -373,6 +373,41 @@ async fn failed_insert_over_http_leaves_the_code_for_the_retry() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// SQLite result codes for BUSY and LOCKED, including the extended forms. The server's
+/// classifier is crate-private, so this integration test matches the documented codes itself.
+const SQLITE_BUSY_CODES: [&str; 8] = ["5", "261", "517", "773", "6", "262", "518", "774"];
+const BUSY_RETRY_ATTEMPTS: usize = 3;
+const BUSY_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn is_busy_database_error(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Database(db) => db
+            .code()
+            .as_deref()
+            .is_some_and(|code| SQLITE_BUSY_CODES.contains(&code)),
+        _ => false,
+    }
+}
+
+/// Redeem a pairing code, retrying only when SQLite reported BUSY or LOCKED before producing a
+/// result. A lost race still returns `None` and is never retried, so a second winner still fails
+/// the caller's exactly-one-device assertion.
+async fn redeem_with_busy_retry(
+    pool: &SqlitePool,
+    code: &str,
+    device_name: &str,
+) -> Result<Option<(String, String)>, sqlx::Error> {
+    for attempt in 1..=BUSY_RETRY_ATTEMPTS {
+        match auth::redeem(pool, code, device_name).await {
+            Err(error) if attempt < BUSY_RETRY_ATTEMPTS && is_busy_database_error(&error) => {
+                tokio::time::sleep(BUSY_RETRY_BACKOFF).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the final attempt returns instead of looping")
+}
+
 #[tokio::test]
 async fn concurrent_redemptions_of_one_code_create_exactly_one_device() {
     let dir = tempfile::tempdir().unwrap();
@@ -387,7 +422,7 @@ async fn concurrent_redemptions_of_one_code_create_exactly_one_device() {
             let pool = pool.clone();
             let code = code.clone();
             tasks.push(tokio::spawn(async move {
-                auth::redeem(&pool, &code, &format!("racer {n}")).await
+                redeem_with_busy_retry(&pool, &code, &format!("racer {n}")).await
             }));
         }
         let mut winners = 0;

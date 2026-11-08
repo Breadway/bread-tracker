@@ -3212,6 +3212,44 @@ async fn signup_is_public_but_the_other_routes_still_need_a_token() {
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 }
 
+// ---- concurrency helpers ----
+
+/// SQLite result codes for BUSY and LOCKED, including the extended forms. The server has an
+/// equivalent classifier in `db`, but it is crate-private, so this integration test matches the
+/// documented codes itself.
+const SQLITE_BUSY_CODES: [&str; 8] = ["5", "261", "517", "773", "6", "262", "518", "774"];
+const BUSY_RETRY_ATTEMPTS: usize = 3;
+const BUSY_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn is_busy_database_error(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Database(db) => db
+            .code()
+            .as_deref()
+            .is_some_and(|code| SQLITE_BUSY_CODES.contains(&code)),
+        _ => false,
+    }
+}
+
+/// Redeem an invite, retrying only when SQLite reported BUSY or LOCKED before producing a
+/// result. A lost race still returns `BadInvite` and is never retried, so a second successful
+/// redemption still fails the caller's exactly-one-winner assertion.
+async fn signup_with_busy_retry(
+    pool: &sqlx::SqlitePool,
+    code: &str,
+    name: &str,
+) -> Result<Result<invites::SignedUp, invites::SignupError>, sqlx::Error> {
+    for attempt in 1..=BUSY_RETRY_ATTEMPTS {
+        match invites::signup(pool, code, name, "phone", None, 1000).await {
+            Err(error) if attempt < BUSY_RETRY_ATTEMPTS && is_busy_database_error(&error) => {
+                tokio::time::sleep(BUSY_RETRY_BACKOFF).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the final attempt returns instead of looping")
+}
+
 #[tokio::test]
 async fn concurrent_double_redeem_creates_exactly_one_user() {
     // A file database with several connections, so the two redemptions really race.
@@ -3228,7 +3266,7 @@ async fn concurrent_double_redeem_creates_exactly_one_user() {
         for i in 0..8 {
             let (pool, code) = (pool.clone(), code.clone());
             tasks.push(tokio::spawn(async move {
-                invites::signup(&pool, &code, &format!("R{round}U{i}"), "phone", None, 1000)
+                signup_with_busy_retry(&pool, &code, &format!("R{round}U{i}"))
                     .await
                     .unwrap()
             }));

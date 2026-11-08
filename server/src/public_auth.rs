@@ -10,8 +10,11 @@ use sqlx::{Sqlite, Transaction};
 use crate::{db::Db, error::ApiError, store::now_ms, AppState};
 
 const WINDOW_MS: i64 = 600_000;
-const MAX_FAILURES: i64 = 5;
-const MAX_SOURCES: i64 = 1024;
+/// Failed attempts a source may spend in one window before pairing and signup deny it.
+pub const MAX_FAILURES: i64 = 5;
+/// Largest number of live per-source budgets; at capacity a new source is denied rather than
+/// evicting a live one.
+pub const MAX_SOURCES: i64 = 1024;
 
 #[derive(Debug, Clone)]
 pub struct TrustedProxy {

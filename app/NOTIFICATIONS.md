@@ -16,12 +16,12 @@ flutter build apk --debug
 The APK is `app/build/app/outputs/flutter-apk/app-debug.apk` relative to the
 repository root. It is a debug build, not a signed production release.
 
-Push needs the gitignored `android/app/google-services.json` for
-Firebase project `bread-tracker-df441`, package `dev.breadway.tracker`. Without it the
-build still succeeds (with a warning) but push registration fails at runtime. This client
-configuration is not the server service-account private key. Never put the
-service-account key in the app or repository. Release signing, versioning and getting
-the APK onto a phone are in `RELEASE.md`.
+Push needs the gitignored `android/app/google-services.json` for the operator's
+Firebase project configured for the app package name `dev.breadway.tracker`.
+Without it the build still succeeds (with a warning) but push registration fails
+at runtime. This client configuration is not the server service-account private
+key. Never put the service-account key in the app or repository. Release signing,
+versioning and getting the APK onto a phone are in `RELEASE.md`.
 
 ## Pairing and notifications
 
@@ -51,6 +51,6 @@ foreground. **Mark done from a notification is not implemented yet.**
 - Deny notification permission, then enable it in Android settings and retry.
 - Pair without notification permission, then enable it and confirm registration.
 - Complete an item offline and verify sync after reconnecting.
-- Confirm scheduled reminders use Perth time and skip completed items.
+- Confirm scheduled reminders use the server's configured timezone and skip completed items.
 - Test under Doze. Android force-stop is different from swiping away and can
   prevent delivery until the app is opened again.

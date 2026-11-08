@@ -104,11 +104,22 @@ class FakeServer {
       if (e != null && e['updated_at'] >= c['updated_at']) continue;
       comps[k] = {...c, 'seq': ++seq};
     }
+    // A cursor past the database cursor means the snapshot rolled back, so the
+    // server returns everything instead of an empty delta.
+    final rolledBack = since > seq;
     return {
       'cursor': seq,
       'epoch': epoch,
-      'items': items.values.where((i) => i['seq'] > since).toList(),
-      'completions': comps.values.where((c) => c['seq'] > since).toList(),
+      'items':
+          (rolledBack
+                  ? items.values
+                  : items.values.where((i) => i['seq'] > since))
+              .toList(),
+      'completions':
+          (rolledBack
+                  ? comps.values
+                  : comps.values.where((c) => c['seq'] > since))
+              .toList(),
       'server_time': 0,
     };
   }
@@ -170,6 +181,7 @@ class MemStore extends Store {
 }
 
 const id1 = '11111111-1111-4111-8111-111111111111';
+const id2 = '22222222-2222-4222-8222-222222222222';
 
 Future<(AppDb, SyncEngine, MemStore)> device(FakeServer s) async {
   SharedPreferences.setMockInitialValues({});
@@ -295,7 +307,11 @@ void main() {
       isNull,
       reason: 'a revoked token is forgotten, not retried forever',
     );
-    expect(await sync.sync(), SyncStatus.unpaired, reason: 'nothing left to send');
+    expect(
+      await sync.sync(),
+      SyncStatus.unpaired,
+      reason: 'nothing left to send',
+    );
 
     server.reject = false;
     await store.saveToken('new');
@@ -549,6 +565,46 @@ void main() {
     expect(server.outgoingItemCounts.skip(outgoingAfterFirst), everyElement(0));
   });
 
+  test(
+    'same-generation rollback behind the local cursor reoffers clean rows',
+    () async {
+      final server = FakeServer();
+      final (db, sync, store) = await device(server);
+      await db.upsertItem(
+        ItemsCompanion.insert(
+          id: id1,
+          kind: 'chore',
+          name: 'Dishes',
+          points: 10,
+          updatedAt: 1000,
+          dirty: const Value(true),
+        ),
+      );
+      await db.upsertItem(
+        ItemsCompanion.insert(
+          id: id2,
+          kind: 'chore',
+          name: 'Read',
+          points: 5,
+          updatedAt: 1000,
+          dirty: const Value(true),
+        ),
+      );
+      expect(await sync.sync(), SyncStatus.idle);
+      expect(store.cursor, greaterThan(0));
+      // Restoring an older replica can keep the sidecar while losing rows and
+      // rewinding seq, so the epoch alone cannot expose the rollback.
+      server.items.remove(id1);
+      server.items[id2]!['seq'] = 1;
+      server.seq = 1;
+      expect(await sync.sync(), SyncStatus.idle);
+      expect(server.items.keys, containsAll([id1, id2]));
+      expect(server.items[id1]!['name'], 'Dishes');
+      expect(server.outgoingItemCounts.last, 2);
+      expect(store.epoch, 'epoch-1');
+    },
+  );
+
   test('empty stale generation preflight only discovers, then a real change reuploads once', () async {
     final server = FakeServer();
     final (db, sync, store) = await device(server);
@@ -626,7 +682,11 @@ void main() {
     );
 
     // A fresh engine over the same database and preferences is a process restart.
-    final restarted = SyncEngine(db, store, apiFactory: (_, _) => FakeApi(server));
+    final restarted = SyncEngine(
+      db,
+      store,
+      apiFactory: (_, _) => FakeApi(server),
+    );
     expect(await restarted.sync(), SyncStatus.idle);
     expect(server.items.length, 5001, reason: 'all rows recovered');
     expect(store.epoch, 'bulk-restore');
@@ -1005,7 +1065,6 @@ void main() {
     await db.close();
   });
 
-
   test('default Api instances share one http client instead of opening one per call', () async {
     final seen = <String>[];
     final shared = MockClient((r) async {
@@ -1054,7 +1113,6 @@ void main() {
     );
   });
 
-
   test('a real TCP connection is reused across Api instances and rotated credentials', () async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     server.autoCompress = false;
@@ -1088,6 +1146,4 @@ void main() {
     );
     expect(tokens, ['Bearer old-token', 'Bearer rotated-token']);
   });
-
-
 }

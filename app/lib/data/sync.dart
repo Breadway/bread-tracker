@@ -6,7 +6,27 @@ import 'api.dart';
 import 'database.dart';
 import 'store.dart';
 
-enum SyncStatus { idle, syncing, offline, unpaired, rejected }
+/// Outcome of a sync pass. Policy refusals are distinct from [offline]: the
+/// server was reachable and answered, but retrying cannot fix the account
+/// state without a user or owner action.
+enum SyncStatus {
+  idle,
+  syncing,
+  offline,
+  unpaired,
+  rejected,
+  quotaExhausted,
+  accountDisabled,
+  rateLimited,
+}
+
+extension SyncStatusPolicy on SyncStatus {
+  bool get isPolicyRejection =>
+      this == SyncStatus.quotaExhausted ||
+      this == SyncStatus.accountDisabled ||
+      this == SyncStatus.rateLimited ||
+      this == SyncStatus.rejected;
+}
 
 class _RestoreBatch {
   const _RestoreBatch(this.items, this.completions);
@@ -86,10 +106,11 @@ class SyncEngine {
     final api = _apiFactory(server, token);
 
     final requestEpoch = store.epoch;
+    final requestCursor = store.cursor;
     Map<String, dynamic> preflight;
     try {
       preflight = await api.sync(
-        store.cursor,
+        requestCursor,
         const [],
         const [],
         epoch: requestEpoch,
@@ -103,14 +124,21 @@ class SyncEngine {
       return SyncStatus.unpaired;
     }
     final serverEpoch = preflight['epoch'] as String?;
+    final serverCursor = preflight['cursor'] as int? ?? 0;
+    final lostRowsBehindCursor =
+        serverEpoch != null &&
+        requestEpoch != null &&
+        serverCursor < requestCursor;
 
     if (serverEpoch != null &&
         requestEpoch != null &&
-        serverEpoch != requestEpoch) {
+        (serverEpoch != requestEpoch || lostRowsBehindCursor)) {
       // A restored or rebuilt server. Apply the complete snapshot with plain LWW first
       // (dirty is not a freshness indicator: a synced phone row can be newer than a
       // restored backup), then offer every local row again under the new generation.
-      // The new epoch is committed only after the last upload succeeds.
+      // A rollback that kept the same sidecar generation is caught by the server cursor
+      // being behind ours: those rows are clean locally and would never be re-offered
+      // otherwise. The new epoch is committed only after the last upload succeeds.
       return _reuploadAfterRestore(
         preflight,
         serverEpoch,
@@ -124,7 +152,12 @@ class SyncEngine {
       // An upgraded install has a cursor from a server it never recorded an epoch for.
       // Reconcile it once as a full exchange: pull the whole snapshot before accepting
       // the new generation as the owner of the cursor.
-      if (!await _applySnapshot(preflight, storeGeneration, generation, server)) {
+      if (!await _applySnapshot(
+        preflight,
+        storeGeneration,
+        generation,
+        server,
+      )) {
         return SyncStatus.unpaired;
       }
       // This install never recorded a generation, so its clean rows may never have been
@@ -180,8 +213,16 @@ class SyncEngine {
   SyncStatus _apiFailure(ApiException error) {
     final code = error.statusCode;
     if (code != null && code >= 400 && code < 500) {
+      // The token is valid enough to be answered, so keep it and the dirty
+      // rows. The status tells the UI whether waiting, freeing quota or an
+      // owner action is the only way forward.
       rejectionMessage = error.message;
-      return SyncStatus.rejected;
+      return switch (code) {
+        403 => SyncStatus.accountDisabled,
+        422 => SyncStatus.quotaExhausted,
+        429 => SyncStatus.rateLimited,
+        _ => SyncStatus.rejected,
+      };
     }
     return SyncStatus.offline;
   }
@@ -196,6 +237,8 @@ class SyncEngine {
   ) async {
     if (!_isCurrent(generation, storeGeneration, server)) return false;
     await db.transaction(() async {
+      // A sign-out may have started between the preflight check and this write.
+      if (!_isCurrent(generation, storeGeneration, server)) return;
       for (final row
           in (snapshot['items'] as List).cast<Map<String, dynamic>>()) {
         await db.upsertItemIfNewer(_itemCompanion(row));
@@ -282,13 +325,14 @@ class SyncEngine {
         return SyncStatus.unpaired;
       }
       responseEpoch = res['epoch'] as String?;
-      if (epoch != null &&
-          responseEpoch != null &&
-          responseEpoch != epoch) {
+      if (epoch != null && responseEpoch != null && responseEpoch != epoch) {
         // A second restore landed during this exchange. Restart from preflight.
         return SyncStatus.offline;
       }
       await db.transaction(() async {
+        // Re-check inside the same database write transaction used for applying the
+        // response. Sign-out performs its local wipe in a database transaction too.
+        if (!_isCurrent(generation, storeGeneration, server)) return;
         // Rows unchanged since we pushed them are now clean.
         for (final i in batch.items) {
           await (db.update(db.items)..where(
@@ -321,7 +365,8 @@ class SyncEngine {
           final local =
               await (db.select(db.completions)..where(
                     (t) =>
-                        t.itemId.equals(j['item_id']) & t.date.equals(j['date']),
+                        t.itemId.equals(j['item_id']) &
+                        t.date.equals(j['date']),
                   ))
                   .getSingleOrNull();
           if (local != null && local.updatedAt > (j['updated_at'] as int)) {

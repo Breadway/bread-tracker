@@ -360,16 +360,19 @@ async fn main() -> anyhow::Result<()> {
         None => {}
     }
 
-    // A server owns the generation exclusively for its listener lifetime. Pair is a
-    // short SQLite transaction and does not acquire the generation file lock. Take the lock
-    // before opening or migrating the database so a refused start changes nothing.
-    let startup_lock = db::GenerationLock::try_acquire_lifetime_exclusive(&config.database_path)
-        .context("another server or restore operation already owns this database")?;
+    // A running server holds the generation lock shared for its listener lifetime. Servers
+    // sharing one database keep working (the shared request budget relies on that), and
+    // generation reconciliation is serialised by the database transaction it opens, so the
+    // sidecar, journal and SQLite row still agree for every process. Restore marking needs
+    // the exclusive lock, so it refuses while any server holds this one. Pair is a short
+    // SQLite transaction and does not acquire the generation file lock. Take the lock before
+    // opening or migrating the database so a refused start changes nothing.
+    let generation_lock = db::GenerationLock::try_acquire_shared(&config.database_path)
+        .context("a restore operation is marking this database")?;
     let db = db::connect_with_admin(&config.database_url(), config.admin_name.as_deref())
         .await
         .context("opening database")?;
     let generation = db::reconcile_generation_locked(&db, &config.database_path).await?;
-    let generation_lock = startup_lock;
 
     let sender: Arc<dyn push::PushSender> = match &config.fcm_service_account {
         Some(path) => Arc::new(push::Fcm::from_file(path).context("loading FCM service account")?),

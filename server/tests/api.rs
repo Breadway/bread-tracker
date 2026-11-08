@@ -3805,9 +3805,11 @@ async fn new_client_optional_wire_fields_are_ignored_and_legacy_rows_survive() {
 }
 
 /// Generous deadline for a debug-build server binary to open its database, migrate,
-/// take the generation lock and bind on a loaded CI runner. It only bounds how long
-/// a broken child can wedge the suite; the tests still assert the real behaviour.
-const STARTUP_DEADLINE: StdDuration = StdDuration::from_secs(60);
+/// take the generation lock and bind on a loaded CI runner. The runner is shared with the
+/// other check jobs and the whole workspace suite, so process startup can take far longer
+/// than it does on an idle machine. It only bounds how long a broken child can wedge the
+/// suite; the tests still assert the real behaviour.
+const STARTUP_DEADLINE: StdDuration = StdDuration::from_secs(180);
 
 /// A spawned server binary whose stderr is captured to a file in the test's temp
 /// directory. The child is always killed and reaped when this value drops, so a
@@ -3850,37 +3852,6 @@ impl ServerProcess {
             if std::time::Instant::now() >= deadline {
                 panic!(
                     "server did not become ready on {address} within {STARTUP_DEADLINE:?}:\n{}",
-                    self.stderr_output()
-                );
-            }
-            thread::sleep(StdDuration::from_millis(20));
-        }
-    }
-
-    /// Waits for the child to exit. Panics with the captured stderr if it starts
-    /// listening instead, or if it neither starts nor exits before the deadline.
-    fn wait_for_fail_closed(
-        &mut self,
-        address: std::net::SocketAddr,
-        timeout: StdDuration,
-    ) -> std::process::ExitStatus {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                return status;
-            }
-            if std::net::TcpStream::connect_timeout(&address, StdDuration::from_millis(50)).is_ok()
-            {
-                let _ = self.child.kill();
-                panic!(
-                    "server accepted connections on {address} although the generation lock is held; stderr:\n{}",
-                    self.stderr_output()
-                );
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = self.child.kill();
-                panic!(
-                    "server neither failed closed nor started within {timeout:?}; stderr:\n{}",
                     self.stderr_output()
                 );
             }
@@ -4057,7 +4028,7 @@ fn default_database_path_refusal_does_not_create_a_failure_sentinel() {
 }
 
 #[test]
-fn second_server_startup_fails_closed_while_first_owns_generation_lock() {
+fn second_server_shares_the_database_and_restore_marking_still_refuses() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("concurrent-start.db");
     let address1 = std::net::TcpListener::bind("127.0.0.1:0")
@@ -4077,18 +4048,49 @@ fn second_server_startup_fails_closed_while_first_owns_generation_lock() {
             .env("BREADTRACKER_FCM_SERVICE_ACCOUNT", "");
         command
     };
+    // Servers hold the generation lock shared: a second process may serve the same
+    // database, which the shared request budget already relies on. Both reconcile the
+    // generation through the database transaction, so they agree on one epoch.
     let mut first = ServerProcess::spawn(command(address1), dir.path().join("first.stderr.log"));
     first.wait_until_listening(address1);
     let mut second = ServerProcess::spawn(command(address2), dir.path().join("second.stderr.log"));
-    let status = second.wait_for_fail_closed(address2, STARTUP_DEADLINE);
+    second.wait_until_listening(address2);
+    let sidecar = database.with_extension("sync-generation");
+    let generation = std::fs::read_to_string(&sidecar).unwrap().trim().to_owned();
     assert!(
-        !status.success(),
-        "second server must fail closed promptly while first holds generation lock; stderr:\n{}",
+        uuid::Uuid::parse_str(&generation).is_ok(),
+        "startup must publish one generation sidecar, got {generation:?}"
+    );
+    // The marker still needs the exclusive lock, so a healthy server pair refuses it
+    // without touching the sidecar or arming the failure sentinel.
+    let marker = Command::new(binary)
+        .arg("mark-restored")
+        .env("BREADTRACKER_DATABASE_PATH", &database)
+        .env("BREADTRACKER_LISTEN", address1.to_string())
+        .output()
+        .unwrap();
+    assert!(
+        !marker.status.success(),
+        "restore marker must refuse while servers hold the shared generation lock"
+    );
+    assert!(String::from_utf8_lossy(&marker.stderr).contains("server is running"));
+    assert!(!database.with_extension("sync-restore-failed").exists());
+    assert_eq!(
+        std::fs::read_to_string(&sidecar).unwrap().trim(),
+        generation
+    );
+    // One server leaving does not take the database away from the other.
+    drop(first);
+    assert!(
+        second.child.try_wait().unwrap().is_none(),
+        "the surviving server must stay running; stderr:\n{}",
         second.stderr_output()
     );
-    // Both guards are dropped here, killing and reaping either child if it is
-    // somehow still alive.
-    drop(first);
+    assert!(
+        std::net::TcpStream::connect_timeout(&address2, StdDuration::from_millis(50)).is_ok(),
+        "the surviving server must keep serving; stderr:\n{}",
+        second.stderr_output()
+    );
     drop(second);
 }
 

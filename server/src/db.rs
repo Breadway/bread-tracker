@@ -733,11 +733,11 @@ mod generation_tests {
     }
 
     #[tokio::test]
-    async fn startup_lock_conflicts_with_server_lifetime_shared_lock() {
+    async fn restore_marker_conflicts_with_server_lifetime_shared_lock() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tracker.db");
         let _server = GenerationLock::try_acquire_shared(&path).unwrap();
-        assert!(GenerationLock::try_acquire_exclusive(&path).is_err());
+        assert!(GenerationLock::try_acquire_lifetime_exclusive(&path).is_err());
     }
 
     #[tokio::test]

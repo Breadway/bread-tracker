@@ -51,8 +51,25 @@ class _GateState extends ConsumerState<Gate> {
         if (isPaired || skipped) return const Shell();
         return PairScreen(
           onSkip: () async {
-            await prefs.setBool('skipPair', true);
-            setState(() {});
+            try {
+              final saved = await prefs.setBool('skipPair', true);
+              if (!saved) {
+                await prefs.reload();
+                if (!(prefs.getBool('skipPair') ?? false)) {
+                  throw StateError('Offline choice was not persisted.');
+                }
+              }
+              if (mounted) setState(() {});
+            } catch (_) {
+              if (!context.mounted) return;
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text(
+                    'Could not save offline mode. Pairing remains available.',
+                  ),
+                ),
+              );
+            }
           },
         );
       },

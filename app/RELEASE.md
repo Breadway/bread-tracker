@@ -2,8 +2,16 @@
 
 ## Toolchain
 
-`source scripts/android-env.sh` puts Flutter, JDK 17 and the Android SDK on PATH (user-space
-install, see that file for the expected locations). Then:
+`source scripts/android-env.sh` adds Flutter and the Android SDK to PATH and keeps an existing
+`JAVA_HOME` (or uses `/usr/lib/jvm/java-17-openjdk` when that package is installed). For a
+user-space JDK, export it first; adjust the version to what you installed:
+
+```sh
+export JAVA_HOME="$HOME/.local/share/java/jdk-17.0.21+9"
+source scripts/android-env.sh
+```
+
+Then:
 
 ```sh
 scripts/build-apk.sh debug
@@ -49,6 +57,15 @@ Give Gradle the key either in `app/android/key.properties` (gitignored; copy
 
 key.properties wins over the environment. With any of the four missing, `assembleRelease` and
 `bundleRelease` fail with a message saying so, rather than producing a debug-signed release.
+
+To check what an APK was signed with (use the build-tools version you have):
+
+```sh
+"$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs \
+  app/build/app/outputs/flutter-apk/app-release.apk
+```
+
+The certificate must be your upload key, never `CN=Android Debug`.
 
 ## Versioning
 

@@ -26,7 +26,13 @@ jobs:
       - name: clippy
         run: cd src && cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # Two jobs share this runner and the host still builds locally, so file-backed SQLite
+      # tests can be starved past the 5 s production busy timeout. The larger test-only wait
+      # keeps "database is locked" from masking a real assertion failure; the product default
+      # stays at 5 s and no test retries an exclusivity failure.
       - name: test
+        env:
+          BREADTRACKER_BUSY_TIMEOUT_MS: "30000"
         run: cd src && cargo test --workspace --locked
 
   app:

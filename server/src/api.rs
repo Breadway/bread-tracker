@@ -203,7 +203,7 @@ async fn delete_account(
     let u = users::find_by_id(&st.db, uid)
         .await?
         .ok_or(ApiError::Unauthorized)?;
-    if !req.confirm.trim().eq_ignore_ascii_case(&u.name) {
+    if users::name_key(req.confirm.trim()) != users::name_key(&u.name) {
         return Err(ApiError::BadRequest(
             "confirmation does not match the account name".into(),
         ));
@@ -230,8 +230,9 @@ struct PairCodeResp {
 /// It is bound to the caller's user id, taken from their token, never from the request.
 async fn new_pair_code(
     State(st): State<AppState>,
-    Extension(UserId(uid)): Extension<UserId>,
+    Extension(caller): Extension<auth::CallerIdentity>,
 ) -> ApiResult<Json<PairCodeResp>> {
+    let uid = caller.user_id;
     let devices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE user_id = ?")
         .bind(uid)
         .fetch_one(&st.db)
@@ -242,7 +243,9 @@ async fn new_pair_code(
             st.config.limits.max_devices
         )));
     }
-    let code = auth::create_pairing_code_limited(&st.db, uid).await?;
+    let code = auth::create_pairing_code_limited(&st.db, &caller)
+        .await?
+        .ok_or(ApiError::Unauthorized)?;
     tracing::info!(user = uid, "pairing code issued");
     Ok(Json(PairCodeResp {
         code,
@@ -394,6 +397,10 @@ async fn sync(
             return Err(ApiError::BadRequest(
                 "completion references an unknown item".into(),
             ))
+        }
+        Err(PushError::Db(e)) if crate::db::is_busy_database_error(&e) => {
+            tracing::warn!(error = %e, "sync transaction stayed busy after retry");
+            return Err(ApiError::Unavailable);
         }
         Err(PushError::Db(e)) => return Err(e.into()),
         Err(PushError::LimitReached(message)) => return Err(ApiError::LimitReached(message)),

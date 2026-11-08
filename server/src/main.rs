@@ -92,11 +92,18 @@ async fn main() -> anyhow::Result<()> {
                         println!("{}  {}  {}", device.id, device.user, device.name);
                     }
                 }
-                Some("revoke") if args.len() == 3 => match devices::revoke(&db, &args[2]).await? {
-                    devices::Revoked::Removed(name) => println!("Revoked device {name:?}."),
-                    devices::Revoked::NotFound => anyhow::bail!("no matching device"),
-                    devices::Revoked::Ambiguous(_) => anyhow::bail!("ambiguous device prefix"),
-                },
+                Some("revoke") => {
+                    only_positionals(
+                        &args[2..],
+                        1,
+                        "usage: bread-tracker-server device revoke <id>",
+                    )?;
+                    match devices::revoke(&db, &args[2]).await? {
+                        devices::Revoked::Removed(name) => println!("Revoked device {name:?}."),
+                        devices::Revoked::NotFound => anyhow::bail!("no matching device"),
+                        devices::Revoked::Ambiguous(_) => anyhow::bail!("ambiguous device prefix"),
+                    }
+                }
                 _ => anyhow::bail!("usage: device list [--user <name>] | device revoke <id>"),
             }
             return Ok(());
@@ -104,6 +111,11 @@ async fn main() -> anyhow::Result<()> {
         Some("user") => {
             match args.get(1).map(String::as_str) {
                 Some("list") => {
+                    only_positionals(
+                        &args[2..],
+                        0,
+                        "usage: bread-tracker-server user list",
+                    )?;
                     for u in users::list(&db).await? {
                         let devices = devices::list(&db, Some(u.id)).await?.len();
                         println!(
@@ -118,12 +130,22 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 Some("export") => {
-                    let name = args.get(2).context("usage: bread-tracker-server user export <name>")?;
+                    only_positionals(
+                        &args[2..],
+                        1,
+                        "usage: bread-tracker-server user export <name>",
+                    )?;
+                    let name = &args[2];
                     let Some(user) = users::find(&db, name).await? else { anyhow::bail!("no user named {name:?}") };
                     println!("{}", serde_json::to_string_pretty(&users::export(&db, user.id).await?)?);
                 }
                 Some(which @ ("disable" | "enable")) => {
-                    let name = args.get(2).context("usage: bread-tracker-server user disable|enable <name>")?;
+                    only_positionals(
+                        &args[2..],
+                        1,
+                        "usage: bread-tracker-server user disable|enable <name>",
+                    )?;
+                    let name = &args[2];
                     let Some(user) = users::find(&db, name).await? else { anyhow::bail!("no user named {name:?}") };
                     if !users::set_disabled(&db, user.id, which == "disable").await? {
                         anyhow::bail!("{} is an admin and cannot be disabled", user.name);
@@ -131,14 +153,11 @@ async fn main() -> anyhow::Result<()> {
                     println!("{} {}d.", user.name, which);
                 }
                 Some("remove") => {
-                    let name = args
-                        .get(2)
-                        .filter(|a| !a.starts_with("--"))
-                        .context("usage: bread-tracker-server user remove <name> --yes")?;
+                    let (name, confirmed) = remove_name(&args[2..])?;
                     let Some(user) = users::find(&db, name).await? else {
                         anyhow::bail!("no user named {name:?}")
                     };
-                    if !args.iter().any(|a| a == "--yes") {
+                    if !confirmed {
                         anyhow::bail!(
                             "this deletes {} and all of their devices, items, completions and settings, and cannot be undone. Run again with --yes to confirm.",
                             user.name
@@ -162,9 +181,12 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some("revoke") => {
-            let Some(id) = args.get(1) else {
-                anyhow::bail!("usage: bread-tracker-server revoke <device id or prefix>");
-            };
+            only_positionals(
+                &args[1..],
+                1,
+                "usage: bread-tracker-server revoke <device id or prefix>",
+            )?;
+            let id = &args[1];
             match devices::revoke(&db, id).await? {
                 devices::Revoked::Removed(name) => println!("Revoked device \"{name}\"."),
                 devices::Revoked::NotFound => anyhow::bail!(
@@ -179,20 +201,27 @@ async fn main() -> anyhow::Result<()> {
         Some("invite") => {
             match args.get(1).map(String::as_str) {
                 Some("create") => {
-                    let ttl_ms = match args.iter().position(|a| a == "--ttl") {
-                        Some(i) => {
-                            let v = args
-                                .get(i + 1)
-                                .context("--ttl needs a value such as 7d, 48h or 90m")?;
-                            invites::parse_ttl(v).with_context(|| format!("invalid --ttl {v:?} (use e.g. 7d, 48h, 90m; 1 minute to 365 days)"))?
+                    let usage = "usage: bread-tracker-server invite create [--ttl 7d]";
+                    let ttl_ms = match &args[2..] {
+                        [] => config.invite_ttl_days * 86_400_000,
+                        [flag, value] if flag == "--ttl" => {
+                            anyhow::ensure!(
+                                !value.starts_with('-'),
+                                "--ttl needs a value such as 7d, 48h or 90m; {usage}"
+                            );
+                            invites::parse_ttl(value).with_context(|| format!("invalid --ttl {value:?} (use e.g. 7d, 48h, 90m; 1 minute to 365 days)"))?
                         }
-                        None => config.invite_ttl_days * 86_400_000,
+                        [flag, _] if flag.starts_with('-') => {
+                            anyhow::bail!("unknown option {flag:?}; {usage}")
+                        }
+                        _ => anyhow::bail!("{usage}"),
                     };
                     let (id, code) = invites::create(&db, users::ADMIN_ID, ttl_ms).await?;
                     println!("{code}");
                     eprintln!("Invite {id}, valid until {}. It can be used once; it cannot be shown again.", fmt_ms(bread_tracker_server::store::now_ms() + ttl_ms));
                 }
                 Some("list") => {
+                    only_positionals(&args[2..], 0, "usage: bread-tracker-server invite list")?;
                     let list = invites::list(&db).await?;
                     if list.is_empty() {
                         println!("No invites.");
@@ -214,9 +243,14 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 Some("revoke") => {
-                    let id: i64 = args.get(2).and_then(|v| v.parse().ok()).context(
+                    only_positionals(
+                        &args[2..],
+                        1,
                         "usage: bread-tracker-server invite revoke <id from `invite list`>",
                     )?;
+                    let id: i64 = args[2].parse().with_context(|| {
+                        "usage: bread-tracker-server invite revoke <id from `invite list`>"
+                    })?;
                     match invites::revoke(&db, id).await? {
                         invites::Revoked::Revoked => println!("Invite {id} revoked."),
                         invites::Revoked::NotFound => anyhow::bail!("no invite {id}"),
@@ -268,6 +302,47 @@ async fn main() -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await
     .context("server error")
+}
+
+/// Destructive and state-changing subcommands take exactly their documented arguments. An
+/// unknown label, repeated flag or extra positional is a usage error, never something to
+/// silently ignore before a delete.
+fn only_positionals(args: &[String], expected: usize, usage: &str) -> anyhow::Result<()> {
+    if let Some(flag) = args.iter().find(|a| a.starts_with('-')) {
+        anyhow::bail!("unknown option {flag:?}; {usage}");
+    }
+    anyhow::ensure!(
+        args.len() == expected,
+        "expected {expected} argument(s), got {}; {usage}",
+        args.len()
+    );
+    Ok(())
+}
+
+/// `user remove <name> [--yes]`. The name comes first and may not look like a flag; `--yes`
+/// may appear at most once after it. Without it the caller must still see the confirmation
+/// prompt and nothing is deleted.
+fn remove_name(args: &[String]) -> anyhow::Result<(&str, bool)> {
+    const USAGE: &str = "usage: bread-tracker-server user remove <name> --yes";
+    let name = args
+        .first()
+        .filter(|a| !a.starts_with('-'))
+        .ok_or_else(|| anyhow::anyhow!("missing user name; {USAGE}"))?;
+    let mut confirmed = false;
+    for arg in &args[1..] {
+        match arg.as_str() {
+            "--yes" => {
+                anyhow::ensure!(
+                    !confirmed,
+                    "option \"--yes\" was given more than once; {USAGE}"
+                );
+                confirmed = true;
+            }
+            other if other.starts_with('-') => anyhow::bail!("unknown option {other:?}; {USAGE}"),
+            other => anyhow::bail!("unexpected extra argument {other:?}; {USAGE}"),
+        }
+    }
+    Ok((name, confirmed))
 }
 
 fn fmt_ms(ms: i64) -> String {

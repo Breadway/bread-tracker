@@ -4,7 +4,27 @@ import 'api.dart';
 import 'database.dart';
 import 'store.dart';
 
-enum SyncStatus { idle, syncing, offline, unpaired, rejected }
+/// Outcome of a sync pass. Policy refusals are distinct from [offline]: the
+/// server was reachable and answered, but retrying cannot fix the account
+/// state without a user or owner action.
+enum SyncStatus {
+  idle,
+  syncing,
+  offline,
+  unpaired,
+  rejected,
+  quotaExhausted,
+  accountDisabled,
+  rateLimited,
+}
+
+extension SyncStatusPolicy on SyncStatus {
+  bool get isPolicyRejection =>
+      this == SyncStatus.quotaExhausted ||
+      this == SyncStatus.accountDisabled ||
+      this == SyncStatus.rateLimited ||
+      this == SyncStatus.rejected;
+}
 
 class SyncEngine {
   SyncEngine(
@@ -107,11 +127,18 @@ class SyncEngine {
       }
       return SyncStatus.unpaired;
     } on ApiException catch (error) {
-      if (error.statusCode != null &&
-          error.statusCode! >= 400 &&
-          error.statusCode! < 500) {
+      final status = error.statusCode;
+      if (status != null && status >= 400 && status < 500) {
+        // The token is valid enough to be answered, so keep it and the dirty
+        // rows. The status tells the UI whether waiting, freeing quota or an
+        // owner action is the only way forward.
         rejectionMessage = error.message;
-        return SyncStatus.rejected;
+        return switch (status) {
+          403 => SyncStatus.accountDisabled,
+          422 => SyncStatus.quotaExhausted,
+          429 => SyncStatus.rateLimited,
+          _ => SyncStatus.rejected,
+        };
       }
       return SyncStatus.offline;
     }

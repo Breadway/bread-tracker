@@ -86,6 +86,24 @@ impl UserDb {
         completions: &[Completion],
         limits: &crate::config::Limits,
     ) -> Result<(), PushError> {
+        // BEGIN IMMEDIATE serializes admission across processes, so normal contention
+        // waits instead of upgrading a read snapshot. If SQLite still reports busy after
+        // its busy timeout, reuse the shared one-retry policy rather than surfacing an
+        // internal error. A retry starts from scratch: neither the counts nor any upsert
+        // from the failed attempt can leak into it.
+        crate::db::retry_busy(
+            |err| matches!(err, PushError::Db(e) if crate::db::is_busy_database_error(e)),
+            || self.try_apply_push(items, completions, limits),
+        )
+        .await
+    }
+
+    async fn try_apply_push(
+        &self,
+        items: &[Item],
+        completions: &[Completion],
+        limits: &crate::config::Limits,
+    ) -> Result<(), PushError> {
         let ceiling = now_ms() + DAY_MS;
         let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
         let mut item_count: i64 =

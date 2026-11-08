@@ -5173,6 +5173,83 @@ async fn the_admin_cannot_delete_their_account_from_the_app() {
 }
 
 #[tokio::test]
+async fn deleting_a_unicode_name_account_folds_case_but_not_spelling() {
+    let h = harness().await;
+    let (s, v) = signup(&h, &invite(&h).await, "Älex").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let alex = v["token"].as_str().unwrap().to_string();
+    let alex_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE name = 'Älex'")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+
+    // A different spelling is not the same name, even when it differs by one letter.
+    for body in [
+        json!({"confirm": "Alex"}),
+        json!({"confirm": "Älexx"}),
+        json!({"confirm": "Äle"}),
+    ] {
+        let (s, v) = call(&h.app, "DELETE", "/account", Some(&alex), Some(body)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    }
+    assert_eq!(
+        call(&h.app, "GET", "/me", Some(&alex), None).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        count(
+            &h,
+            &format!("SELECT COUNT(*) FROM users WHERE id = {alex_id}")
+        )
+        .await,
+        1
+    );
+
+    // The same name in another case is accepted, and the surrounding-space trim is kept.
+    let (s, v) = call(
+        &h.app,
+        "DELETE",
+        "/account",
+        Some(&alex),
+        Some(json!({"confirm": "  äLEX "})),
+    )
+    .await;
+    assert_eq!(
+        (s, v["deleted"].as_bool()),
+        (StatusCode::OK, Some(true)),
+        "{v}"
+    );
+    assert_eq!(
+        count(
+            &h,
+            &format!("SELECT COUNT(*) FROM users WHERE id = {alex_id}")
+        )
+        .await,
+        0
+    );
+
+    // The admin self-delete guard is reached after the caseless match, not bypassed by it.
+    let admin = paired(&h).await;
+    let (s, v) = call(
+        &h.app,
+        "DELETE",
+        "/account",
+        Some(&admin),
+        Some(json!({"confirm": "ADMIN"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(
+        call(&h.app, "GET", "/me", Some(&admin), None).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        count(&h, "SELECT COUNT(*) FROM users WHERE id = 1").await,
+        1
+    );
+}
+
+#[tokio::test]
 async fn deletion_through_the_api_and_the_cli_use_the_same_code_path() {
     // Same row accounting as users::remove (used by the CLI), and both leave no row behind in
     // any table that has a user_id column.

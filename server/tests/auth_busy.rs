@@ -22,6 +22,10 @@ impl ServerProcess {
             .env("BREADTRACKER_DATABASE_PATH", db_path)
             .env("BREADTRACKER_LISTEN", format!("127.0.0.1:{port}"))
             .env("BREADTRACKER_REQUESTS_PER_MINUTE", "1000")
+            // This test waits out two busy timeouts. Pin the production value so a CI-wide
+            // override (for example the 30 s used by the loaded test job) cannot push the
+            // request past the 30 s deadline below.
+            .env("BREADTRACKER_BUSY_TIMEOUT_MS", "5000")
             .env("RUST_LOG", "warn")
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err))

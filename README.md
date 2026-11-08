@@ -37,6 +37,12 @@ environment variable, all optional:
 | `BREADTRACKER_DATABASE_PATH` | `bread-tracker.db` | SQLite file |
 | `BREADTRACKER_FCM_SERVICE_ACCOUNT` | unset | Path to a Firebase service-account JSON. Push is disabled without it |
 | `BREADTRACKER_REMINDER_GRACE_MINS` | `360` | How long after its time a reminder may still be sent |
+| `BREADTRACKER_BUSY_TIMEOUT_MS` | `5000` | Milliseconds a connection waits for a locked SQLite database before reporting it as busy. Whole numbers from 1 to 600000; anything else stops startup |
+
+The 5 second busy wait is the production default. Test suites that run many file-backed
+writers rely on `BREADTRACKER_BUSY_TIMEOUT_MS` to stay reliable on a loaded host: the CI server
+job sets 30000 ms so contention between parallel jobs cannot turn a correct assertion into a
+`database is locked` error. No test retries an exclusivity failure.
 
 ## Pair a phone
 

@@ -4,40 +4,6 @@ use bread_tracker_server::auth::{self, CallerIdentity};
 use bread_tracker_server::db;
 use sqlx::SqlitePool;
 
-/// SQLite result codes for BUSY and LOCKED, including the extended forms. The server's
-/// classifier in `db` is crate-private, so this integration test matches the documented
-/// codes itself (the same helper the other file-backed concurrency tests carry).
-const SQLITE_BUSY_CODES: [&str; 8] = ["5", "261", "517", "773", "6", "262", "518", "774"];
-const BUSY_RETRY_ATTEMPTS: usize = 3;
-const BUSY_RETRY_BACKOFF: Duration = Duration::from_millis(100);
-
-fn is_busy_database_error(error: &sqlx::Error) -> bool {
-    match error {
-        sqlx::Error::Database(db) => db
-            .code()
-            .as_deref()
-            .is_some_and(|code| SQLITE_BUSY_CODES.contains(&code)),
-        _ => false,
-    }
-}
-
-/// Issue one capped pairing code, retrying only a raw SQLite BUSY or LOCKED result. A
-/// genuine failure still returns immediately, so the trigger assertion below is unaffected.
-async fn issue_with_busy_retry(
-    pool: &SqlitePool,
-    caller: &CallerIdentity,
-) -> Result<Option<String>, sqlx::Error> {
-    for attempt in 1..=BUSY_RETRY_ATTEMPTS {
-        match auth::create_pairing_code_limited(pool, caller).await {
-            Err(error) if attempt < BUSY_RETRY_ATTEMPTS && is_busy_database_error(&error) => {
-                tokio::time::sleep(BUSY_RETRY_BACKOFF).await;
-            }
-            result => return result,
-        }
-    }
-    unreachable!("the final attempt returns instead of looping")
-}
-
 /// A real file database (several connections), the admin user and one paired device whose
 /// credential belongs to that caller.
 async fn caller(pool: &SqlitePool) -> CallerIdentity {
@@ -91,7 +57,7 @@ async fn failed_issuance_retains_existing_codes_and_concurrency_respects_cap() {
         let pool = pool.clone();
         let caller = caller.clone();
         tasks.push(tokio::spawn(async move {
-            issue_with_busy_retry(&pool, &caller).await
+            auth::create_pairing_code_limited(&pool, &caller).await
         }));
     }
     for task in tasks {

@@ -34,6 +34,23 @@ const BUSY_RETRY_ATTEMPTS: usize = 2;
 /// Delay before the single busy retry, short enough to stay inside a client's request timeout.
 const BUSY_RETRY_DELAY: Duration = Duration::from_millis(100);
 
+/// How long a connection waits for another writer before SQLite reports `SQLITE_BUSY`.
+///
+/// Five seconds is the production default: ordinary WAL contention resolves well inside it, and
+/// a writer that is genuinely stuck should become a 503 rather than hold a request open. Test
+/// suites that run many file-backed writers in parallel override it with
+/// `BREADTRACKER_BUSY_TIMEOUT_MS`; the CI server job uses 30 s so host load cannot turn a correct
+/// assertion into a `database is locked` failure.
+const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Environment override in milliseconds. An unset or empty value keeps the default.
+const BUSY_TIMEOUT_VAR: &str = "BREADTRACKER_BUSY_TIMEOUT_MS";
+/// Smallest accepted override. Zero would disable waiting entirely and turn ordinary contention
+/// into an immediate failure.
+const MIN_BUSY_TIMEOUT_MS: u64 = 1;
+/// Largest accepted override (ten minutes). A longer wait would outlive every client request and
+/// hide a real exclusivity problem instead of surfacing it.
+const MAX_BUSY_TIMEOUT_MS: u64 = 600_000;
+
 pub async fn connect(database_url: &str) -> anyhow::Result<Db> {
     connect_with_admin(database_url, None).await
 }
@@ -44,6 +61,35 @@ pub async fn connect_with_admin(
     admin_name: Option<&str>,
 ) -> anyhow::Result<Db> {
     connect_with_migrator(database_url, admin_name, &sqlx::migrate!("../migrations")).await
+}
+
+/// The busy timeout from the process environment. See [`parse_busy_timeout`].
+fn busy_timeout_from_env() -> anyhow::Result<Duration> {
+    parse_busy_timeout(std::env::var(BUSY_TIMEOUT_VAR).ok().as_deref())
+}
+
+/// Parse an optional `BREADTRACKER_BUSY_TIMEOUT_MS` value.
+///
+/// Absent or empty keeps the production default. Anything else must be a whole number in
+/// [`MIN_BUSY_TIMEOUT_MS`]..=[`MAX_BUSY_TIMEOUT_MS`], so a typo stops startup with the variable
+/// named instead of silently running with the default or a wait the operator did not intend.
+fn parse_busy_timeout(raw: Option<&str>) -> anyhow::Result<Duration> {
+    let raw = raw.map(str::trim).filter(|value| !value.is_empty());
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_BUSY_TIMEOUT);
+    };
+    let value: u64 = raw.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "{BUSY_TIMEOUT_VAR} must be a whole number of milliseconds between \
+             {MIN_BUSY_TIMEOUT_MS} and {MAX_BUSY_TIMEOUT_MS}, got {raw:?}"
+        )
+    })?;
+    anyhow::ensure!(
+        (MIN_BUSY_TIMEOUT_MS..=MAX_BUSY_TIMEOUT_MS).contains(&value),
+        "{BUSY_TIMEOUT_VAR} must be between {MIN_BUSY_TIMEOUT_MS} and {MAX_BUSY_TIMEOUT_MS} \
+         milliseconds, got {value}"
+    );
+    Ok(Duration::from_millis(value))
 }
 
 /// [`connect_with_admin`] with an explicit migration set. The server always passes the embedded
@@ -58,10 +104,13 @@ pub async fn connect_with_migrator(
     admin_name: Option<&str>,
     migrator: &sqlx::migrate::Migrator,
 ) -> anyhow::Result<Db> {
+    // Parse before the retry loop: a bad value is a configuration error, not a transient lock
+    // that another attempt could resolve.
+    let busy_timeout = busy_timeout_from_env()?;
     let deadline = tokio::time::Instant::now() + OPEN_RETRY_BUDGET;
     let mut delay = OPEN_RETRY_FIRST;
     loop {
-        match open_and_prepare(database_url, admin_name, migrator).await {
+        match open_and_prepare(database_url, admin_name, migrator, busy_timeout).await {
             Ok(pool) => return Ok(pool),
             Err(err) if is_sqlite_busy(&err) && tokio::time::Instant::now() < deadline => {
                 tracing::warn!(
@@ -82,12 +131,13 @@ async fn open_and_prepare(
     database_url: &str,
     admin_name: Option<&str>,
     migrator: &sqlx::migrate::Migrator,
+    busy_timeout: Duration,
 ) -> anyhow::Result<Db> {
     let opts = SqliteConnectOptions::from_str(database_url)?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true)
-        .busy_timeout(Duration::from_secs(5));
+        .busy_timeout(busy_timeout);
 
     let pool = SqlitePoolOptions::new()
         .max_connections(8)
@@ -267,4 +317,47 @@ pub async fn connect_memory() -> anyhow::Result<Db> {
         .await?;
     prepare(&pool, None, &sqlx::migrate!("../migrations")).await?;
     Ok(pool)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn busy_timeout_defaults_when_unset_or_empty() {
+        assert_eq!(parse_busy_timeout(None).unwrap(), DEFAULT_BUSY_TIMEOUT);
+        assert_eq!(parse_busy_timeout(Some("")).unwrap(), DEFAULT_BUSY_TIMEOUT);
+        assert_eq!(
+            parse_busy_timeout(Some("   ")).unwrap(),
+            DEFAULT_BUSY_TIMEOUT
+        );
+        assert_eq!(DEFAULT_BUSY_TIMEOUT, Duration::from_millis(5_000));
+    }
+
+    #[test]
+    fn busy_timeout_accepts_the_documented_range() {
+        assert_eq!(
+            parse_busy_timeout(Some("30000")).unwrap(),
+            Duration::from_millis(30_000)
+        );
+        assert_eq!(
+            parse_busy_timeout(Some(" 1 ")).unwrap(),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            parse_busy_timeout(Some("600000")).unwrap(),
+            Duration::from_millis(600_000)
+        );
+    }
+
+    #[test]
+    fn busy_timeout_rejects_bad_values_by_name() {
+        for bad in ["0", "600001", "-1", "5s", "1.5", "many"] {
+            let err = parse_busy_timeout(Some(bad)).unwrap_err().to_string();
+            assert!(
+                err.contains("BREADTRACKER_BUSY_TIMEOUT_MS"),
+                "{bad:?} error names the variable: {err}"
+            );
+        }
+    }
 }

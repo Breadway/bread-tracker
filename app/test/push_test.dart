@@ -152,25 +152,42 @@ void main() {
     expect(push.status.value, PushStatus.ready);
   });
 
-  test('a cold-start payload survives until the consumer attaches', () async {
-    final pending = const ReminderPayload(
-      itemId: 'item',
-      date: '2026-10-21',
-      kind: 'chore',
-    );
-    final device = ColdStartDevice();
-    device.deliver(pending);
-    final delivered = <ReminderPayload>[];
-    final sub = device.taps.listen(delivered.add);
-    if (device.pending case final value?) {
-      device.pending = null;
-      device.controller.add(value);
-    }
-    await Future<void>.delayed(Duration.zero);
-    expect(delivered.single.itemId, 'item');
-    await sub.cancel();
-    await device.controller.close();
-  });
+  test(
+    'production launch tap replays behind delayed Gate and remount',
+    () async {
+      final pending = const ReminderPayload(
+        itemId: 'item',
+        date: '2026-10-21',
+        kind: 'chore',
+      );
+      final gate = Completer<void>();
+      final device = FirebasePushDevice();
+      final startup = device.captureInitialTapForTest(() async {
+        await gate.future;
+        return pending;
+      });
+      await Future<void>.delayed(Duration.zero);
+      final firstSeen = <ReminderPayload>[];
+      final first = device.taps.listen(firstSeen.add);
+      gate.complete();
+      await startup;
+      device.replayPendingTap();
+      await Future<void>.delayed(Duration.zero);
+      expect(firstSeen, [pending]);
+      await first.cancel();
+      device.releaseTapDelivery();
+      final secondSeen = <ReminderPayload>[];
+      final second = device.taps.listen((p) {
+        secondSeen.add(p);
+        device.acknowledgeTap(p);
+      });
+      device.replayPendingTap();
+      await Future<void>.delayed(Duration.zero);
+      expect(secondSeen, [pending]);
+      await second.cancel();
+      device.dispose();
+    },
+  );
 
   test(
     'AuthLost during push registration clears the dead pairing credential',

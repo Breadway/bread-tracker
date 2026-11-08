@@ -26,6 +26,12 @@ class TapPush extends NoPushService {
   Stream<ReminderPayload> get taps => controller.stream;
 }
 
+class FirebaseTapPush extends FcmPushService {
+  FirebaseTapPush(super.store, {required super.device});
+  @override
+  Future<void> register({bool requestPermission = false}) async {}
+}
+
 void main() {
   driftRuntimeOptions.dontWarnAboutMultipleDatabases = true;
 
@@ -121,6 +127,55 @@ void main() {
       ]);
       expect(acknowledged, isTrue);
       d.dispose();
+    },
+  );
+
+  testWidgets(
+    'Gate delays Shell until production launch tap is buffered, then routes',
+    (tester) async {
+      final gate = Completer<void>();
+      final device = FirebasePushDevice();
+      SharedPreferences.setMockInitialValues({});
+      final prefs = await SharedPreferences.getInstance();
+      final service = FirebaseTapPush(NoTokenStore(prefs), device: device);
+      final db = AppDb(NativeDatabase.memory());
+      final container = ProviderContainer(
+        overrides: [
+          prefsProvider.overrideWithValue(prefs),
+          storeProvider.overrideWithValue(NoTokenStore(prefs)),
+          dbProvider.overrideWithValue(db),
+          pairedProvider.overrideWith((ref) => gate.future.then((_) => true)),
+          pushProvider.overrideWithValue(service),
+        ],
+      );
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: const MaterialApp(home: Gate()),
+        ),
+      );
+      await tester.pump();
+      expect(find.byType(Shell), findsNothing, reason: 'Gate is still loading');
+      final launchCapture = device.captureInitialTapForTest(() async {
+        await gate.future;
+        return const ReminderPayload(
+          itemId: 'i',
+          date: '2026-10-12',
+          kind: 'chore',
+        );
+      });
+      gate.complete();
+      await tester.pump();
+      await launchCapture;
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(container.read(selectedDayProvider), DateTime.utc(2026, 10, 12));
+      addTearDown(() async {
+        await tester.pumpWidget(const SizedBox.shrink());
+        container.dispose();
+        await db.close();
+        device.dispose();
+      });
     },
   );
 }

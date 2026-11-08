@@ -18,6 +18,9 @@ abstract class PushService {
   /// Reminders the user opened by tapping the notification body. Includes the one that
   /// launched the app, delivered once after [init].
   Stream<ReminderPayload> get taps;
+
+  /// Drop an in-flight tap marker so a later consumer can receive it again.
+  void releaseTapDelivery();
   Future<void> init();
 
   /// Send the current FCM token to the server. Safe to call whenever; does nothing when
@@ -34,6 +37,8 @@ class NoPushService implements PushService {
   );
   @override
   Stream<ReminderPayload> get taps => const Stream.empty();
+  @override
+  void releaseTapDelivery() {}
   @override
   Future<void> init() async {}
   @override
@@ -81,6 +86,12 @@ class FcmPushService implements PushService {
   void replayPendingTap() {
     final d = device;
     if (d is FirebasePushDevice) d.replayPendingTap();
+  }
+
+  @override
+  void releaseTapDelivery() {
+    final d = device;
+    if (d is FirebasePushDevice) d.releaseTapDelivery();
   }
 
   @override
@@ -143,6 +154,7 @@ class FirebasePushDevice implements PushDevice {
   final StreamController<ReminderPayload> _taps =
       StreamController<ReminderPayload>.broadcast();
   ReminderPayload? _pendingLaunch;
+  final Set<ReminderPayload> _inFlightTaps = {};
   StreamSubscription<RemoteMessage>? _foreground, _opened;
 
   /// Tests exercise this exact production buffering/replay code with a delayed
@@ -167,7 +179,12 @@ class FirebasePushDevice implements PushDevice {
   Stream<ReminderPayload> get taps => _taps.stream;
 
   void acknowledgeTap(ReminderPayload payload) {
+    _inFlightTaps.remove(payload);
     if (_pendingLaunch == payload) _pendingLaunch = null;
+  }
+
+  void releaseTapDelivery() {
+    _inFlightTaps.clear();
   }
 
   @override
@@ -231,16 +248,18 @@ class FirebasePushDevice implements PushDevice {
   void _rememberTap(ReminderPayload payload) {
     _pendingLaunch = payload;
     if (_taps.hasListener) {
-      _pendingLaunch = null;
-      _taps.add(payload);
+      _deliverPending(payload);
     }
+  }
+
+  void _deliverPending(ReminderPayload payload) {
+    if (_inFlightTaps.add(payload)) _taps.add(payload);
   }
 
   void replayPendingTap() {
     final pending = _pendingLaunch;
     if (pending != null && _taps.hasListener) {
-      _pendingLaunch = null;
-      _taps.add(pending);
+      _deliverPending(pending);
     }
   }
 

@@ -70,6 +70,7 @@ class Shell extends ConsumerStatefulWidget {
 
 class _ShellState extends ConsumerState<Shell> with WidgetsBindingObserver {
   int _tab = 0;
+  PushService? _pushService;
   Timer? _poll;
   StreamSubscription<List<ConnectivityResult>>? _conn;
   StreamSubscription<ReminderPayload>? _taps;
@@ -80,8 +81,9 @@ class _ShellState extends ConsumerState<Shell> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     final ctl = ref.read(controllerProvider);
     ctl.syncNow();
-    ref.read(pushProvider).register();
     final push = ref.read(pushProvider);
+    _pushService = push;
+    push.register();
     _taps = push.taps.listen((p) {
       ref.read(openTodayProvider.notifier).request(p.date);
       final push = ref.read(pushProvider);
@@ -110,6 +112,9 @@ class _ShellState extends ConsumerState<Shell> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    final push = _pushService;
+    // Unacknowledged tap remains pending and can be replayed by a later Shell.
+    if (push is FcmPushService) push.releaseTapDelivery();
     WidgetsBinding.instance.removeObserver(this);
     _poll?.cancel();
     _taps?.cancel();

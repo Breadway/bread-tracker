@@ -16,6 +16,9 @@ class Items extends Table {
   BoolColumn get active => boolean().withDefault(const Constant(true))();
   IntColumn get updatedAt => integer()();
   IntColumn get deletedAt => integer().nullable()();
+  /// `YYYY-MM-DD` local creation date, immutable once recorded. Null means the item predates
+  /// TRACK-65 (no lower bound for perfect-day scheduling) or came from an old server.
+  TextColumn get createdOn => text().nullable()();
   IntColumn get seq => integer().withDefault(const Constant(0))();
   BoolColumn get dirty => boolean().withDefault(const Constant(false))();
 
@@ -42,7 +45,19 @@ class AppDb extends _$AppDb {
   AppDb([QueryExecutor? e]) : super(e ?? driftDatabase(name: 'tracker'));
 
   @override
-  int get schemaVersion => 1;
+  int get schemaVersion => 2;
+
+  @override
+  MigrationStrategy get migration => MigrationStrategy(
+    onCreate: (m) => m.createAll(),
+    onUpgrade: (m, from, to) async {
+      // 1 -> 2: TRACK-65 adds the item creation date. Existing rows stay NULL on purpose: they
+      // have no lower bound, so an upgrade changes no XP, level or perfect day.
+      if (from < 2) {
+        await m.addColumn(items, items.createdOn);
+      }
+    },
+  );
 
   Stream<List<ItemRow>> watchItems() =>
       (select(items)

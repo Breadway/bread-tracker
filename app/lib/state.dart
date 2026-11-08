@@ -144,6 +144,7 @@ List<RItem> toRItems(List<ItemRow> rows) => [
       points: i.points,
       active: i.active,
       deleted: i.deletedAt != null,
+      createdOn: i.createdOn,
     ),
 ];
 
@@ -882,6 +883,7 @@ class AppController {
     String? dueDate,
     bool active = true,
   }) async {
+    final creating = id == null;
     await _db.upsertItem(
       ItemsCompanion(
         id: Value(id ?? const Uuid().v4()),
@@ -894,6 +896,9 @@ class AppController {
         active: Value(active),
         updatedAt: Value(nowMs()),
         deletedAt: const Value(null),
+        // Immutable: recorded on creation, never touched by an edit so past perfect days stay
+        // earned. Absent leaves an existing (or legacy NULL) value exactly as it is.
+        createdOn: creating ? Value(fmtDay(DateTime.now())) : const Value.absent(),
         dirty: const Value(true),
       ),
     );

@@ -233,6 +233,7 @@ class SyncEngine {
     'active': i.active,
     'updated_at': i.updatedAt,
     'deleted_at': i.deletedAt,
+    'created_on': i.createdOn,
   };
 
   Map<String, dynamic> _compJson(CompletionRow c) => {
@@ -255,6 +256,10 @@ class SyncEngine {
     active: Value(j['active']),
     updatedAt: Value(j['updated_at']),
     deletedAt: Value(j['deleted_at']),
+    // Additive: an old server omits the field, and a stored value must survive that pull.
+    createdOn: j['created_on'] == null
+        ? const Value.absent()
+        : Value(j['created_on'] as String),
     seq: Value(j['seq'] ?? 0),
     dirty: const Value(false),
   );

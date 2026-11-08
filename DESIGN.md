@@ -8,11 +8,12 @@ below).
 ## Rules (shared by server `server/src/xp.rs` and the app; vectors in `spec/xp_vectors.json`)
 
 - XP per completion is the item's `points` (defaults: chore 10, habit 15, to-do 20). A date counts once per item.
-- A **perfect day** is a date with at least one scheduled chore or habit where every scheduled chore and habit is done. It adds 50 XP. To-dos are never scheduled, so they never make or break a perfect day. Scheduled means active and the date's weekday bit is set (`weekdays` bit0 = Monday .. bit6 = Sunday).
+- A **perfect day** is a date with at least one scheduled chore or habit where every scheduled chore and habit is done. It adds 50 XP. To-dos are never scheduled, so they never make or break a perfect day. Scheduled means active, the date is after the item's creation date, and the date's weekday bit is set (`weekdays` bit0 = Monday .. bit6 = Sunday).
+- An item counts toward a day's schedule only from the day **after** it was created. Adding a chore or habit therefore cannot remove a bonus already earned today, and adding one later cannot rescore an earlier day. An item with no recorded creation date (everything that predates TRACK-65, and rows from an old client that never sent one) has no lower bound and scores exactly as it did before the upgrade.
 - 120 XP per level; level = xp / 120 + 1. Ranks, one per level and clamped at the last: Flour, Dough, Proofing, Rising, Baked, Golden Crust, Sourdough Master.
 - A habit **streak** is the run of consecutive completed days ending today, or ending yesterday when today is not done yet.
 - Un-ticked completions and completions of deleted items earn nothing.
-- Perfect days are evaluated against the current item definitions, not the schedule as it was in the past.
+- A perfect day is still evaluated against the item's current definition once the creation-date bound is satisfied. Changing an item's weekdays, deactivating it, or deleting it therefore still rescores past days (and deleting also drops the XP its completions earned). Making those cases non-retroactive needs persisted perfect-day history, which is a separate follow-up; `spec/xp_vectors.json` names and pins the current behaviour so the gap stays visible.
 
 ## Sync
 
@@ -20,6 +21,7 @@ below).
 - Server assigns a monotonic `seq` to every accepted write. The cursor is a `seq`, so clock skew cannot lose rows.
 - `POST /sync {since, items, completions}` pushes local changes then returns every row with `seq > since` plus the new `cursor`, in one round trip. `GET /sync?since=` is pull only.
 - Conflicts: last write wins by `updated_at`; ties keep the server row. Timestamps more than a day in the future are clamped.
+- `items.created_on` is an additive `YYYY-MM-DD` creation date. A new app sends the local date on creation. The server records the first value it sees for a new row, or its own local date when an old client omits it, and never overwrites it on a later push. An item that predates the column keeps NULL (no lower bound). Old servers ignore the field and old apps omit it, so both directions keep syncing; an old app keeps scoring locally the old way until it is updated.
 - Batches are limited to 5000 rows and 2 MiB. A completion dated more than 7 days ahead of the server's UTC date, or before 2020, is rejected; `completed_at` is clamped like `updated_at`.
 - Housekeeping runs hourly in the scheduler: `reminders_sent` older than two days and expired pairing codes are deleted. Tombstoned items and completions are retained because the current cursor protocol has no per-device acknowledgement or forced-full-resync contract; pruning them could strand an offline client. XP and streak statistics use all retained history. A bounded-history or retention policy requires an explicit backward-compatible protocol/product decision before implementation.
 

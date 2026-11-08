@@ -41,10 +41,24 @@ fn parse(d: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()
 }
 
-/// A chore or habit is scheduled on `date` when its weekday bit is set.
+/// Whether an item exists yet on `date`. A missing creation date (every item that predates
+/// TRACK-65, and any item an old client created before the server recorded one) has no lower
+/// bound, so its history scores exactly as it did before the upgrade.
+fn existed_on(item: &Item, date: NaiveDate) -> bool {
+    item.created_on
+        .as_deref()
+        .and_then(parse)
+        .is_none_or(|created| date > created)
+}
+
+/// A chore or habit is scheduled on `date` when it existed by then and its weekday bit is set.
+///
+/// The item counts only from the day AFTER creation, so adding one today cannot remove a
+/// perfect-day bonus already earned today, and adding one later cannot rescore an earlier day.
 fn scheduled_on(item: &Item, date: NaiveDate) -> bool {
     item.active
         && (item.kind == "chore" || item.kind == "habit")
+        && existed_on(item, date)
         && item.weekdays & (1 << date.weekday().num_days_from_monday()) != 0
 }
 
@@ -154,5 +168,79 @@ mod tests {
         assert_eq!(rank_for(1), "Flour");
         assert_eq!(rank_for(7), "Sourdough Master");
         assert_eq!(rank_for(99), "Sourdough Master");
+    }
+
+    fn scheduled_item(id: &str, created_on: &str) -> Item {
+        Item {
+            id: id.to_string(),
+            kind: "chore".to_string(),
+            name: "Chore".to_string(),
+            weekdays: 127,
+            remind_time: None,
+            points: 10,
+            due_date: None,
+            sort: 0,
+            active: true,
+            updated_at: 0,
+            deleted_at: None,
+            created_on: Some(created_on.to_string()),
+            seq: 0,
+        }
+    }
+
+    fn completion(item_id: &str, date: &str) -> Completion {
+        Completion {
+            item_id: item_id.to_string(),
+            date: date.to_string(),
+            completed_at: 0,
+            updated_at: 0,
+            deleted_at: None,
+            seq: 0,
+        }
+    }
+
+    #[test]
+    fn adding_an_item_never_reduces_xp_or_perfect_days() {
+        let today = parse("2026-10-20").unwrap();
+        let mut items = vec![scheduled_item("a", "2026-10-01")];
+        let completions = vec![
+            completion("a", "2026-10-18"),
+            completion("a", "2026-10-19"),
+            completion("a", "2026-10-20"),
+        ];
+        let before = compute(&items, &completions, today);
+        assert_eq!(before.perfect_days.len(), 3);
+
+        // Created today or in the future: neither may remove a past day or today's bonus.
+        for created_on in ["2026-10-20", "2026-10-27"] {
+            items.push(scheduled_item("b", created_on));
+            let after = compute(&items, &completions, today);
+            assert!(
+                after.xp >= before.xp,
+                "adding an item created {created_on} reduced xp"
+            );
+            assert!(
+                after.perfect_days.len() >= before.perfect_days.len(),
+                "adding an item created {created_on} removed a perfect day"
+            );
+            items.pop();
+        }
+    }
+
+    #[test]
+    fn an_item_starts_counting_the_day_after_it_was_created() {
+        let today = parse("2026-10-20").unwrap();
+        let items = vec![scheduled_item("a", "2026-10-20")];
+        let completions = vec![completion("a", "2026-10-20")];
+        let stats = compute(&items, &completions, today);
+        assert_eq!(stats.xp, 10, "the completion still earns its item XP");
+        assert!(
+            stats.perfect_days.is_empty(),
+            "the creation day is not scheduled yet"
+        );
+
+        let completions = vec![completion("a", "2026-10-20"), completion("a", "2026-10-21")];
+        let stats = compute(&items, &completions, parse("2026-10-21").unwrap());
+        assert_eq!(stats.perfect_days, vec!["2026-10-21".to_string()]);
     }
 }

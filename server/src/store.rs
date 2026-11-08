@@ -19,6 +19,28 @@ async fn next_seq(conn: &mut SqliteConnection) -> Result<i64, sqlx::Error> {
         .await
 }
 
+/// The user's current local date, used as the creation date for an item first seen now.
+///
+/// The date, not a timestamp: perfect-day scheduling is per local date, and an item created in
+/// the evening must not be scheduled for that same day. Missing or unparseable settings fall
+/// back to UTC, matching the rest of the settings handling.
+async fn first_seen_date(conn: &mut SqliteConnection, user_id: i64) -> Result<String, sqlx::Error> {
+    let timezone: Option<String> =
+        sqlx::query_scalar("SELECT timezone FROM user_settings WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let tz: chrono_tz::Tz = timezone
+        .as_deref()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(chrono_tz::UTC);
+    Ok(chrono::Utc::now()
+        .with_timezone(&tz)
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string())
+}
+
 /// Why a push was refused or failed.
 #[derive(Debug, thiserror::Error)]
 pub enum PushError {
@@ -33,7 +55,7 @@ pub enum PushError {
 }
 
 const ITEM_COLS: &str =
-    "id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, seq";
+    "id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, created_on, seq";
 const COMPLETION_COLS: &str = "item_id, date, completed_at, updated_at, deleted_at, seq";
 
 fn pull_sql(table: &str, cols: &str) -> String {
@@ -139,15 +161,21 @@ impl UserDb {
             }
         }
 
+        // A new item gets the creation date the client sent, or the user's local date the first
+        // time the server sees it. An existing row keeps its stored value forever, including a
+        // legacy NULL, so a later push can never move the day an item starts counting toward
+        // perfect days and retroactively rescore history.
+        let first_seen = first_seen_date(&mut tx, self.user_id).await?;
         for it in items {
             let updated = it.updated_at.min(ceiling);
-            let existing: Option<i64> =
-                sqlx::query_scalar("SELECT updated_at FROM items WHERE user_id = ? AND id = ?")
-                    .bind(self.user_id)
-                    .bind(&it.id)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-            if existing.is_some_and(|e| e >= updated) {
+            let existing: Option<(i64, Option<String>)> = sqlx::query_as(
+                "SELECT updated_at, created_on FROM items WHERE user_id = ? AND id = ?",
+            )
+            .bind(self.user_id)
+            .bind(&it.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if existing.as_ref().is_some_and(|(e, _)| *e >= updated) {
                 continue;
             }
             if existing.is_none() {
@@ -159,10 +187,14 @@ impl UserDb {
                 }
                 item_count += 1;
             }
+            let created_on = match &existing {
+                Some((_, stored)) => stored.clone(),
+                None => Some(it.created_on.clone().unwrap_or_else(|| first_seen.clone())),
+            };
             let seq = next_seq(&mut tx).await?;
             sqlx::query(
-                "INSERT INTO items (user_id, id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, seq)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "INSERT INTO items (user_id, id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, created_on, seq)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(user_id, id) DO UPDATE SET
                    kind = excluded.kind, name = excluded.name, weekdays = excluded.weekdays,
                    remind_time = excluded.remind_time, points = excluded.points, due_date = excluded.due_date,
@@ -181,6 +213,7 @@ impl UserDb {
             .bind(it.active)
             .bind(updated)
             .bind(it.deleted_at)
+            .bind(created_on)
             .bind(seq)
             .execute(&mut *tx)
             .await?;

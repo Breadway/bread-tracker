@@ -18,6 +18,13 @@ pub struct Item {
     pub active: bool,
     pub updated_at: i64,
     pub deleted_at: Option<i64>,
+    /// The day the item was created, `YYYY-MM-DD`, in the creator's local date.
+    ///
+    /// Additive on the wire. Missing means "no lower bound", which is how every item that
+    /// predates TRACK-65 is stored, so upgrading changes no existing stats. The server records
+    /// the first value it sees and never overwrites it (see `store::UserDb::apply_push`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_on: Option<String>,
     #[serde(default)]
     pub seq: i64,
 }
@@ -38,7 +45,9 @@ fn bad(msg: &str) -> String {
 }
 
 impl Item {
-    pub fn validate(&self) -> Result<(), String> {
+    /// `today` is the server's current UTC date; a client's local creation date can be at most
+    /// one day ahead of it.
+    pub fn validate(&self, today: NaiveDate) -> Result<(), String> {
         uuid::Uuid::parse_str(&self.id).map_err(|_| bad("item id must be a uuid"))?;
         if !KINDS.contains(&self.kind.as_str()) {
             return Err(bad("item kind must be chore, habit or todo"));
@@ -57,6 +66,16 @@ impl Item {
             NaiveDate::parse_from_str(d, "%Y-%m-%d")
                 .map_err(|_| bad("due_date must be YYYY-MM-DD"))?;
         }
+        if let Some(c) = &self.created_on {
+            let date = NaiveDate::parse_from_str(c, "%Y-%m-%d")
+                .map_err(|_| bad("created_on must be YYYY-MM-DD"))?;
+            let (y, m, d) = EARLIEST_COMPLETION_DATE;
+            if date < NaiveDate::from_ymd_opt(y, m, d).unwrap()
+                || date > today + chrono::Duration::days(MAX_CREATED_ON_DAYS_AHEAD)
+            {
+                return Err(bad("created_on is out of range"));
+            }
+        }
         if !(0..=1000).contains(&self.points) {
             return Err(bad("points must be 0 to 1000"));
         }
@@ -69,6 +88,8 @@ impl Item {
 pub const MAX_COMPLETION_DAYS_AHEAD: i64 = 7;
 /// Nothing in this app predates this, so an earlier date is a bug or garbage.
 pub const EARLIEST_COMPLETION_DATE: (i32, u32, u32) = (2020, 1, 1);
+/// A client's local date can be ahead of the server's UTC date by its offset, but no further.
+pub const MAX_CREATED_ON_DAYS_AHEAD: i64 = 1;
 
 impl Completion {
     /// `today` is the server's current UTC date.

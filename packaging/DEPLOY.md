@@ -39,7 +39,7 @@ rebuilds `items`, `completions`, `devices`, `reminders_sent` and `pairing_codes`
 tightens the name-key guard. 0012 records whether the database was an empty file before this
 run and gives only a genuinely new installation the neutral UTC default; an existing household
 keeps its timezone even when it has no devices left. Phones keep working without an app update:
-the sync API did not change.
+the sync generation fields are additive, and a request without them keeps the old behaviour.
 
 **This source branch is not a deployment approval.** Routes, reminder settings and scheduler
 are per-user here, but the upstream candidates and the rest of the multi-user stack still need
@@ -69,11 +69,12 @@ Never modify its ledger, recreate production, or remove reviewer evidence. See D
   runbook stops every writer before the copy and does not start them again until step 4, so
   the maintenance window from step 2 to step 4 admits no new writes. Once the new release has
   served phones, rolling back loses every write accepted after the copy. Phones keep their
-  local rows, but they push only rows marked dirty and do not resend rows that already
-  synced, so roll back after live use only with explicit consent to that recovery point and
-  data loss. Otherwise fix forward. A restored server can also have a lower `meta.seq` than a
-  phone's stored `cursor`, so that phone can stop pulling rows it would otherwise receive.
-  That client recovery is not shipped by this release and is untested (see below).
+  local rows. This release reconciles by `updated_at`, treats a generation change or a server
+  cursor behind the phone's cursor as a rollback, and then reoffers all local rows, but a
+  rollback after live use can still discard a server-only write from that window, so use it
+  only with explicit consent to that recovery point and data loss. Otherwise fix forward. A
+  restored server can also have a lower `meta.seq` than a phone's stored `cursor`; that case
+  is handled as a rollback by the same path and is covered by tests, not by a real device.
 * The Litestream replica is a second copy, not the recovery point, and it is only trusted
   after the mandatory gate (step 3) shows it holds exactly the same data as the frozen copy.
   Its file names and modification times prove nothing about what is inside, so the gate

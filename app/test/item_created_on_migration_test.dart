@@ -52,7 +52,7 @@ void main() {
               0, 1, 1000, NULL, 4, 0);
     ''');
     raw.userVersion = 1;
-    raw.dispose();
+    raw.close();
 
     final db = AppDb(NativeDatabase(file));
     final row = (await db.select(db.items).get()).single;

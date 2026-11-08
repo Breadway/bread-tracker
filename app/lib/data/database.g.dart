@@ -123,6 +123,17 @@ class $ItemsTable extends Items with TableInfo<$ItemsTable, ItemRow> {
     type: DriftSqlType.int,
     requiredDuringInsert: false,
   );
+  static const VerificationMeta _createdOnMeta = const VerificationMeta(
+    'createdOn',
+  );
+  @override
+  late final GeneratedColumn<String> createdOn = GeneratedColumn<String>(
+    'created_on',
+    aliasedName,
+    true,
+    type: DriftSqlType.string,
+    requiredDuringInsert: false,
+  );
   static const VerificationMeta _seqMeta = const VerificationMeta('seq');
   @override
   late final GeneratedColumn<int> seq = GeneratedColumn<int>(
@@ -159,6 +170,7 @@ class $ItemsTable extends Items with TableInfo<$ItemsTable, ItemRow> {
     active,
     updatedAt,
     deletedAt,
+    createdOn,
     seq,
     dirty,
   ];
@@ -247,6 +259,12 @@ class $ItemsTable extends Items with TableInfo<$ItemsTable, ItemRow> {
         deletedAt.isAcceptableOrUnknown(data['deleted_at']!, _deletedAtMeta),
       );
     }
+    if (data.containsKey('created_on')) {
+      context.handle(
+        _createdOnMeta,
+        createdOn.isAcceptableOrUnknown(data['created_on']!, _createdOnMeta),
+      );
+    }
     if (data.containsKey('seq')) {
       context.handle(
         _seqMeta,
@@ -312,6 +330,10 @@ class $ItemsTable extends Items with TableInfo<$ItemsTable, ItemRow> {
         DriftSqlType.int,
         data['${effectivePrefix}deleted_at'],
       ),
+      createdOn: attachedDatabase.typeMapping.read(
+        DriftSqlType.string,
+        data['${effectivePrefix}created_on'],
+      ),
       seq: attachedDatabase.typeMapping.read(
         DriftSqlType.int,
         data['${effectivePrefix}seq'],
@@ -341,6 +363,10 @@ class ItemRow extends DataClass implements Insertable<ItemRow> {
   final bool active;
   final int updatedAt;
   final int? deletedAt;
+
+  /// `YYYY-MM-DD` local creation date, immutable once recorded. Null means the item predates
+  /// TRACK-65 (no lower bound for perfect-day scheduling) or came from an old server.
+  final String? createdOn;
   final int seq;
   final bool dirty;
   const ItemRow({
@@ -355,6 +381,7 @@ class ItemRow extends DataClass implements Insertable<ItemRow> {
     required this.active,
     required this.updatedAt,
     this.deletedAt,
+    this.createdOn,
     required this.seq,
     required this.dirty,
   });
@@ -377,6 +404,9 @@ class ItemRow extends DataClass implements Insertable<ItemRow> {
     map['updated_at'] = Variable<int>(updatedAt);
     if (!nullToAbsent || deletedAt != null) {
       map['deleted_at'] = Variable<int>(deletedAt);
+    }
+    if (!nullToAbsent || createdOn != null) {
+      map['created_on'] = Variable<String>(createdOn);
     }
     map['seq'] = Variable<int>(seq);
     map['dirty'] = Variable<bool>(dirty);
@@ -402,6 +432,9 @@ class ItemRow extends DataClass implements Insertable<ItemRow> {
       deletedAt: deletedAt == null && nullToAbsent
           ? const Value.absent()
           : Value(deletedAt),
+      createdOn: createdOn == null && nullToAbsent
+          ? const Value.absent()
+          : Value(createdOn),
       seq: Value(seq),
       dirty: Value(dirty),
     );
@@ -424,6 +457,7 @@ class ItemRow extends DataClass implements Insertable<ItemRow> {
       active: serializer.fromJson<bool>(json['active']),
       updatedAt: serializer.fromJson<int>(json['updatedAt']),
       deletedAt: serializer.fromJson<int?>(json['deletedAt']),
+      createdOn: serializer.fromJson<String?>(json['createdOn']),
       seq: serializer.fromJson<int>(json['seq']),
       dirty: serializer.fromJson<bool>(json['dirty']),
     );
@@ -443,6 +477,7 @@ class ItemRow extends DataClass implements Insertable<ItemRow> {
       'active': serializer.toJson<bool>(active),
       'updatedAt': serializer.toJson<int>(updatedAt),
       'deletedAt': serializer.toJson<int?>(deletedAt),
+      'createdOn': serializer.toJson<String?>(createdOn),
       'seq': serializer.toJson<int>(seq),
       'dirty': serializer.toJson<bool>(dirty),
     };
@@ -460,6 +495,7 @@ class ItemRow extends DataClass implements Insertable<ItemRow> {
     bool? active,
     int? updatedAt,
     Value<int?> deletedAt = const Value.absent(),
+    Value<String?> createdOn = const Value.absent(),
     int? seq,
     bool? dirty,
   }) => ItemRow(
@@ -474,6 +510,7 @@ class ItemRow extends DataClass implements Insertable<ItemRow> {
     active: active ?? this.active,
     updatedAt: updatedAt ?? this.updatedAt,
     deletedAt: deletedAt.present ? deletedAt.value : this.deletedAt,
+    createdOn: createdOn.present ? createdOn.value : this.createdOn,
     seq: seq ?? this.seq,
     dirty: dirty ?? this.dirty,
   );
@@ -492,6 +529,7 @@ class ItemRow extends DataClass implements Insertable<ItemRow> {
       active: data.active.present ? data.active.value : this.active,
       updatedAt: data.updatedAt.present ? data.updatedAt.value : this.updatedAt,
       deletedAt: data.deletedAt.present ? data.deletedAt.value : this.deletedAt,
+      createdOn: data.createdOn.present ? data.createdOn.value : this.createdOn,
       seq: data.seq.present ? data.seq.value : this.seq,
       dirty: data.dirty.present ? data.dirty.value : this.dirty,
     );
@@ -511,6 +549,7 @@ class ItemRow extends DataClass implements Insertable<ItemRow> {
           ..write('active: $active, ')
           ..write('updatedAt: $updatedAt, ')
           ..write('deletedAt: $deletedAt, ')
+          ..write('createdOn: $createdOn, ')
           ..write('seq: $seq, ')
           ..write('dirty: $dirty')
           ..write(')'))
@@ -530,6 +569,7 @@ class ItemRow extends DataClass implements Insertable<ItemRow> {
     active,
     updatedAt,
     deletedAt,
+    createdOn,
     seq,
     dirty,
   );
@@ -548,6 +588,7 @@ class ItemRow extends DataClass implements Insertable<ItemRow> {
           other.active == this.active &&
           other.updatedAt == this.updatedAt &&
           other.deletedAt == this.deletedAt &&
+          other.createdOn == this.createdOn &&
           other.seq == this.seq &&
           other.dirty == this.dirty);
 }
@@ -564,6 +605,7 @@ class ItemsCompanion extends UpdateCompanion<ItemRow> {
   final Value<bool> active;
   final Value<int> updatedAt;
   final Value<int?> deletedAt;
+  final Value<String?> createdOn;
   final Value<int> seq;
   final Value<bool> dirty;
   final Value<int> rowid;
@@ -579,6 +621,7 @@ class ItemsCompanion extends UpdateCompanion<ItemRow> {
     this.active = const Value.absent(),
     this.updatedAt = const Value.absent(),
     this.deletedAt = const Value.absent(),
+    this.createdOn = const Value.absent(),
     this.seq = const Value.absent(),
     this.dirty = const Value.absent(),
     this.rowid = const Value.absent(),
@@ -595,6 +638,7 @@ class ItemsCompanion extends UpdateCompanion<ItemRow> {
     this.active = const Value.absent(),
     required int updatedAt,
     this.deletedAt = const Value.absent(),
+    this.createdOn = const Value.absent(),
     this.seq = const Value.absent(),
     this.dirty = const Value.absent(),
     this.rowid = const Value.absent(),
@@ -615,6 +659,7 @@ class ItemsCompanion extends UpdateCompanion<ItemRow> {
     Expression<bool>? active,
     Expression<int>? updatedAt,
     Expression<int>? deletedAt,
+    Expression<String>? createdOn,
     Expression<int>? seq,
     Expression<bool>? dirty,
     Expression<int>? rowid,
@@ -631,6 +676,7 @@ class ItemsCompanion extends UpdateCompanion<ItemRow> {
       if (active != null) 'active': active,
       if (updatedAt != null) 'updated_at': updatedAt,
       if (deletedAt != null) 'deleted_at': deletedAt,
+      if (createdOn != null) 'created_on': createdOn,
       if (seq != null) 'seq': seq,
       if (dirty != null) 'dirty': dirty,
       if (rowid != null) 'rowid': rowid,
@@ -649,6 +695,7 @@ class ItemsCompanion extends UpdateCompanion<ItemRow> {
     Value<bool>? active,
     Value<int>? updatedAt,
     Value<int?>? deletedAt,
+    Value<String?>? createdOn,
     Value<int>? seq,
     Value<bool>? dirty,
     Value<int>? rowid,
@@ -665,6 +712,7 @@ class ItemsCompanion extends UpdateCompanion<ItemRow> {
       active: active ?? this.active,
       updatedAt: updatedAt ?? this.updatedAt,
       deletedAt: deletedAt ?? this.deletedAt,
+      createdOn: createdOn ?? this.createdOn,
       seq: seq ?? this.seq,
       dirty: dirty ?? this.dirty,
       rowid: rowid ?? this.rowid,
@@ -707,6 +755,9 @@ class ItemsCompanion extends UpdateCompanion<ItemRow> {
     if (deletedAt.present) {
       map['deleted_at'] = Variable<int>(deletedAt.value);
     }
+    if (createdOn.present) {
+      map['created_on'] = Variable<String>(createdOn.value);
+    }
     if (seq.present) {
       map['seq'] = Variable<int>(seq.value);
     }
@@ -733,6 +784,7 @@ class ItemsCompanion extends UpdateCompanion<ItemRow> {
           ..write('active: $active, ')
           ..write('updatedAt: $updatedAt, ')
           ..write('deletedAt: $deletedAt, ')
+          ..write('createdOn: $createdOn, ')
           ..write('seq: $seq, ')
           ..write('dirty: $dirty, ')
           ..write('rowid: $rowid')
@@ -1224,6 +1276,7 @@ typedef $$ItemsTableCreateCompanionBuilder = ItemsCompanion Function({
   Value<bool> active,
   required int updatedAt,
   Value<int?> deletedAt,
+  Value<String?> createdOn,
   Value<int> seq,
   Value<bool> dirty,
   Value<int> rowid,
@@ -1240,6 +1293,7 @@ typedef $$ItemsTableUpdateCompanionBuilder = ItemsCompanion Function({
   Value<bool> active,
   Value<int> updatedAt,
   Value<int?> deletedAt,
+  Value<String?> createdOn,
   Value<int> seq,
   Value<bool> dirty,
   Value<int> rowid,
@@ -1305,6 +1359,11 @@ class $$ItemsTableFilterComposer extends Composer<_$AppDb, $ItemsTable> {
 
   ColumnFilters<int> get deletedAt => $composableBuilder(
     column: $table.deletedAt,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get createdOn => $composableBuilder(
+    column: $table.createdOn,
     builder: (column) => ColumnFilters(column),
   );
 
@@ -1382,6 +1441,11 @@ class $$ItemsTableOrderingComposer extends Composer<_$AppDb, $ItemsTable> {
     builder: (column) => ColumnOrderings(column),
   );
 
+  ColumnOrderings<String> get createdOn => $composableBuilder(
+    column: $table.createdOn,
+    builder: (column) => ColumnOrderings(column),
+  );
+
   ColumnOrderings<int> get seq => $composableBuilder(
     column: $table.seq,
     builder: (column) => ColumnOrderings(column),
@@ -1436,6 +1500,9 @@ class $$ItemsTableAnnotationComposer extends Composer<_$AppDb, $ItemsTable> {
   GeneratedColumn<int> get deletedAt =>
       $composableBuilder(column: $table.deletedAt, builder: (column) => column);
 
+  GeneratedColumn<String> get createdOn =>
+      $composableBuilder(column: $table.createdOn, builder: (column) => column);
+
   GeneratedColumn<int> get seq =>
       $composableBuilder(column: $table.seq, builder: (column) => column);
 
@@ -1482,6 +1549,7 @@ class $$ItemsTableTableManager
                 Value<bool> active = const Value.absent(),
                 Value<int> updatedAt = const Value.absent(),
                 Value<int?> deletedAt = const Value.absent(),
+                Value<String?> createdOn = const Value.absent(),
                 Value<int> seq = const Value.absent(),
                 Value<bool> dirty = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
@@ -1497,6 +1565,7 @@ class $$ItemsTableTableManager
                 active: active,
                 updatedAt: updatedAt,
                 deletedAt: deletedAt,
+                createdOn: createdOn,
                 seq: seq,
                 dirty: dirty,
                 rowid: rowid,
@@ -1514,6 +1583,7 @@ class $$ItemsTableTableManager
                 Value<bool> active = const Value.absent(),
                 required int updatedAt,
                 Value<int?> deletedAt = const Value.absent(),
+                Value<String?> createdOn = const Value.absent(),
                 Value<int> seq = const Value.absent(),
                 Value<bool> dirty = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
@@ -1529,6 +1599,7 @@ class $$ItemsTableTableManager
                 active: active,
                 updatedAt: updatedAt,
                 deletedAt: deletedAt,
+                createdOn: createdOn,
                 seq: seq,
                 dirty: dirty,
                 rowid: rowid,

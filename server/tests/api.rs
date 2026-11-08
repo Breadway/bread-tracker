@@ -4852,6 +4852,145 @@ fn limits_come_from_the_environment_with_sane_fallbacks() {
     assert_eq!(l.max_completions, d.max_completions);
 }
 
+// TRACK-5 regressions: `/pair` uses the shared `public_auth` admission from TRACK-20. These
+// pin the bounded, fail-closed capacity behaviour that the removed in-process limiter tried to
+// provide, beyond the per-source and forwarding tests that already cover the incumbent path.
+
+#[tokio::test]
+async fn successful_pairings_do_not_consume_the_shared_failure_budget() {
+    let h = harness().await;
+    for _ in 0..8 {
+        let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+        assert_eq!(
+            call_from(
+                &h.app,
+                "203.0.113.8:5000",
+                None,
+                "/pair",
+                json!({"code": code})
+            )
+            .await,
+            StatusCode::OK
+        );
+    }
+    let failures: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(failures), 0) FROM public_auth_limits")
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(failures, 0, "a success must not leave a partial charge");
+}
+
+#[tokio::test]
+async fn saturated_source_table_rejects_pair_attempts_without_evicting_live_budgets() {
+    let h = harness().await;
+    for n in 0..bread_tracker_server::public_auth::MAX_SOURCES as u32 {
+        let source = format!("198.51.{}.{}:4000", (n / 256) % 256, n % 256);
+        assert_eq!(
+            call_from(&h.app, &source, None, "/pair", json!({"code": "invalid"})).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    for _ in 0..100 {
+        assert_eq!(
+            call_from(
+                &h.app,
+                "192.0.2.222:4000",
+                None,
+                "/pair",
+                json!({"code": code})
+            )
+            .await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+    assert_eq!(device_rows(&h).await, 0);
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM public_auth_limits")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(rows, bread_tracker_server::public_auth::MAX_SOURCES);
+}
+
+#[tokio::test]
+async fn expired_capacity_is_reclaimed_without_evicting_live_pair_budgets() {
+    let h = harness().await;
+    for n in 0..bread_tracker_server::public_auth::MAX_SOURCES as u32 {
+        let source = format!("198.51.{}.{}:4000", (n / 256) % 256, n % 256);
+        assert_eq!(
+            call_from(&h.app, &source, None, "/pair", json!({"code": "invalid"})).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let blocked = auth::create_pairing_code(&h.state.db).await.unwrap();
+    assert_eq!(
+        call_from(
+            &h.app,
+            "192.0.2.201:4000",
+            None,
+            "/pair",
+            json!({"code": blocked})
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    sqlx::query("UPDATE public_auth_limits SET window_started_at = 0")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    assert_eq!(
+        call_from(
+            &h.app,
+            "192.0.2.202:4000",
+            None,
+            "/pair",
+            json!({"code": code})
+        )
+        .await,
+        StatusCode::OK,
+        "an expired window frees capacity for a new source"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_pair_guesses_get_exactly_five_attempts() {
+    let h = harness().await;
+    let mut tasks = Vec::new();
+    for _ in 0..20 {
+        let app = h.app.clone();
+        tasks.push(tokio::spawn(async move {
+            call_from(
+                &app,
+                "192.0.2.240:4000",
+                None,
+                "/pair",
+                json!({"code": "invalid"}),
+            )
+            .await
+        }));
+    }
+    let mut invalid = 0;
+    let mut throttled = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            StatusCode::UNAUTHORIZED => invalid += 1,
+            StatusCode::TOO_MANY_REQUESTS => throttled += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!(invalid, 5);
+    assert_eq!(throttled, 15);
+}
+
+async fn device_rows(h: &Harness) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM devices")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap()
+}
+
 // ---- account deletion and export ----
 
 #[tokio::test]

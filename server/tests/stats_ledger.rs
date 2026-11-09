@@ -363,6 +363,45 @@ async fn creation_dates_bound_the_schedule_ledger_per_date() {
     assert_parity(&user, today, "created item weekdays narrowed").await;
 }
 
+/// TRACK-62: `created_by` is display provenance. A row a parent assigned to the child is stored
+/// under the child's `user_id`, and the statistics ledger must score it exactly like an item the
+/// child created, including XP, the habit streak and perfect-day scheduling.
+#[tokio::test]
+async fn parent_provenance_does_not_change_any_statistic() {
+    let db = db::connect_memory().await.unwrap();
+    let parent = users::create(&db, "Parent", false).await.unwrap();
+    let user = UserDb::new(&db, 1);
+    let today = day("2026-11-08");
+    let habit = item("h", "habit", 127, 15);
+    let chore = item("c", "chore", 127, 10);
+    let dates = ["2026-11-06", "2026-11-07", "2026-11-08"];
+
+    let completions: Vec<Completion> = dates
+        .iter()
+        .flat_map(|date| [comp("h", date, 10), comp("c", date, 10)])
+        .collect();
+    user.apply_push(&[habit, chore], &completions)
+        .await
+        .unwrap();
+
+    let owned = user.stats(today).await.unwrap();
+    assert_eq!(owned.xp, 3 * 15 + 3 * 10 + 3 * xp::PERFECT_DAY_BONUS);
+    assert_eq!(owned.perfect_days, dates.map(str::to_string).to_vec());
+    assert_eq!(owned.streaks.get("h"), Some(&3));
+    assert_parity(&user, today, "owned items").await;
+
+    // A parent route (TRACK-57) will write the parent as creator. Simulate that stored row and
+    // confirm no statistic moves, in both the ledger and the full-history reference.
+    sqlx::query("UPDATE items SET created_by = ? WHERE user_id = 1")
+        .bind(parent)
+        .execute(&db)
+        .await
+        .unwrap();
+    let assigned = user.stats(today).await.unwrap();
+    assert_eq!(assigned, owned, "parent provenance changed the statistics");
+    assert_parity(&user, today, "parent-assigned items").await;
+}
+
 #[tokio::test]
 async fn ledgers_are_scoped_to_one_account() {
     let db = db::connect_memory().await.unwrap();

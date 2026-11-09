@@ -199,9 +199,10 @@ When a link is revoked, the items the parent added stay on the child's list as t
 
 ### XP, levels, streaks and perfect days
 
-- Parent-assigned items earn XP, levels and streaks exactly like the child's own items, and they join perfect-day scheduling. The shared rules in `spec/xp_vectors.json` do not fork.
+- Parent-assigned items earn XP, levels and streaks exactly like the child's own items, and they join perfect-day scheduling. Provenance is not an input to the shared rules: `xp::compute` and `rules.dart` read only the item's scoring fields and `created_on`. `spec/xp_vectors.json` pins cases with `created_by` set, so neither implementation can quietly add a provenance branch.
+- A parent-assigned scheduled chore or habit can therefore complete a perfect day on its own, and leaving one undone blocks that day. Removal follows the same current-definition behaviour as an owned item: deleting a parent-assigned item drops the XP its completions earned and can rescore past days, exactly as the child deleting their own would. The creation bound below is the only protection for days already earned.
 - Perfect days follow TRACK-65's immutable creation date: an item joins a day's schedule only from the day after it was created, and the server's timestamp, not a client clock, sets that date. A parent adding an item today therefore cannot revoke a perfect day that was already earned.
-- The parent sees the child's XP for the items the parent assigned, not the child's total or any XP from the child's own items.
+- The parent sees the child's XP for the items the parent assigned, not the child's total or any XP from the child's own items. The parent statistics route belongs to TRACK-57; this section fixes the rule it reports.
 
 ### Completion alerts
 

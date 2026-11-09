@@ -10,8 +10,8 @@
 #   BREADTRACKER_OFFSITE_SOURCE=/var/backups/bread-tracker/litestream
 #   BREADTRACKER_OFFSITE_DEST=operator-configured-user@host:/safe/path/litestream
 #   BREADTRACKER_FCM_KEY_FILE=/home/breadway/secrets/bread-tracker-fcm.json   Firebase service account
-#   BREADTRACKER_CONTAINER_NAME / BREADTRACKER_LITESTREAM_NAME   override only for an isolated
-#                                               scratch project; leave unset in production
+#   BREADTRACKER_CONTAINER_NAME / BREADTRACKER_LITESTREAM_NAME / BREADTRACKER_INIT_NAME
+#                                               override only for an isolated scratch project; leave unset in production
 #
 # Pair a phone:  docker compose -f packaging/compose.yaml --project-directory . exec bread-tracker bread-tracker-server pair
 
@@ -23,6 +23,7 @@ services:
       context: .
       dockerfile: packaging/Containerfile
     image: ${BREADTRACKER_IMAGE:-bread-tracker:local}
+    container_name: ${BREADTRACKER_INIT_NAME:-bread-tracker-init-perms}
     user: root
     entrypoint: ["sh", "-c"]
     command:

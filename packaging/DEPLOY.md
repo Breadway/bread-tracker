@@ -414,8 +414,9 @@ credentials and the actual offsite protection remain an operator gate.
   The pins are real multi-arch index digests resolved from the Docker registry; they are a snapshot,
   not a claim that the mutable tags still point at them. To take base image updates, run
   `docker buildx imagetools inspect <image>`, put the new digest in the `FROM` lines and rebuild.
-- `BREADTRACKER_CONTAINER_NAME`, `BREADTRACKER_LITESTREAM_NAME` and `BREADTRACKER_IMAGE` exist so an
-  isolated scratch project can use unique names. Leave them unset in production.
+- `BREADTRACKER_CONTAINER_NAME`, `BREADTRACKER_LITESTREAM_NAME`,
+  `BREADTRACKER_INIT_NAME` and `BREADTRACKER_IMAGE` exist so an isolated scratch project can use
+  unique names. Leave them unset in production.
 
 ## Invite signup admission
 

@@ -1,0 +1,6 @@
+# Copy to android/key.properties (gitignored) and fill in. Never commit the real file or the keystore.
+# storeFile is resolved relative to android/app, or use an absolute path.
+storeFile=/home/you/secrets/bread-tracker-release.jks
+storePassword=change-me
+keyAlias=bread-tracker
+keyPassword=change-me

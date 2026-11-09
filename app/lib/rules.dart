@@ -24,10 +24,14 @@ class RItem {
     required this.points,
     required this.active,
     this.deleted = false,
+    this.createdOn,
   });
   final String id, kind;
   final int weekdays, points;
   final bool active, deleted;
+
+  /// `YYYY-MM-DD`, or null for an item that predates TRACK-65 (no lower bound).
+  final String? createdOn;
 }
 
 class RCompletion {
@@ -62,9 +66,20 @@ String fmtDay(DateTime d) =>
 /// Monday = 0 .. Sunday = 6.
 int weekdayIndex(DateTime d) => d.weekday - 1;
 
+/// Whether an item exists yet on [date]. A missing creation date (an item from before TRACK-65)
+/// has no lower bound, so its history scores exactly as it did before the upgrade.
+bool existedOn(RItem i, DateTime date) {
+  final created = i.createdOn;
+  return created == null || date.isAfter(parseDay(created));
+}
+
+/// A chore or habit is scheduled on [date] when it existed by then and its weekday bit is set.
+/// It counts only from the day AFTER creation, so adding one today cannot remove a perfect-day
+/// bonus already earned today, and adding one later cannot rescore an earlier day.
 bool scheduledOn(RItem i, DateTime date) =>
     i.active &&
     (i.kind == 'chore' || i.kind == 'habit') &&
+    existedOn(i, date) &&
     (i.weekdays & (1 << weekdayIndex(date))) != 0;
 
 Stats computeStats(

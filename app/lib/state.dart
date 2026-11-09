@@ -144,6 +144,7 @@ List<RItem> toRItems(List<ItemRow> rows) => [
       points: i.points,
       active: i.active,
       deleted: i.deletedAt != null,
+      createdOn: i.createdOn,
     ),
 ];
 
@@ -872,32 +873,48 @@ class AppController {
     }
   }
 
-  Future<void> saveItem({
+  /// Saves an item and returns whether it changed local data. [creating] is required because
+  /// newness cannot be inferred from [id]: starter chores pass a precomputed id, and looking the
+  /// row up to decide would race with sync. New rows always get today's creation date; edits
+  /// never touch the stored one.
+  Future<bool> saveItem({
     String? id,
     required String kind,
     required String name,
+    required bool creating,
     int weekdays = 127,
     String? remindTime,
     int? points,
     String? dueDate,
     bool active = true,
   }) async {
-    await _db.upsertItem(
-      ItemsCompanion(
-        id: Value(id ?? const Uuid().v4()),
-        kind: Value(kind),
-        name: Value(name.trim()),
-        weekdays: Value(weekdays),
-        remindTime: Value(remindTime),
-        points: Value(points ?? _defaultPoints[kind]!),
-        dueDate: Value(dueDate),
-        active: Value(active),
-        updatedAt: Value(nowMs()),
-        deletedAt: const Value(null),
-        dirty: const Value(true),
-      ),
+    final companion = ItemsCompanion(
+      id: Value(id ?? const Uuid().v4()),
+      kind: Value(kind),
+      name: Value(name.trim()),
+      weekdays: Value(weekdays),
+      remindTime: Value(remindTime),
+      points: Value(points ?? _defaultPoints[kind]!),
+      dueDate: Value(dueDate),
+      active: Value(active),
+      updatedAt: Value(nowMs()),
+      deletedAt: const Value(null),
+      // Immutable: recorded on creation, never touched by an edit so past perfect days stay
+      // earned. Absent leaves an existing (or legacy NULL) value exactly as it is.
+      createdOn: creating
+          ? Value(fmtDay(DateTime.now()))
+          : const Value.absent(),
+      dirty: const Value(true),
     );
+    if (creating) {
+      // Insert only. A deterministic id must never overwrite a row a sync just landed, and that
+      // row's creation date is immutable.
+      if (!await _db.createItem(companion)) return false;
+    } else {
+      await _db.upsertItem(companion);
+    }
     scheduleSync();
+    return true;
   }
 
   Future<void> deleteItem(String id) async {
@@ -906,24 +923,23 @@ class AppController {
   }
 
   Future<int> addStarterChores() async {
-    final existing = (ref.read(itemsProvider).value ?? const <ItemRow>[])
-        .map((i) => i.id)
-        .toSet();
     var added = 0;
     for (final c in starterChores) {
       final id = const Uuid().v5(
         Namespace.url.value,
         'bread-tracker:chore:${c.name}',
       );
-      if (existing.contains(id)) continue;
-      await saveItem(
+      // The id is deterministic, so a row may already exist (including one a sync just
+      // landed). `saveItem` inserts only when absent, which keeps its creation date intact.
+      final inserted = await saveItem(
         id: id,
         kind: 'chore',
         name: c.name,
         weekdays: c.weekdays,
         remindTime: c.time,
+        creating: true,
       );
-      added++;
+      if (inserted) added++;
     }
     return added;
   }

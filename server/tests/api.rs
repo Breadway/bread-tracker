@@ -446,10 +446,22 @@ async fn stats_endpoint_uses_shared_rules() {
     let h = harness().await;
     let tok = paired(&h).await;
     let now = store::now_ms();
-    call(&h.app, "POST", "/sync", Some(&tok), Some(json!({
-        "items": [item(C1, "chore", "Dishes", 127, None, now), item(H1, "habit", "Read", 127, None, now)],
-        "completions": [comp(C1, "2026-10-19", now, None), comp(H1, "2026-10-19", now, None)]
-    }))).await;
+    // Items created before the ticked day: a new item counts only from the day after creation.
+    let mut chore = item(C1, "chore", "Dishes", 127, None, now);
+    chore["created_on"] = json!("2026-10-01");
+    let mut habit = item(H1, "habit", "Read", 127, None, now);
+    habit["created_on"] = json!("2026-10-01");
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({
+            "items": [chore, habit],
+            "completions": [comp(C1, "2026-10-19", now, None), comp(H1, "2026-10-19", now, None)]
+        })),
+    )
+    .await;
     let (s, v) = call(&h.app, "GET", "/stats?date=2026-10-19", Some(&tok), None).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["xp"], 10 + 10 + 50);

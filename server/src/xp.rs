@@ -232,6 +232,26 @@ mod tests {
         }
     }
 
+    fn habit_item(id: &str, created_on: &str) -> Item {
+        Item {
+            id: id.to_string(),
+            kind: "habit".to_string(),
+            name: "Habit".to_string(),
+            weekdays: 127,
+            remind_time: None,
+            points: 15,
+            due_date: None,
+            sort: 0,
+            active: true,
+            updated_at: 0,
+            deleted_at: None,
+            created_on: Some(created_on.to_string()),
+            created_by: None,
+            permission_override: None,
+            seq: 0,
+        }
+    }
+
     fn completion(item_id: &str, date: &str) -> Completion {
         Completion {
             item_id: item_id.to_string(),
@@ -286,5 +306,68 @@ mod tests {
         let completions = vec![completion("a", "2026-10-20"), completion("a", "2026-10-21")];
         let stats = compute(&items, &completions, parse("2026-10-21").unwrap());
         assert_eq!(stats.perfect_days, vec!["2026-10-21".to_string()]);
+    }
+
+    #[test]
+    fn parent_assigned_items_score_exactly_like_owned_items() {
+        let today = parse("2026-10-19").unwrap();
+        let base = vec![
+            scheduled_item("chore", "2026-10-01"),
+            habit_item("habit", "2026-10-01"),
+        ];
+        let completions = vec![
+            completion("chore", "2026-10-19"),
+            completion("habit", "2026-10-17"),
+            completion("habit", "2026-10-18"),
+            completion("habit", "2026-10-19"),
+        ];
+
+        let owned = compute(&base, &completions, today);
+        assert_eq!(owned.xp, 105, "chore, habit and perfect-day points");
+        assert_eq!(owned.perfect_days, vec!["2026-10-19".to_string()]);
+        assert_eq!(owned.streaks.get("habit"), Some(&3));
+
+        // Provenance is display information only: an item the child owns (created_by = the
+        // child), an item a parent assigned (created_by = another user) and a legacy row with
+        // no provenance must produce byte-for-byte the same statistics.
+        for created_by in [Some(1), Some(2), None] {
+            let items: Vec<Item> = base
+                .iter()
+                .map(|item| Item {
+                    created_by,
+                    ..item.clone()
+                })
+                .collect();
+            let stats = compute(&items, &completions, today);
+            assert_eq!(
+                stats, owned,
+                "created_by = {created_by:?} changed the score"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parent_assigned_item_obeys_the_creation_date_bound() {
+        let mut item = scheduled_item("parent", "2026-10-19");
+        item.created_by = Some(2);
+
+        let same_day = compute(
+            std::slice::from_ref(&item),
+            &[completion("parent", "2026-10-19")],
+            parse("2026-10-19").unwrap(),
+        );
+        assert_eq!(same_day.xp, 10, "the completion still earns item XP");
+        assert!(
+            same_day.perfect_days.is_empty(),
+            "the creation day is not scheduled yet"
+        );
+
+        let next_day = compute(
+            &[item],
+            &[completion("parent", "2026-10-20")],
+            parse("2026-10-20").unwrap(),
+        );
+        assert_eq!(next_day.xp, 60, "10 points plus the perfect-day bonus");
+        assert_eq!(next_day.perfect_days, vec!["2026-10-20".to_string()]);
     }
 }

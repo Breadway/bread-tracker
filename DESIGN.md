@@ -2,8 +2,10 @@
 
 Separate from the Nextcloud Chores calendar and the Gotify cron reminders. Server and
 database live on a server you host; the Android app (Flutter) is offline-first and syncs to it.
-The server is shared: each person has their own account, isolated from the others (see Users
-below).
+The server is shared: each person has their own account, and isolation is per user (see Users
+below). The one exception is an explicit family link that the child accepts (see Family): a
+linked parent can assign items to the child's list and see only those items and their progress.
+Without a link there is no sharing, and a child is fully usable with no parent.
 
 ## Rules (shared by server `server/src/xp.rs` and the app; vectors in `spec/xp_vectors.json`)
 
@@ -16,7 +18,7 @@ below).
 
 ## Sync
 
-- Rows: `items` (key `user_id` + `id`) and `completions` (key `user_id` + `item_id` + `date`); every request only sees the caller's own rows. Every row has `updated_at` (client unix ms) and `deleted_at` (tombstone, so an un-tick or delete syncs).
+- Rows: `items` (key `user_id` + `id`) and `completions` (key `user_id` + `item_id` + `date`); every sync request only sees the caller's own rows (the family routes in Family are separate). Every row has `updated_at` (client unix ms) and `deleted_at` (tombstone, so an un-tick or delete syncs).
 - Server assigns a monotonic `seq` to every accepted write. The cursor is a `seq`, so clock skew cannot lose rows.
 - `POST /sync {since, items, completions}` pushes local changes then returns every row with `seq > since` plus the new `cursor`, in one round trip. `GET /sync?since=` is pull only.
 - Conflicts: last write wins by `updated_at`; ties keep the server row. Timestamps more than a day in the future are clamped.
@@ -128,6 +130,57 @@ The phone's database is one store, shared by whichever account signs in, so the 
 - Whenever the screen cannot rule out a wipe (the phone has data and a history) it first asks for confirmation, saying that unsynced changes to the old account are lost. Cancel changes nothing.
 - **Sign out** revokes the device on the server and forgets the token and cursor. With "keep data" the account is remembered, so signing back in to the same account keeps the data and signing in to another wipes it; "sign out and delete data" also forgets the account.
 - Against a server that predates accounts the app reports "too old for this version" rather than guessing.
+
+## Family
+
+A parent can assign chores, habits and to-dos to a linked child's list. The child keeps their own
+account, phone and full use of the app with no parent linked; a family link is optional, and only
+the child can accept one. The multi-user chain (TRACK-17 to TRACK-20) is integrated on `feature/app`
+(see Users and migrations), so family work builds on that foundation and no longer waits for it.
+
+### Links
+
+- One row per pair in `family_links(id, parent_id, child_id, status, default_permission, notify_on_complete, created_at, accepted_at)`, unique on `(parent_id, child_id)`; status is pending, active or revoked, and a user cannot link to themselves. The schema, provenance and override columns belong to TRACK-55; existing items default `created_by` to their owner so nothing changes for current users.
+- The child offers a short-lived single-use family code from Settings. The parent redeems it to create a pending link, and the child confirms who is asking before it becomes active. A parent can never link unilaterally, and pending links expire.
+- Either side can unlink at any time. Revocation ends the parent's access immediately, including anything the parent's devices have not pulled yet.
+- Roles are per link direction, never per account: one child may have several parents, one parent several children, and a user may be both a parent in one link and a child in another. The child always sees who can assign to them.
+
+### Item provenance and visibility
+
+- A parent-added item is stored under the child's `user_id` with `created_by` set to the parent. The child's normal sync pull delivers it through the same cursor; the child needs no new endpoint.
+- `created_by` is immutable provenance that the server sets. It is never trusted from a client payload, on the child's `/sync` or on the parent routes. An item the child creates keeps `created_by` = the child.
+- Parent writes use dedicated authenticated routes (list children, create, update and delete an assigned item, read assigned-item progress), never the parent's `/sync`. Parent reads return only items the parent assigned plus completions and XP progress for those. They never return the child's own items, settings, devices, push tokens or full stats.
+- The child's app learns `created_by` and a read-only `effective_permission` with each item so it can label assigned items and grey out controls, but the server remains the authority.
+
+### Permission levels
+
+The effective level is the item's override when set, otherwise the link's default. A new link defaults to complete_only. The server computes the level and enforces it on every write.
+
+| Level | The child may write |
+| --- | --- |
+| `complete_only` | completions, including completion tombstones (an un-tick) |
+| `complete_and_reschedule` | the above plus `due_date`, `weekdays`, `remind_time` and `active` |
+| `full` | the above plus `name`, `points` and delete |
+
+- A write outside the effective level is refused per row with a reason the app can show and revert. It must not fail the whole batch silently.
+- Changing a link's default permission takes effect on the child's next pull and does not rewrite history. The server advances the `seq` of that parent's items under the child, and does not touch their `updated_at`, so the child's cursor-based pull delivers the new effective permission without pretending the item itself was edited. An item override still wins.
+- Tightening a level changes future edits only; edits the child already made stay.
+
+### Revocation
+
+When a link is revoked, the items the parent added stay on the child's list as the child's own: `created_by` is cleared to the child, and the child can delete them like any other item. The parent stops seeing those items and the child's progress immediately, and the parent's devices receive nothing more about the child on their next sync.
+
+### XP, levels, streaks and perfect days
+
+- Parent-assigned items earn XP, levels and streaks exactly like the child's own items, and they join perfect-day scheduling. The shared rules in `spec/xp_vectors.json` do not fork.
+- Perfect days follow TRACK-65's immutable creation date: an item joins a day's schedule only from the day after it was created, and the server's timestamp, not a client clock, sets that date. A parent adding an item today therefore cannot revoke a perfect day that was already earned.
+- The parent sees the child's XP for the items the parent assigned, not the child's total or any XP from the child's own items.
+
+### Completion alerts
+
+- Completion alerts are per link, default off, and controlled by the parent.
+- They are batched so a child ticking several items produces one message, respect the parent's own reminders switch and quiet hours, and are suppressed rather than deferred inside quiet hours.
+- The payload carries only the name of the assigned item and no tokens. The child's reminders are unchanged and go to the child only.
 
 ## Defaults for new users
 

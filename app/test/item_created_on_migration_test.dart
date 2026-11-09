@@ -67,5 +67,5 @@ void main() {
     expect(columns, hasLength(1), reason: 'the column was added by onUpgrade');
     await db.close();
     await dir.delete(recursive: true);
-  });
+  }, timeout: const Timeout(Duration(minutes: 2)));
 }

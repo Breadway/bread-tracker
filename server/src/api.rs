@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::middleware;
 use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
@@ -20,8 +20,8 @@ use crate::model::{SyncRequest, SyncResponse};
 use crate::public_auth::{self, ClientIp};
 use crate::push::{Message, SendOutcome};
 use crate::store::{PushError, UserDb, UserSettings};
+use crate::{family, xp, AppState};
 use crate::{invites, users};
-use crate::{xp, AppState};
 
 const MAX_BATCH: usize = 5000;
 
@@ -50,6 +50,10 @@ pub fn router(state: AppState) -> Router {
         .route("/stats", get(stats))
         .route("/settings", get(get_settings).put(put_settings))
         .route("/push/test", post(push_test))
+        .route("/family/code", post(family_code))
+        .route("/family/links", get(family_links).post(family_create_link))
+        .route("/family/links/{id}/accept", post(family_accept))
+        .route("/family/links/{id}", delete(family_unlink))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,
@@ -251,6 +255,169 @@ async fn new_pair_code(
         code,
         expires_in_secs: auth::pairing_code_ttl_secs(),
     }))
+}
+
+#[derive(Serialize)]
+struct FamilyCodeResp {
+    code: String,
+    expires_in_secs: i64,
+}
+
+/// Authenticated: the caller offers a short-lived single-use family code. It is bound to the
+/// caller's user id from their token, never from the request, and the same code cannot be used
+/// on `/pair`.
+async fn family_code(
+    State(st): State<AppState>,
+    Extension(caller): Extension<auth::CallerIdentity>,
+) -> ApiResult<Json<FamilyCodeResp>> {
+    let code = family::issue_code(&st.db, &caller)
+        .await?
+        .ok_or(ApiError::Unauthorized)?;
+    tracing::info!(user = caller.user_id, "family code issued");
+    Ok(Json(FamilyCodeResp {
+        code,
+        expires_in_secs: family::code_ttl_secs(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct FamilyRedeemReq {
+    code: String,
+}
+
+#[derive(Serialize)]
+struct FamilyLinkResp {
+    id: i64,
+    direction: String,
+    status: String,
+    permission: String,
+    other_name: String,
+    created_at: i64,
+    accepted_at: Option<i64>,
+    revoked_at: Option<i64>,
+    pending_expires_at: Option<i64>,
+    pending_expired: bool,
+}
+
+impl From<family::LinkInfo> for FamilyLinkResp {
+    fn from(link: family::LinkInfo) -> Self {
+        let pending_expired = link.pending_expired(crate::store::now_ms());
+        Self {
+            id: link.id,
+            direction: link.direction,
+            status: link.status,
+            permission: link.permission,
+            other_name: link.other_name,
+            created_at: link.created_at,
+            accepted_at: link.accepted_at,
+            revoked_at: link.revoked_at,
+            pending_expires_at: link.pending_expires_at,
+            pending_expired,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct FamilyLinksResp {
+    links: Vec<FamilyLinkResp>,
+}
+
+async fn family_links(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+) -> ApiResult<Json<FamilyLinksResp>> {
+    let links = family::links_for(&st.db, uid)
+        .await?
+        .into_iter()
+        .map(FamilyLinkResp::from)
+        .collect();
+    Ok(Json(FamilyLinksResp { links }))
+}
+
+/// Authenticated: redeem a child's family code into a *pending* link. Both the shared
+/// per-source admission and the durable per-code budget apply. A successful redemption spends
+/// neither: it deletes its per-code attempt row and leaves the source budget untouched.
+async fn family_create_link(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+    ClientIp(source): ClientIp,
+    body: Result<Json<FamilyRedeemReq>, JsonRejection>,
+) -> ApiResult<Json<FamilyLinkResp>> {
+    let mut tx = public_auth::admit(&st.db, source).await?;
+    let req = match body {
+        Ok(Json(req)) => req,
+        Err(_) => {
+            public_auth::fail(tx, source).await?;
+            return Err(ApiError::BadRequest("invalid family link request".into()));
+        }
+    };
+    match family::redeem_in(&mut tx, uid, &req.code).await? {
+        Ok(link) => {
+            tx.commit().await?;
+            tracing::info!(user = uid, link = link.id, "family link requested");
+            Ok(Json(FamilyLinkResp::from(link)))
+        }
+        Err(family::RedeemError::BadCode) => {
+            public_auth::fail(tx, source).await?;
+            Err(ApiError::Unauthorized)
+        }
+        Err(family::RedeemError::Blocked) => {
+            public_auth::fail(tx, source).await?;
+            Err(ApiError::TooManyRequests)
+        }
+        Err(family::RedeemError::SelfLink) => {
+            tx.commit().await?;
+            Err(ApiError::BadRequest(
+                "you cannot link your own account as a parent".into(),
+            ))
+        }
+        Err(family::RedeemError::AlreadyLinked) => {
+            tx.commit().await?;
+            Err(ApiError::Conflict(
+                "you are already actively linked to this child".into(),
+            ))
+        }
+    }
+}
+
+/// Only the child of the link may accept it, only while it is pending and unexpired.
+async fn family_accept(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<serde_json::Value>> {
+    match family::accept(&st.db, uid, id).await? {
+        family::AcceptOutcome::Accepted => {
+            tracing::info!(user = uid, link = id, "family link accepted");
+            Ok(Json(serde_json::json!({ "ok": true, "status": "active" })))
+        }
+        family::AcceptOutcome::NotFound => Err(ApiError::NotFound),
+        family::AcceptOutcome::NotPending => Err(ApiError::Conflict(
+            "this link is not pending any more".into(),
+        )),
+        family::AcceptOutcome::Expired => Err(ApiError::Conflict(
+            "this link request has expired; ask the parent to request again".into(),
+        )),
+    }
+}
+
+/// Either side may unlink. Revoking is idempotent; a link the caller is not on is a 404 so an
+/// unowned id is never confirmed.
+async fn family_unlink(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<serde_json::Value>> {
+    match family::revoke(&st.db, uid, id).await? {
+        family::Revoked::Revoked => {
+            tracing::info!(user = uid, link = id, "family link revoked");
+            Ok(Json(serde_json::json!({ "ok": true, "status": "revoked" })))
+        }
+        family::Revoked::AlreadyRevoked => {
+            Ok(Json(serde_json::json!({ "ok": true, "status": "revoked" })))
+        }
+        family::Revoked::NotFound => Err(ApiError::NotFound),
+    }
 }
 
 #[derive(Deserialize)]

@@ -12,6 +12,9 @@ pub enum ApiError {
     TooManyRequests,
     #[error("{0}")]
     BadRequest(String),
+    /// No such object for this caller. Used where confirming an id would leak another account.
+    #[error("not found")]
+    NotFound,
     #[error("{0}")]
     Conflict(String),
     /// A per-user or server-wide limit was reached (rows, devices, users).
@@ -39,6 +42,7 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
             ApiError::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
+            ApiError::NotFound => (StatusCode::NOT_FOUND, self.to_string()),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
             ApiError::LimitReached(m) => (StatusCode::UNPROCESSABLE_ENTITY, m.clone()),
             ApiError::Disabled => (StatusCode::FORBIDDEN, self.to_string()),

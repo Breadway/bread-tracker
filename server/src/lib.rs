@@ -6,6 +6,7 @@ pub mod config;
 pub mod db;
 pub mod devices;
 pub mod error;
+pub mod family;
 pub mod invites;
 pub mod model;
 pub mod public_auth;

@@ -929,6 +929,7 @@ mod generation_tests {
                 active: true,
                 updated_at: 2000,
                 deleted_at: None,
+                created_on: None,
                 seq: 3,
             },
         )]);
@@ -944,6 +945,7 @@ mod generation_tests {
             active: true,
             updated_at: 1000,
             deleted_at: None,
+            created_on: None,
             seq: 1,
         };
         apply_restore_snapshot_to_values(

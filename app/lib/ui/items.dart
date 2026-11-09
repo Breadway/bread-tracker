@@ -153,6 +153,7 @@ class _ItemEditorState extends ConsumerState<_ItemEditor> {
         .read(controllerProvider)
         .saveItem(
           id: widget.item?.id,
+          creating: widget.item == null,
           kind: _kind,
           name: name,
           weekdays: _kind == 'todo' ? 0 : _mask,

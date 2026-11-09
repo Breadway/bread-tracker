@@ -378,10 +378,10 @@ async fn sync(
             "batch too large (max {MAX_BATCH} rows)"
         )));
     }
-    for it in &req.items {
-        it.validate().map_err(ApiError::BadRequest)?;
-    }
     let today = Utc::now().date_naive();
+    for it in &req.items {
+        it.validate(today).map_err(ApiError::BadRequest)?;
+    }
     for c in &req.completions {
         c.validate(today).map_err(ApiError::BadRequest)?;
     }

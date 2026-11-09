@@ -3,7 +3,7 @@
 //! The default branch has applied 0001 (init) and 0003 (hygiene indexes). 0004 (PR31) ships
 //! with this tree but its table is reserved: the live pairing and signup admission is 0009's
 //! `public_auth_limits`. The set also carries 0002 (users, which rebuilds five tables), the
-//! additive forward repair 0005 and the later multi-user migrations through 0012. SQLx applies
+//! additive forward repair 0005 and the later multi-user migrations through 0013. SQLx applies
 //! any version it has not recorded, so the ledgers a deployment can be in are all upgraded by
 //! the same migration set; these tests build each ledger for real, fill it with data, upgrade
 //! it, and check what survived.
@@ -222,6 +222,20 @@ async fn assert_upgraded_and_intact(pool: &SqlitePool) {
             .await
             .unwrap();
     assert_eq!(item, ("Read".to_string(), 15, Some(5000), 3));
+    // TRACK-65: the column is additive, and every item that predates it has no lower bound.
+    assert_eq!(
+        scalar(
+            pool,
+            "SELECT COUNT(*) FROM pragma_table_info('items') WHERE name = 'created_on'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(pool, "SELECT COUNT(*) FROM items WHERE created_on IS NULL").await,
+        3,
+        "pre-existing items must keep no lower bound"
+    );
     let dev: (String, Option<String>, i64, i64) = sqlx::query_as(
         "SELECT name, fcm_token, created_at, last_seen FROM devices WHERE token_hash = 'tok-1'",
     )
@@ -353,7 +367,7 @@ fn published_migration_files_keep_their_checksums() {
     assert_eq!(checksum_of(SQL_0004), SHA_0004);
     // Versions are unique and strictly increasing; nothing collides with 0004.
     let versions: Vec<i64> = m.migrations.iter().map(|x| x.version).collect();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
 }
 
 #[tokio::test]
@@ -367,7 +381,7 @@ async fn upgrade_from_0001_only() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -412,7 +426,7 @@ async fn upgrade_from_0001_and_0003_restores_the_hygiene_indexes_0002_dropped() 
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -429,7 +443,7 @@ async fn upgrade_from_0001_0003_and_0004() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -450,7 +464,7 @@ async fn upgrade_from_0001_and_0004_without_0003() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -467,7 +481,7 @@ async fn upgrade_from_the_published_pr43_head_0001_and_0002() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -484,7 +498,7 @@ async fn upgrade_from_0001_0002_0003_in_that_order() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -499,7 +513,7 @@ async fn fresh_database_gets_the_whole_set_in_version_order() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
         true,
     );
     let names = index_names(&pool).await;
@@ -599,7 +613,7 @@ async fn reopening_after_close_retries_while_a_writer_holds_the_lock() {
         "a reopen racing a held write lock must retry SQLITE_BUSY, not fail the second start",
     );
     let expected = ledger(&pool).await;
-    assert_eq!(expected.len(), 12);
+    assert_eq!(expected.len(), 13);
     close_pool(pool).await;
 
     for round in 0..24 {
@@ -614,7 +628,7 @@ async fn reopening_after_close_retries_while_a_writer_holds_the_lock() {
 #[tokio::test]
 async fn a_database_that_already_ran_0004_is_adopted_by_the_integrated_migration_set() {
     // PR43 plus the separately published PR31 limiter: the ledger records 0001, 0003 and 0004.
-    // Now that 0004 ships in this tree, the same start applies 0002 and 0005 to 0012, keeping
+    // Now that 0004 ships in this tree, the same start applies 0002 and 0005 to 0013, keeping
     // the recorded 0004 checksum and its table untouched.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("adopts0004.db");
@@ -624,7 +638,7 @@ async fn a_database_that_already_ran_0004_is_adopted_by_the_integrated_migration
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
         true,
     );
     assert_eq!(
@@ -735,7 +749,7 @@ async fn a_failed_0002_rolls_back_completely_and_a_retry_succeeds() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -777,7 +791,7 @@ async fn a_failed_0005_keeps_the_0002_result_and_a_retry_completes_the_repair() 
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -868,10 +882,10 @@ async fn a_database_already_upgraded_by_6f9986e_receives_0004_and_later_migratio
             .unwrap();
         let after = ledger(&pool).await;
         // Every recorded row is untouched (same versions, same checksums). The integrated
-        // deployment adds 0004 when it was absent, plus the later migrations.
+        // deployment adds 0004 when it was absent, plus the later migrations through 0013.
         assert_eq!(
             after.iter().map(|r| r.0).collect::<Vec<_>>(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
             "{name}"
         );
         for row in &before {
@@ -908,7 +922,7 @@ async fn a_failed_0006_keeps_everything_before_it_and_a_retry_completes() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -1019,7 +1033,7 @@ async fn already_published_upstream_0006_gets_0004_and_settings0007_with_values_
     // adds the limiter's 0004 and the later migrations, leaving every recorded row intact.
     assert_eq!(
         after.iter().map(|r| r.0).collect::<Vec<_>>(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     );
     for row in before {
         assert!(after.contains(&row));

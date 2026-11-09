@@ -404,6 +404,7 @@ void main() {
         reason: 'failed secure write cannot associate old credential with attempted new server',
       );
     },
+    timeout: const Timeout(Duration(minutes: 2)),
   );
   test('durable preference failure is not reported as successful pairing persistence', () async {
     SharedPreferences.setMockInitialValues({

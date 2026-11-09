@@ -237,6 +237,7 @@ async fn existing_database_migrates_and_the_admin_owns_everything() {
     // The old app still syncs with its old token and the unchanged wire format.
     let state = AppState::new(
         pool.clone(),
+        "test-generation".to_owned(),
         Config::from_env(),
         Arc::new(MockSender::default()),
     );

@@ -336,5 +336,365 @@
    ],
    "streaks": {}
   }
+ },
+ {
+  "name": "adding a daily chore the next day keeps the perfect days already earned",
+  "today": "2026-10-20",
+  "items": [
+   {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "chore",
+    "name": "Dishes",
+    "weekdays": 127,
+    "remind_time": null,
+    "points": 10,
+    "due_date": null,
+    "sort": 0,
+    "active": true,
+    "updated_at": 0,
+    "deleted_at": null,
+    "created_on": "2026-10-17"
+   },
+   {
+    "id": "55555555-5555-4555-8555-555555555555",
+    "kind": "chore",
+    "name": "Wipe counters",
+    "weekdays": 127,
+    "remind_time": null,
+    "points": 10,
+    "due_date": null,
+    "sort": 0,
+    "active": true,
+    "updated_at": 0,
+    "deleted_at": null,
+    "created_on": "2026-10-20"
+   }
+  ],
+  "completions": [
+   {
+    "item_id": "11111111-1111-4111-8111-111111111111",
+    "date": "2026-10-18",
+    "completed_at": 0,
+    "updated_at": 0,
+    "deleted_at": null
+   },
+   {
+    "item_id": "11111111-1111-4111-8111-111111111111",
+    "date": "2026-10-19",
+    "completed_at": 0,
+    "updated_at": 0,
+    "deleted_at": null
+   }
+  ],
+  "expect": {
+   "xp": 120,
+   "level": 2,
+   "perfect_days": [
+    "2026-10-18",
+    "2026-10-19"
+   ],
+   "streaks": {}
+  }
+ },
+ {
+  "name": "adding a chore on the same day keeps today's perfect day",
+  "today": "2026-10-19",
+  "items": [
+   {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "chore",
+    "name": "Dishes",
+    "weekdays": 127,
+    "remind_time": null,
+    "points": 10,
+    "due_date": null,
+    "sort": 0,
+    "active": true,
+    "updated_at": 0,
+    "deleted_at": null,
+    "created_on": "2026-10-17"
+   },
+   {
+    "id": "55555555-5555-4555-8555-555555555555",
+    "kind": "chore",
+    "name": "Wipe counters",
+    "weekdays": 127,
+    "remind_time": null,
+    "points": 10,
+    "due_date": null,
+    "sort": 0,
+    "active": true,
+    "updated_at": 0,
+    "deleted_at": null,
+    "created_on": "2026-10-19"
+   }
+  ],
+  "completions": [
+   {
+    "item_id": "11111111-1111-4111-8111-111111111111",
+    "date": "2026-10-19",
+    "completed_at": 0,
+    "updated_at": 0,
+    "deleted_at": null
+   }
+  ],
+  "expect": {
+   "xp": 60,
+   "level": 1,
+   "perfect_days": [
+    "2026-10-19"
+   ],
+   "streaks": {}
+  }
+ },
+ {
+  "name": "a chore added today with an earlier weekday does not rescore yesterday",
+  "today": "2026-10-20",
+  "items": [
+   {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "chore",
+    "name": "Recycling",
+    "weekdays": 1,
+    "remind_time": null,
+    "points": 10,
+    "due_date": null,
+    "sort": 0,
+    "active": true,
+    "updated_at": 0,
+    "deleted_at": null,
+    "created_on": "2026-10-01"
+   },
+   {
+    "id": "55555555-5555-4555-8555-555555555555",
+    "kind": "chore",
+    "name": "Bins out",
+    "weekdays": 17,
+    "remind_time": null,
+    "points": 10,
+    "due_date": null,
+    "sort": 0,
+    "active": true,
+    "updated_at": 0,
+    "deleted_at": null,
+    "created_on": "2026-10-20"
+   }
+  ],
+  "completions": [
+   {
+    "item_id": "11111111-1111-4111-8111-111111111111",
+    "date": "2026-10-19",
+    "completed_at": 0,
+    "updated_at": 0,
+    "deleted_at": null
+   }
+  ],
+  "expect": {
+   "xp": 60,
+   "level": 1,
+   "perfect_days": [
+    "2026-10-19"
+   ],
+   "streaks": {}
+  }
+ },
+ {
+  "name": "an old-format item with no creation date keeps its full history",
+  "today": "2026-10-20",
+  "items": [
+   {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "chore",
+    "name": "Dishes",
+    "weekdays": 127,
+    "remind_time": null,
+    "points": 10,
+    "due_date": null,
+    "sort": 0,
+    "active": true,
+    "updated_at": 0,
+    "deleted_at": null
+   }
+  ],
+  "completions": [
+   {
+    "item_id": "11111111-1111-4111-8111-111111111111",
+    "date": "2026-10-18",
+    "completed_at": 0,
+    "updated_at": 0,
+    "deleted_at": null
+   },
+   {
+    "item_id": "11111111-1111-4111-8111-111111111111",
+    "date": "2026-10-19",
+    "completed_at": 0,
+    "updated_at": 0,
+    "deleted_at": null
+   }
+  ],
+  "expect": {
+   "xp": 120,
+   "level": 2,
+   "perfect_days": [
+    "2026-10-18",
+    "2026-10-19"
+   ],
+   "streaks": {}
+  }
+ },
+ {
+  "name": "a legacy item and an item created today: only the legacy one is scheduled today",
+  "today": "2026-10-19",
+  "items": [
+   {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "chore",
+    "name": "Dishes",
+    "weekdays": 127,
+    "remind_time": null,
+    "points": 10,
+    "due_date": null,
+    "sort": 0,
+    "active": true,
+    "updated_at": 0,
+    "deleted_at": null
+   },
+   {
+    "id": "55555555-5555-4555-8555-555555555555",
+    "kind": "chore",
+    "name": "Wipe counters",
+    "weekdays": 127,
+    "remind_time": null,
+    "points": 10,
+    "due_date": null,
+    "sort": 0,
+    "active": true,
+    "updated_at": 0,
+    "deleted_at": null,
+    "created_on": "2026-10-19"
+   }
+  ],
+  "completions": [
+   {
+    "item_id": "11111111-1111-4111-8111-111111111111",
+    "date": "2026-10-19",
+    "completed_at": 0,
+    "updated_at": 0,
+    "deleted_at": null
+   }
+  ],
+  "expect": {
+   "xp": 60,
+   "level": 1,
+   "perfect_days": [
+    "2026-10-19"
+   ],
+   "streaks": {}
+  }
+ },
+ {
+  "name": "follow-up: a weekday edit still rescores past days",
+  "today": "2026-10-20",
+  "items": [
+   {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "chore",
+    "name": "Dishes",
+    "weekdays": 2,
+    "remind_time": null,
+    "points": 10,
+    "due_date": null,
+    "sort": 0,
+    "active": true,
+    "updated_at": 0,
+    "deleted_at": null,
+    "created_on": "2026-10-01"
+   }
+  ],
+  "completions": [
+   {
+    "item_id": "11111111-1111-4111-8111-111111111111",
+    "date": "2026-10-19",
+    "completed_at": 0,
+    "updated_at": 0,
+    "deleted_at": null
+   }
+  ],
+  "expect": {
+   "xp": 10,
+   "level": 1,
+   "perfect_days": [],
+   "streaks": {}
+  }
+ },
+ {
+  "name": "follow-up: deactivating an item still rescores past days",
+  "today": "2026-10-20",
+  "items": [
+   {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "chore",
+    "name": "Dishes",
+    "weekdays": 127,
+    "remind_time": null,
+    "points": 10,
+    "due_date": null,
+    "sort": 0,
+    "active": false,
+    "updated_at": 0,
+    "deleted_at": null,
+    "created_on": "2026-10-01"
+   }
+  ],
+  "completions": [
+   {
+    "item_id": "11111111-1111-4111-8111-111111111111",
+    "date": "2026-10-19",
+    "completed_at": 0,
+    "updated_at": 0,
+    "deleted_at": null
+   }
+  ],
+  "expect": {
+   "xp": 10,
+   "level": 1,
+   "perfect_days": [],
+   "streaks": {}
+  }
+ },
+ {
+  "name": "follow-up: deleting an item still drops the XP its completions earned",
+  "today": "2026-10-20",
+  "items": [
+   {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "chore",
+    "name": "Dishes",
+    "weekdays": 127,
+    "remind_time": null,
+    "points": 10,
+    "due_date": null,
+    "sort": 0,
+    "active": true,
+    "updated_at": 0,
+    "deleted_at": 5,
+    "created_on": "2026-10-01"
+   }
+  ],
+  "completions": [
+   {
+    "item_id": "11111111-1111-4111-8111-111111111111",
+    "date": "2026-10-19",
+    "completed_at": 0,
+    "updated_at": 0,
+    "deleted_at": null
+   }
+  ],
+  "expect": {
+   "xp": 0,
+   "level": 1,
+   "perfect_days": [],
+   "streaks": {}
+  }
  }
 ]

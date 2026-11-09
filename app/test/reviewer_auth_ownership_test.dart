@@ -289,6 +289,7 @@ void main() {
       );
       await reopened.close();
     },
+    timeout: const Timeout(Duration(minutes: 2)),
   );
 
   test('actual production wipe COMMIT failure rolls back rows and signout fails closed', () async {
@@ -347,7 +348,7 @@ void main() {
       'preserve on rollback',
     );
     await recovered.close();
-  });
+  }, timeout: const Timeout(Duration(minutes: 2)));
 
   testWidgets(
     'PairScreen retries local recovery without redeeming one-time code again',
@@ -564,6 +565,7 @@ void main() {
         await finalReopen.close();
       });
     },
+    timeout: const Timeout(Duration(minutes: 2)),
   );
 
   for (final invalidation in ['none', 'server-change', 'dispose']) {

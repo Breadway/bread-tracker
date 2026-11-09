@@ -10,11 +10,13 @@ COPY spec spec
 RUN cargo build --release --locked -p bread-tracker-server
 
 FROM docker.io/library/debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /s/target/release/bread-tracker-server /usr/local/bin/bread-tracker-server
+# This image stays on the root user to match the existing root-owned production volume.
+# The non-root switch and its upgrade path are owned by TRACK-15 / PR42.
 ENV BREADTRACKER_LISTEN=0.0.0.0:7290 \
     BREADTRACKER_DATABASE_PATH=/var/lib/bread-tracker/bread-tracker.db
 VOLUME /var/lib/bread-tracker
 EXPOSE 7290
-ENTRYPOINT ["bread-tracker-server"]
+ENTRYPOINT ["/usr/local/bin/bread-tracker-server"]

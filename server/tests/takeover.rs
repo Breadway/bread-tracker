@@ -26,6 +26,7 @@ async fn world(extra: &[&str]) -> (World, Vec<(i64, String)>) {
     let pool = db::connect_with_admin(&url, Some("Alice")).await.unwrap();
     let app = api::router(AppState::new(
         pool.clone(),
+        "test-generation".to_owned(),
         Config::from_env(),
         Arc::new(MockSender::default()),
     ));

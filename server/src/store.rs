@@ -21,6 +21,28 @@ async fn next_seq(conn: &mut SqliteConnection) -> Result<i64, sqlx::Error> {
         .await
 }
 
+/// The user's current local date, used as the creation date for an item first seen now.
+///
+/// The date, not a timestamp: perfect-day scheduling is per local date, and an item created in
+/// the evening must not be scheduled for that same day. Missing or unparseable settings fall
+/// back to UTC, matching the rest of the settings handling.
+async fn first_seen_date(conn: &mut SqliteConnection, user_id: i64) -> Result<String, sqlx::Error> {
+    let timezone: Option<String> =
+        sqlx::query_scalar("SELECT timezone FROM user_settings WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let tz: chrono_tz::Tz = timezone
+        .as_deref()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(chrono_tz::UTC);
+    Ok(chrono::Utc::now()
+        .with_timezone(&tz)
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string())
+}
+
 /// Why a push was refused or failed.
 #[derive(Debug, thiserror::Error)]
 pub enum PushError {
@@ -35,12 +57,17 @@ pub enum PushError {
 }
 
 const ITEM_COLS: &str =
-    "id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, seq";
+    "id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, created_on, seq";
 const COMPLETION_COLS: &str = "item_id, date, completed_at, updated_at, deleted_at, seq";
 
 fn pull_sql(table: &str, cols: &str) -> String {
     format!("SELECT {cols} FROM {table} WHERE user_id = ? AND seq > ? AND seq <= ? ORDER BY seq")
 }
+
+/// Stored item fields read before an upsert: `updated_at` plus everything the ledger needs.
+type StoredItemRow = (i64, String, i64, i64, bool, Option<i64>, Option<String>);
+/// The fields of the completion's item that decide its ledger contribution.
+type CompletionItemRow = (String, i64, i64, bool, Option<i64>, Option<String>);
 
 /// The item fields a statistics ledger update can depend on, captured before an upsert.
 struct LedgerItem {
@@ -49,6 +76,7 @@ struct LedgerItem {
     points: i64,
     active: bool,
     deleted_at: Option<i64>,
+    created_on: Option<String>,
 }
 
 impl LedgerItem {
@@ -65,12 +93,23 @@ impl LedgerItem {
         )
     }
 
+    /// The canonical creation date when the item has a lower bound, or `None` for a legacy
+    /// item with no bound. An unparseable value is treated as no bound, exactly like
+    /// [`xp::scheduled_on_parts`] treats it.
+    fn created_bound(&self) -> Option<String> {
+        self.created_on
+            .as_deref()
+            .and_then(xp::parse)
+            .map(|day| day.format("%Y-%m-%d").to_string())
+    }
+
     fn scheduled_on(&self, day: NaiveDate) -> bool {
         xp::scheduled_on_parts(
             &self.kind,
             self.weekdays,
             self.active,
             self.deleted_at.is_some(),
+            self.created_on.as_deref(),
             day,
         )
     }
@@ -137,16 +176,74 @@ async fn ledger_day_add(
     Ok(())
 }
 
-/// Adjust the per-weekday count of live scheduled items after an item's membership mask changes.
+/// Add `delta` to the count of live scheduled items for one `(weekday, creation date)`.
+async fn ledger_schedule_created_add(
+    conn: &mut SqliteConnection,
+    user_id: i64,
+    weekday: i64,
+    created_on: &str,
+    delta: i64,
+) -> Result<(), sqlx::Error> {
+    if delta > 0 {
+        sqlx::query(
+            "INSERT INTO stats_schedule_created (user_id, weekday, created_on, scheduled)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(user_id, weekday, created_on) DO UPDATE
+               SET scheduled = scheduled + excluded.scheduled",
+        )
+        .bind(user_id)
+        .bind(weekday)
+        .bind(created_on)
+        .bind(delta)
+        .execute(&mut *conn)
+        .await?;
+    } else if delta < 0 {
+        sqlx::query(
+            "DELETE FROM stats_schedule_created
+             WHERE user_id = ? AND weekday = ? AND created_on = ? AND scheduled <= ?",
+        )
+        .bind(user_id)
+        .bind(weekday)
+        .bind(created_on)
+        .bind(-delta)
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(
+            "UPDATE stats_schedule_created SET scheduled = scheduled + ?
+             WHERE user_id = ? AND weekday = ? AND created_on = ?",
+        )
+        .bind(delta)
+        .bind(user_id)
+        .bind(weekday)
+        .bind(created_on)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Adjust the schedule ledger after an item's live membership changes.
+///
+/// `stats_schedule` keeps the per-weekday count of every live scheduled item, including those
+/// with a creation date. `stats_schedule_created` keeps the same count split by creation date,
+/// so `/stats` can subtract the items that did not exist yet on a given date. Both are exact:
+/// `scheduled(D)` is `stats_schedule[weekday(D)]` minus every `stats_schedule_created` row for
+/// that weekday whose creation date is on or after `D`. An item without a creation date has no
+/// lower bound and never appears in the second table.
 async fn ledger_schedule_delta(
     conn: &mut SqliteConnection,
     user_id: i64,
-    old_bits: u8,
-    new_bits: u8,
+    previous: Option<&LedgerItem>,
+    current: &LedgerItem,
 ) -> Result<(), sqlx::Error> {
+    let old_bits = previous.map(LedgerItem::weekday_bits).unwrap_or(0);
+    let new_bits = current.weekday_bits();
+    let old_bound = previous.and_then(LedgerItem::created_bound);
+    let new_bound = current.created_bound();
     for weekday in 0..7u8 {
-        let was = i64::from(old_bits & (1 << weekday) != 0);
-        let now = i64::from(new_bits & (1 << weekday) != 0);
+        let bit = 1u8 << weekday;
+        let was = i64::from(old_bits & bit != 0);
+        let now = i64::from(new_bits & bit != 0);
         let delta = now - was;
         if delta > 0 {
             sqlx::query(
@@ -177,6 +274,19 @@ async fn ledger_schedule_delta(
             .execute(&mut *conn)
             .await?;
         }
+
+        // A creation bound is immutable, so only a membership change can move it. When both
+        // sides carry the same bound the two writes cancel, so skip them.
+        let old_entry = if was != 0 { old_bound.as_deref() } else { None };
+        let new_entry = if now != 0 { new_bound.as_deref() } else { None };
+        if old_entry != new_entry {
+            if let Some(created) = old_entry {
+                ledger_schedule_created_add(conn, user_id, i64::from(weekday), created, -1).await?;
+            }
+            if let Some(created) = new_entry {
+                ledger_schedule_created_add(conn, user_id, i64::from(weekday), created, 1).await?;
+            }
+        }
     }
     Ok(())
 }
@@ -187,6 +297,8 @@ const STATS_XP_SQL: &str = "SELECT COALESCE((SELECT xp_base FROM stats_user WHER
 const STATS_DAYS_SQL: &str =
     "SELECT date, done_scheduled FROM stats_day WHERE user_id = ? ORDER BY date";
 const STATS_SCHEDULE_SQL: &str = "SELECT weekday, scheduled FROM stats_schedule WHERE user_id = ?";
+const STATS_SCHEDULE_CREATED_SQL: &str =
+    "SELECT weekday, created_on, scheduled FROM stats_schedule_created WHERE user_id = ?";
 const STATS_HABITS_SQL: &str =
     "SELECT id FROM items WHERE user_id = ? AND deleted_at IS NULL AND kind = 'habit' ORDER BY id";
 /// Count consecutive completed days ending at the anchor date. The seed row only exists when
@@ -302,11 +414,16 @@ impl UserDb {
             }
         }
 
+        // A new item gets the creation date the client sent, or the user's local date the first
+        // time the server sees it. An existing row keeps its stored value forever, including a
+        // legacy NULL, so a later push can never move the day an item starts counting toward
+        // perfect days and retroactively rescore history.
+        let first_seen = first_seen_date(&mut tx, self.user_id).await?;
         for it in items {
             let updated = it.updated_at.min(ceiling);
-            let existing: Option<(i64, String, i64, i64, bool, Option<i64>)> = sqlx::query_as(
-                "SELECT updated_at, kind, weekdays, points, active, deleted_at
-                 FROM items WHERE user_id = ? AND id = ?",
+            let existing: Option<StoredItemRow> = sqlx::query_as(
+                "SELECT updated_at, kind, weekdays, points, active, deleted_at, created_on
+                     FROM items WHERE user_id = ? AND id = ?",
             )
             .bind(self.user_id)
             .bind(&it.id)
@@ -324,10 +441,14 @@ impl UserDb {
                 }
                 item_count += 1;
             }
+            let created_on = match &existing {
+                Some((_, _, _, _, _, _, stored)) => stored.clone(),
+                None => Some(it.created_on.clone().unwrap_or_else(|| first_seen.clone())),
+            };
             let seq = next_seq(&mut tx).await?;
             sqlx::query(
-                "INSERT INTO items (user_id, id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, seq)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "INSERT INTO items (user_id, id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, created_on, seq)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(user_id, id) DO UPDATE SET
                    kind = excluded.kind, name = excluded.name, weekdays = excluded.weekdays,
                    remind_time = excluded.remind_time, points = excluded.points, due_date = excluded.due_date,
@@ -346,18 +467,22 @@ impl UserDb {
             .bind(it.active)
             .bind(updated)
             .bind(it.deleted_at)
+            .bind(created_on.clone())
             .bind(seq)
             .execute(&mut *tx)
             .await?;
             // TRACK-72: the item's ledger delta uses only fields that can change its
             // contribution. Points and liveness change base XP; kind, active, weekdays and
-            // liveness change which days it is scheduled on.
+            // liveness change which weekday mask applies, and the stored creation date bounds
+            // it per date. `created_on` is the persisted value, so an edit that sends a new
+            // one cannot move history.
             let previous = existing.map(|e| LedgerItem {
                 kind: e.1,
                 weekdays: e.2,
                 points: e.3,
                 active: e.4,
                 deleted_at: e.5,
+                created_on: e.6,
             });
             let current = LedgerItem {
                 kind: it.kind.clone(),
@@ -365,6 +490,7 @@ impl UserDb {
                 points: it.points,
                 active: it.active,
                 deleted_at: it.deleted_at,
+                created_on: created_on.clone(),
             };
             let done_days: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM stats_item_date WHERE user_id = ? AND item_id = ?",
@@ -387,7 +513,9 @@ impl UserDb {
 
             let old_bits = previous.as_ref().map(LedgerItem::weekday_bits).unwrap_or(0);
             let new_bits = current.weekday_bits();
-            if old_bits != new_bits {
+            if old_bits != new_bits
+                || previous.as_ref().and_then(LedgerItem::created_bound) != current.created_bound()
+            {
                 let dates: Vec<String> = sqlx::query_scalar(
                     "SELECT date FROM stats_item_date WHERE user_id = ? AND item_id = ?",
                 )
@@ -399,15 +527,16 @@ impl UserDb {
                     let Some(day) = crate::xp::parse(&date) else {
                         continue;
                     };
-                    let bit = 1u8 << day.weekday().num_days_from_monday();
-                    let was = old_bits & bit != 0;
-                    let now = new_bits & bit != 0;
+                    // Evaluate the full predicate on each side: the creation bound means a
+                    // weekday bit is not enough to decide whether this date counted.
+                    let was = previous.as_ref().is_some_and(|item| item.scheduled_on(day));
+                    let now = current.scheduled_on(day);
                     if was != now {
                         ledger_day_add(&mut tx, self.user_id, &date, if now { 1 } else { -1 })
                             .await?;
                     }
                 }
-                ledger_schedule_delta(&mut tx, self.user_id, old_bits, new_bits).await?;
+                ledger_schedule_delta(&mut tx, self.user_id, previous.as_ref(), &current).await?;
             }
         }
 
@@ -425,15 +554,15 @@ impl UserDb {
             if existing.as_ref().is_some_and(|e| e.0 >= updated) {
                 continue;
             }
-            let item: Option<(String, i64, i64, bool, Option<i64>)> = sqlx::query_as(
-                "SELECT kind, weekdays, points, active, deleted_at
+            let item: Option<CompletionItemRow> = sqlx::query_as(
+                "SELECT kind, weekdays, points, active, deleted_at, created_on
                  FROM items WHERE user_id = ? AND id = ?",
             )
             .bind(self.user_id)
             .bind(&c.item_id)
             .fetch_optional(&mut *tx)
             .await?;
-            let Some((kind, weekdays, points, active, item_deleted)) = item else {
+            let Some((kind, weekdays, points, active, item_deleted, created_on)) = item else {
                 return Err(PushError::UnknownItem);
             };
             if existing.is_none() {
@@ -478,6 +607,7 @@ impl UserDb {
                     points,
                     active,
                     deleted_at: item_deleted,
+                    created_on,
                 };
                 let live_rows: Option<i64> = sqlx::query_scalar(
                     "SELECT live_rows FROM stats_item_date
@@ -556,11 +686,17 @@ impl UserDb {
     /// cursor. The cursor is the global change counter, so it also advances when other users
     /// write; their rows are never returned and the gaps are harmless. Both reads search the
     /// `(user_id, seq)` index; see [`UserDb::pull_query_plans`].
+    ///
+    /// A `since` above the current cursor means the caller's database was restored to an
+    /// older copy. Reading from 0 returns everything in the same snapshot instead of an empty
+    /// page that would leave the caller stuck until new writes pushed `seq` past its cursor.
+    /// Nothing is written, so this cannot mask a restore by advancing `seq` first.
     pub async fn pull(&self, since: i64) -> Result<SyncResponse, sqlx::Error> {
         let mut tx = self.db.begin().await?;
         let cursor: i64 = sqlx::query_scalar("SELECT val FROM meta WHERE key = 'seq'")
             .fetch_one(&mut *tx)
             .await?;
+        let since = if since > cursor { 0 } else { since };
         let items = sqlx::query_as::<_, Item>(&pull_sql("items", ITEM_COLS))
             .bind(self.user_id)
             .bind(since)
@@ -576,6 +712,7 @@ impl UserDb {
                 .await?;
         tx.commit().await?;
         Ok(SyncResponse {
+            epoch: None,
             cursor,
             items,
             completions,
@@ -653,6 +790,39 @@ impl UserDb {
                 *slot = count;
             }
         }
+        // TRACK-65/TRACK-72: an item only counts toward a date after its creation date, so the
+        // per-weekday total is corrected by the live items created on or after that date. This
+        // table has one row per (weekday, creation date), not per completion or per item, so
+        // the read stays proportional to live schedule bounds, never to retained history.
+        let created_entries: Vec<(i64, String, i64)> = sqlx::query_as(STATS_SCHEDULE_CREATED_SQL)
+            .bind(self.user_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut bound: Vec<Vec<(NaiveDate, i64)>> = vec![Vec::new(); 7];
+        for (weekday, date, count) in created_entries {
+            let Some(day) = xp::parse(&date) else {
+                continue;
+            };
+            if let Some(slot) = bound.get_mut(weekday as usize) {
+                slot.push((day, count));
+            }
+        }
+        // Ascending creation dates plus a suffix sum: `excluded(D)` is the suffix sum from the
+        // first creation date on or after D.
+        let mut excluded_suffix: Vec<Vec<i64>> = Vec::with_capacity(7);
+        for entries in bound.iter_mut() {
+            entries.sort_by_key(|(day, _)| *day);
+            let mut suffix = vec![0i64; entries.len() + 1];
+            for index in (0..entries.len()).rev() {
+                suffix[index] = suffix[index + 1] + entries[index].1;
+            }
+            excluded_suffix.push(suffix);
+        }
+        let excluded_on = |weekday: usize, day: NaiveDate| -> i64 {
+            let entries = &bound[weekday];
+            let first = entries.partition_point(|(created, _)| *created < day);
+            excluded_suffix[weekday][first]
+        };
         let habits: Vec<String> = sqlx::query_scalar(STATS_HABITS_SQL)
             .bind(self.user_id)
             .fetch_all(&mut *tx)
@@ -663,7 +833,9 @@ impl UserDb {
             let Some(day) = xp::parse(&date) else {
                 continue;
             };
-            if done > 0 && done == scheduled[day.weekday().num_days_from_monday() as usize] {
+            let weekday = day.weekday().num_days_from_monday() as usize;
+            let on_date = scheduled[weekday] - excluded_on(weekday, day);
+            if done > 0 && done == on_date {
                 perfect_days.push(date);
             }
         }
@@ -723,6 +895,7 @@ impl UserDb {
             STATS_XP_SQL,
             STATS_DAYS_SQL,
             STATS_SCHEDULE_SQL,
+            STATS_SCHEDULE_CREATED_SQL,
             STATS_HABITS_SQL,
         ] {
             let rows: Vec<(i64, i64, i64, String)> =
@@ -779,6 +952,7 @@ impl UserDb {
             "stats_item_date",
             "stats_day",
             "stats_schedule",
+            "stats_schedule_created",
             "stats_user",
         ] {
             sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
@@ -812,6 +986,18 @@ impl UserDb {
             )
             .bind(self.user_id)
             .bind(weekday as i64)
+            .bind(count)
+            .execute(&mut *tx)
+            .await?;
+        }
+        for ((weekday, created_on), count) in &snapshot.schedule_created {
+            sqlx::query(
+                "INSERT INTO stats_schedule_created (user_id, weekday, created_on, scheduled)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(self.user_id)
+            .bind(weekday)
+            .bind(created_on)
             .bind(count)
             .execute(&mut *tx)
             .await?;

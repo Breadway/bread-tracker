@@ -7,7 +7,7 @@
 #   BREADTRACKER_BACKUP_DIR=/var/backups/bread-tracker
 #   BREADTRACKER_FCM_KEY_FILE=/path/to/secrets/bread-tracker-fcm.json   Firebase service account
 #
-# Pair a phone:  docker exec bread-tracker bread-tracker-server pair
+# Pair a phone:  docker compose -f packaging/compose.yaml --project-directory . exec bread-tracker bread-tracker-server pair
 
 services:
   bread-tracker:

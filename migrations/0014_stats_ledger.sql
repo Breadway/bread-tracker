@@ -13,11 +13,22 @@
 --
 -- `stats_day.done_scheduled` is the number of distinct live, active chore/habit items that are
 -- scheduled on that date and done on it. A day is perfect when that count is positive and equals
--- `stats_schedule.scheduled` for the date's weekday, which is the count of live active
--- chore/habit items with that weekday bit set. A day row exists only while its count is positive.
+-- the number of items scheduled on that exact date. A day row exists only while its count is
+-- positive.
+--
+-- `stats_schedule` is the per-weekday count of live active chore/habit items, including items
+-- that have a creation date. `stats_schedule_created` splits the same count by the item's
+-- immutable `created_on`. An item counts toward a date only from the day AFTER it was created
+-- (TRACK-65), so the scheduled count for date D is `stats_schedule[weekday(D)]` minus every
+-- `stats_schedule_created` row for that weekday whose creation date is on or after D. Rows are
+-- keyed by (weekday, created_on), not by item or completion, so the correction is exact and
+-- bounded by the number of distinct live creation dates. A legacy item with NULL created_on
+-- has no lower bound and never appears in `stats_schedule_created`. Because `created_on` is
+-- immutable after creation, this bound never moves for an existing item.
 --
 -- `stats_user.xp_base` is the sum of `points * number of live completion dates` over live items.
--- Perfect-day bonuses are added at read time, so no bonus is ever stored twice.
+-- Perfect-day bonuses are added at read time, so no bonus is ever stored twice. Base XP and
+-- streaks use every live completion date; only the schedule membership is bounded by creation.
 --
 -- `stats_state` says whether a user's ledger has been built from their retained history. Every
 -- user that exists when this migration runs starts at 0 and is rebuilt once at the next start,
@@ -26,8 +37,8 @@
 -- rebuilt on a normal start, and a failed or interrupted rebuild leaves the marker at 0 so the
 -- next start retries it; no history is read or written by the rebuild beyond the ledger tables.
 --
--- Version 0013 is reserved by the in-flight TRACK-65 item-created branch, so this uses the next
--- free number.
+-- 0013 added `items.created_on`; this ledger applies the same creation bound to schedule
+-- membership, so the two branches are reconciled rather than merged independently.
 
 CREATE TABLE stats_item_date (
   user_id   INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
@@ -49,6 +60,14 @@ CREATE TABLE stats_schedule (
   weekday   INTEGER NOT NULL CHECK (weekday BETWEEN 0 AND 6),  -- bit0 of an item's mask
   scheduled INTEGER NOT NULL CHECK (scheduled >= 0),
   PRIMARY KEY (user_id, weekday)
+);
+
+CREATE TABLE stats_schedule_created (
+  user_id    INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+  weekday    INTEGER NOT NULL CHECK (weekday BETWEEN 0 AND 6),
+  created_on TEXT NOT NULL,                -- canonical YYYY-MM-DD, immutable per item
+  scheduled  INTEGER NOT NULL CHECK (scheduled > 0),
+  PRIMARY KEY (user_id, weekday, created_on)
 );
 
 CREATE TABLE stats_user (

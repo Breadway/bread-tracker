@@ -36,7 +36,18 @@ fn item(id: &str, kind: &str, weekdays: i64, points: i64) -> Item {
         active: true,
         updated_at: 1,
         deleted_at: None,
+        // Most tests describe history that predates the item, so give the helper an old
+        // creation date. A NULL (legacy) creation date is exercised in the populated upgrade
+        // test, where rows are written directly and never pass through the sync path.
+        created_on: Some("2020-01-01".to_string()),
         seq: 0,
+    }
+}
+
+fn created(base: &Item, created_on: &str) -> Item {
+    Item {
+        created_on: Some(created_on.to_string()),
+        ..base.clone()
     }
 }
 
@@ -219,6 +230,137 @@ async fn ledger_matches_reference_through_edits_tombstones_and_date_encodings() 
     assert_parity(&user, today, "last encoding of the date un-ticked").await;
 }
 
+/// TRACK-65 reconciliation: the schedule ledger must apply each item's immutable creation date
+/// per date. An item created on a day does not count toward that day's schedule, so adding one
+/// cannot remove a perfect day that was already earned; it does count from the next day.
+///
+/// This would fail if the created_on bound were ignored: the new item would join the weekday
+/// total for 2026-11-02 while only the old item is done there, and the already-earned perfect
+/// day would disappear.
+#[tokio::test]
+async fn creation_dates_bound_the_schedule_ledger_per_date() {
+    let db = db::connect_memory().await.unwrap();
+    let user = UserDb::new(&db, 1);
+    let today = day("2026-11-08");
+    // Monday to Sunday, created before the history it scores.
+    let a = created(&item("a", "chore", 127, 10), "2026-10-01");
+
+    user.apply_push(
+        std::slice::from_ref(&a),
+        &[
+            comp("a", "2026-11-02", 10),
+            comp("a", "2026-11-03", 10),
+            comp("a", "2026-11-04", 10),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        user.stats(today).await.unwrap().perfect_days,
+        vec![
+            "2026-11-02".to_string(),
+            "2026-11-03".to_string(),
+            "2026-11-04".to_string()
+        ]
+    );
+
+    // Created ON 2026-11-02: it is not scheduled that day, so the earned day stays perfect.
+    // From 2026-11-03 it is scheduled and not done, so those days stop being perfect.
+    let b = created(&item("b", "chore", 127, 20), "2026-11-02");
+    user.apply_push(std::slice::from_ref(&b), &[])
+        .await
+        .unwrap();
+    let stats = user.stats(today).await.unwrap();
+    assert_eq!(
+        stats.perfect_days,
+        vec!["2026-11-02".to_string()],
+        "adding an item created on 2026-11-02 must not remove that day's bonus"
+    );
+    assert_parity(&user, today, "item created on the perfect day").await;
+
+    // Completing it on its creation day earns item XP but does not make that day scheduled.
+    user.apply_push(&[], &[comp("b", "2026-11-02", 20)])
+        .await
+        .unwrap();
+    assert_parity(&user, today, "completion on the creation day").await;
+    user.apply_push(
+        &[],
+        &[comp("b", "2026-11-03", 30), comp("b", "2026-11-04", 30)],
+    )
+    .await
+    .unwrap();
+    assert_parity(&user, today, "created item completed from the next day").await;
+    assert_eq!(
+        user.stats(today).await.unwrap().perfect_days,
+        vec![
+            "2026-11-02".to_string(),
+            "2026-11-03".to_string(),
+            "2026-11-04".to_string()
+        ]
+    );
+
+    // An item synced without a creation date gets the first-seen date, so it does not reach
+    // back into history either. (A stored legacy NULL is covered by the populated upgrade
+    // test, where rows are written directly.)
+    let future = created(&item("c", "chore", 1, 5), "2026-11-09"); // Mondays only
+    user.apply_push(std::slice::from_ref(&future), &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        user.stats(today).await.unwrap().perfect_days,
+        vec![
+            "2026-11-02".to_string(),
+            "2026-11-03".to_string(),
+            "2026-11-04".to_string()
+        ],
+        "an item created after the history must not change its schedule"
+    );
+    assert_parity(&user, today, "item created after the history").await;
+
+    // A stored creation date never changes: an edit that sends another one is ignored.
+    let mut moved = created(&b, "2026-11-04");
+    moved.updated_at = 40;
+    user.apply_push(&[moved], &[]).await.unwrap();
+    let stored = user
+        .all_items()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|i| i.id == "b")
+        .unwrap();
+    assert_eq!(stored.created_on.as_deref(), Some("2026-11-02"));
+    assert_parity(&user, today, "edit trying to move created_on").await;
+
+    // Deactivation and resurrection move the bound with the item's schedule membership.
+    let mut inactive = created(&b, "2026-11-02");
+    inactive.active = false;
+    inactive.updated_at = 50;
+    user.apply_push(&[inactive], &[]).await.unwrap();
+    assert_parity(&user, today, "created item deactivated").await;
+    let mut active = created(&b, "2026-11-02");
+    active.updated_at = 60;
+    user.apply_push(&[active], &[]).await.unwrap();
+    assert_parity(&user, today, "created item reactivated").await;
+
+    // Deletion removes both its XP and its creation bound; resurrection restores both.
+    let mut deleted = created(&b, "2026-11-02");
+    deleted.deleted_at = Some(70);
+    deleted.updated_at = 70;
+    user.apply_push(&[deleted], &[]).await.unwrap();
+    assert_parity(&user, today, "created item deleted").await;
+    let mut resurrected = created(&b, "2026-11-02");
+    resurrected.updated_at = 80;
+    user.apply_push(&[resurrected], &[]).await.unwrap();
+    assert_parity(&user, today, "created item resurrected").await;
+
+    // Weekday edits change membership only from the creation date onward.
+    let mut narrowed = created(&b, "2026-11-02");
+    narrowed.weekdays = 1; // Mondays
+    narrowed.updated_at = 90;
+    user.apply_push(&[narrowed], &[]).await.unwrap();
+    assert_parity(&user, today, "created item weekdays narrowed").await;
+}
+
 #[tokio::test]
 async fn ledgers_are_scoped_to_one_account() {
     let db = db::connect_memory().await.unwrap();
@@ -334,7 +476,8 @@ async fn concurrent_sync_and_stats_never_expose_a_partial_ledger() {
 
 /// The migration set a deployment has before the statistics ledger existed.
 fn pre_ledger_migrator() -> Migrator {
-    let versions = [1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12];
+    // Everything before 0014, including the reserved 0004 limiter and 0013's created_on.
+    let versions = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
     let mut m = sqlx::migrate!("../migrations");
     m.migrations = Cow::Owned(
         m.migrations
@@ -389,11 +532,16 @@ async fn populated_legacy_upgrade_builds_the_ledger_exactly() {
            (1, 't', '2026-11-02', 1, 1, NULL, 13),
            (1, 'd', '2026-11-02', 1, 1, NULL, 14),
            (1, 'h', '2026-02-30', 1, 1, NULL, 15);
-         INSERT INTO items (user_id, id, kind, name, weekdays, points, active, updated_at, deleted_at, seq) VALUES
-           ({pat}, 'a', 'habit', 'Pat habit', 127, 30, 1, 1, NULL, 16);
+         INSERT INTO items (user_id, id, kind, name, weekdays, points, active, updated_at, deleted_at, created_on, seq) VALUES
+           (1, 'e', 'chore', 'Bounded', 127, 7, 1, 1, NULL, '2026-11-01', 16);
          INSERT INTO completions (user_id, item_id, date, completed_at, updated_at, deleted_at, seq) VALUES
-           ({pat}, 'a', '2026-11-06', 1, 1, NULL, 17),
-           ({pat}, 'a', '2026-11-07', 1, 1, NULL, 18);"
+           (1, 'e', '2026-11-01', 1, 1, NULL, 17),
+           (1, 'e', '2026-11-02', 1, 1, NULL, 18);
+         INSERT INTO items (user_id, id, kind, name, weekdays, points, active, updated_at, deleted_at, seq) VALUES
+           ({pat}, 'a', 'habit', 'Pat habit', 127, 30, 1, 1, NULL, 19);
+         INSERT INTO completions (user_id, item_id, date, completed_at, updated_at, deleted_at, seq) VALUES
+           ({pat}, 'a', '2026-11-06', 1, 1, NULL, 20),
+           ({pat}, 'a', '2026-11-07', 1, 1, NULL, 21);"
     ))
     .execute(&pool)
     .await
@@ -418,17 +566,26 @@ async fn populated_legacy_upgrade_builds_the_ledger_exactly() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(rows, 12, "the upgrade must not delete history");
+    assert_eq!(rows, 14, "the upgrade must not delete history");
 
     // The un-ticked row contributes nothing, and the unparseable legacy date is ignored by the
     // snapshot exactly as the reference ignores it.
     let stats = UserDb::new(&pool, 1).stats(today).await.unwrap();
     assert_eq!(
         UserDb::new(&pool, 1).all_completions().await.unwrap().len(),
-        10,
-        "user 1 keeps all ten stored rows, including its tombstone"
+        12,
+        "user 1 keeps all stored rows, including its tombstone"
     );
     assert!(stats.streaks.contains_key("h"));
+    // The legacy NULL rows have no lower bound, so they count from the beginning of the
+    // retained history: 11-01 was always scheduled for a and h, and 11-02 adds the item
+    // created on 11-01 (which first counts the day after). The dead and inactive items never
+    // count, and the unparseable legacy date is ignored.
+    assert_eq!(
+        stats.perfect_days,
+        vec!["2026-11-01".to_string(), "2026-11-02".to_string()],
+        "the backfilled ledger must keep the same schedule under created_on"
+    );
     let again = db::connect(&url).await.unwrap();
     assert_eq!(
         UserDb::new(&again, 1).stats(today).await.unwrap(),
@@ -451,10 +608,11 @@ async fn stats_work_does_not_scale_with_completion_count() {
     let pool = db::connect_memory().await.unwrap();
     sqlx::raw_sql(
         "WITH RECURSIVE n(x) AS (SELECT 0 UNION ALL SELECT x + 1 FROM n WHERE x < 9999)
-         INSERT INTO items (user_id, id, kind, name, weekdays, points, active, updated_at, seq)
+         INSERT INTO items (user_id, id, kind, name, weekdays, points, active, updated_at, created_on, seq)
          SELECT 1, printf('i%d', x),
                 CASE WHEN x < 10 THEN 'habit' ELSE 'todo' END,
-                'item', CASE WHEN x < 10 THEN 127 ELSE 0 END, 10, 1, 1, x
+                'item', CASE WHEN x < 10 THEN 127 ELSE 0 END, 10, 1, 1,
+                CASE WHEN x < 10 THEN '2026-01-01' ELSE NULL END, x
          FROM n;
          WITH RECURSIVE n(x) AS (SELECT 0 UNION ALL SELECT x + 1 FROM n WHERE x < 1999)
          INSERT INTO completions (user_id, item_id, date, completed_at, updated_at, seq)

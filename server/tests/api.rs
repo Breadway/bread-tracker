@@ -1,4 +1,9 @@
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration as StdDuration;
+
+use std::str::FromStr;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -22,6 +27,10 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
+    harness_with_generation(uuid::Uuid::new_v4().to_string()).await
+}
+
+async fn harness_with_generation(generation: String) -> Harness {
     let db = db::connect_memory().await.unwrap();
     // The reminder tests below use a Perth clock. A fresh database defaults to UTC, so put the
     // admin on Perth explicitly (`fresh_installation_defaults_to_utc` covers the default).
@@ -30,7 +39,7 @@ async fn harness() -> Harness {
         .await
         .unwrap();
     let mock = Arc::new(MockSender::default());
-    let state = AppState::new(db, Config::from_env(), mock.clone());
+    let state = AppState::new(db, generation, Config::from_env(), mock.clone());
     Harness {
         app: api::router(state.clone()),
         state,
@@ -437,10 +446,22 @@ async fn stats_endpoint_uses_shared_rules() {
     let h = harness().await;
     let tok = paired(&h).await;
     let now = store::now_ms();
-    call(&h.app, "POST", "/sync", Some(&tok), Some(json!({
-        "items": [item(C1, "chore", "Dishes", 127, None, now), item(H1, "habit", "Read", 127, None, now)],
-        "completions": [comp(C1, "2026-10-19", now, None), comp(H1, "2026-10-19", now, None)]
-    }))).await;
+    // Items created before the ticked day: a new item counts only from the day after creation.
+    let mut chore = item(C1, "chore", "Dishes", 127, None, now);
+    chore["created_on"] = json!("2026-10-01");
+    let mut habit = item(H1, "habit", "Read", 127, None, now);
+    habit["created_on"] = json!("2026-10-01");
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({
+            "items": [chore, habit],
+            "completions": [comp(C1, "2026-10-19", now, None), comp(H1, "2026-10-19", now, None)]
+        })),
+    )
+    .await;
     let (s, v) = call(&h.app, "GET", "/stats?date=2026-10-19", Some(&tok), None).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["xp"], 10 + 10 + 50);
@@ -846,7 +867,12 @@ async fn forwarded_for_is_only_believed_from_a_trusted_proxy() {
     let db = db::connect_memory().await.unwrap();
     let mut config = Config::from_env();
     config.trusted_proxies = vec![TrustedProxy::parse("100.64.0.0/10").unwrap()];
-    let state = AppState::new(db, config, Arc::new(MockSender::default()));
+    let state = AppState::new(
+        db,
+        uuid::Uuid::new_v4().to_string(),
+        config,
+        Arc::new(MockSender::default()),
+    );
     let app = api::router(state.clone());
     for _ in 0..5 {
         call_from(
@@ -2475,6 +2501,7 @@ async fn a_late_unregistered_answer_clears_only_the_token_fcm_rejected() {
         .unwrap();
     let st = AppState::new(
         db.clone(),
+        uuid::Uuid::new_v4().to_string(),
         Config::from_env(),
         Arc::new(Racing { db: db.clone() }),
     );
@@ -3197,6 +3224,44 @@ async fn signup_is_public_but_the_other_routes_still_need_a_token() {
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 }
 
+// ---- concurrency helpers ----
+
+/// SQLite result codes for BUSY and LOCKED, including the extended forms. The server has an
+/// equivalent classifier in `db`, but it is crate-private, so this integration test matches the
+/// documented codes itself.
+const SQLITE_BUSY_CODES: [&str; 8] = ["5", "261", "517", "773", "6", "262", "518", "774"];
+const BUSY_RETRY_ATTEMPTS: usize = 3;
+const BUSY_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn is_busy_database_error(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Database(db) => db
+            .code()
+            .as_deref()
+            .is_some_and(|code| SQLITE_BUSY_CODES.contains(&code)),
+        _ => false,
+    }
+}
+
+/// Redeem an invite, retrying only when SQLite reported BUSY or LOCKED before producing a
+/// result. A lost race still returns `BadInvite` and is never retried, so a second successful
+/// redemption still fails the caller's exactly-one-winner assertion.
+async fn signup_with_busy_retry(
+    pool: &sqlx::SqlitePool,
+    code: &str,
+    name: &str,
+) -> Result<Result<invites::SignedUp, invites::SignupError>, sqlx::Error> {
+    for attempt in 1..=BUSY_RETRY_ATTEMPTS {
+        match invites::signup(pool, code, name, "phone", None, 1000).await {
+            Err(error) if attempt < BUSY_RETRY_ATTEMPTS && is_busy_database_error(&error) => {
+                tokio::time::sleep(BUSY_RETRY_BACKOFF).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the final attempt returns instead of looping")
+}
+
 #[tokio::test]
 async fn concurrent_double_redeem_creates_exactly_one_user() {
     // A file database with several connections, so the two redemptions really race.
@@ -3213,7 +3278,7 @@ async fn concurrent_double_redeem_creates_exactly_one_user() {
         for i in 0..8 {
             let (pool, code) = (pool.clone(), code.clone());
             tasks.push(tokio::spawn(async move {
-                invites::signup(&pool, &code, &format!("R{round}U{i}"), "phone", None, 1000)
+                signup_with_busy_retry(&pool, &code, &format!("R{round}U{i}"))
                     .await
                     .unwrap()
             }));
@@ -3290,7 +3355,12 @@ async fn reviewer_file_scheduler_cross_user_todo_quiet_disabled() {
         .await
         .unwrap();
     let mock = Arc::new(MockSender::default());
-    let state = AppState::new(db, Config::from_env(), mock.clone());
+    let state = AppState::new(
+        db,
+        uuid::Uuid::new_v4().to_string(),
+        Config::from_env(),
+        mock.clone(),
+    );
     let h = Harness {
         app: api::router(state.clone()),
         state,
@@ -3396,6 +3466,703 @@ async fn reviewer_file_scheduler_cross_user_todo_quiet_disabled() {
         .await
         .unwrap();
     assert_eq!(markers, 0);
+}
+#[tokio::test]
+async fn sync_reports_a_stable_epoch_that_differs_between_databases() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let (_, a) = call(&h.app, "GET", "/sync", Some(&tok), None).await;
+    let epoch = a["epoch"].as_str().unwrap().to_string();
+    assert!(!epoch.is_empty() && epoch != "0");
+    let now = store::now_ms();
+    let (_, b) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [item(C1, "chore", "x", 127, None, now)]})),
+    )
+    .await;
+    assert_eq!(b["epoch"], epoch, "writes do not change it");
+    let (_, same) = call(&h.app, "GET", "/sync", Some(&tok), None).await;
+    assert_eq!(same["epoch"], epoch);
+    *h.state.generation.write().unwrap() = "rotated-generation".to_owned();
+    let (_, changed) = call(&h.app, "GET", "/sync", Some(&tok), None).await;
+    assert_ne!(changed["epoch"], epoch);
+}
+
+#[tokio::test]
+async fn generation_preflight_rejects_dirty_writes_then_returns_full_snapshot() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [item(C1, "chore", "restored", 127, None, now)]})),
+    )
+    .await;
+    let old_epoch = h.state.generation.read().unwrap().clone();
+    *h.state.generation.write().unwrap() = "rotated-generation".to_owned();
+    let current: i64 = sqlx::query_scalar("SELECT val FROM meta WHERE key='seq'")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert!(current >= 1);
+    let (status, _) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"since": 999, "epoch": old_epoch, "items": [item(H1, "chore", "dirty", 127, None, now + 1000)]}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, preflight) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"since": 999, "epoch": old_epoch})),
+    )
+    .await;
+    assert_ne!(preflight["epoch"], old_epoch);
+    assert_eq!(preflight["items"].as_array().unwrap().len(), 1);
+    let (status, accepted) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"since": preflight["cursor"], "epoch": preflight["epoch"], "items": [item(H1, "chore", "dirty", 127, None, now + 1000)]}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(accepted["items"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn empty_stale_generation_preflight_does_not_rewrite_database_rows() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({
+            "items": [item(C1, "chore", "kept", 127, None, now)]
+        })),
+    )
+    .await;
+    let before: (i64, i64) = sqlx::query_as("SELECT seq, updated_at FROM items WHERE id=?")
+        .bind(C1)
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    let old_epoch = h.state.generation.read().unwrap().clone();
+    *h.state.generation.write().unwrap() = "rotated-generation".into();
+    let (status, snapshot) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({
+            "since": 99, "epoch": old_epoch, "items": [], "completions": []
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(snapshot["items"].as_array().unwrap().len(), 1);
+    let after: (i64, i64) = sqlx::query_as("SELECT seq, updated_at FROM items WHERE id=?")
+        .bind(C1)
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "read-only generation discovery must not rewrite history"
+    );
+}
+
+#[tokio::test]
+async fn generation_mismatch_with_nonempty_batch_rejects_without_writes() {
+    let h = harness().await;
+    let token = paired(&h).await;
+    let old_epoch = h.state.generation.read().unwrap().clone();
+    *h.state.generation.write().unwrap() = "rotated-generation".into();
+    let (status, _) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&token),
+        Some(json!({
+            "since": 0, "epoch": old_epoch,
+            "items": [item(C1, "chore", "must not be applied", 127, None, store::now_ms())],
+            "completions": []
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE id=?")
+        .bind(C1)
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn restore_snapshot_lww_retry_preserves_newer_item_and_completion_tombstone() {
+    let h = harness().await;
+    let token = paired(&h).await;
+    let now = store::now_ms();
+    for (name, timestamp, done) in [
+        ("older backup", now, true),
+        ("newer phone rename", now + 10, false),
+    ] {
+        let completion = json!({
+            "item_id": C1, "date": "2026-10-22",
+            "completed_at": now,
+            "updated_at": timestamp,
+            "deleted_at": if done { Value::Null } else { json!(timestamp) }
+        });
+        let (status, _) = call(
+            &h.app,
+            "POST",
+            "/sync",
+            Some(&token),
+            Some(json!({
+                "items": [item(C1, "chore", name, 127, None, timestamp)],
+                "completions": [completion]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let before: i64 = sqlx::query_scalar("SELECT val FROM meta WHERE key='seq'")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    let old_epoch = h.state.generation.read().unwrap().clone();
+    *h.state.generation.write().unwrap() = "restore-lww-generation".into();
+    let (status, snapshot) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&token),
+        Some(json!({
+            "since": 0, "epoch": old_epoch, "items": [], "completions": []
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(snapshot["items"][0]["name"], "newer phone rename");
+    assert_eq!(snapshot["completions"][0]["deleted_at"], now + 10);
+    let after: i64 = sqlx::query_scalar("SELECT val FROM meta WHERE key='seq'")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "snapshot discovery leaves sequence untouched"
+    );
+}
+
+#[tokio::test]
+async fn legacy_request_against_generation_server_keeps_push_pull_contract() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    let (status, pushed) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"since": 0, "items": [item(C1, "chore", "legacy", 127, None, now)]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(pushed["items"][0]["name"], "legacy");
+    assert!(pushed["epoch"].as_str().is_some());
+    assert!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM items")
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap()
+            >= 1,
+        "legacy sync request writes its row"
+    );
+}
+
+#[tokio::test]
+async fn stale_epoch_rejects_push_before_it_can_mask_restore_sequence_rollback() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    for idx in 0..3 {
+        let id = format!("1111111{idx}-1111-4111-8111-111111111111");
+        call(
+            &h.app,
+            "POST",
+            "/sync",
+            Some(&tok),
+            Some(json!({"items": [item(&id, "chore", "backup", 127, None, now + idx)]})),
+        )
+        .await;
+    }
+    let old_epoch = h.state.generation.read().unwrap().clone();
+    let current: i64 = sqlx::query_scalar("SELECT val FROM meta WHERE key='seq'")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert!(current >= 3);
+    *h.state.generation.write().unwrap() = "rotated-with-cursor-past-client".to_owned();
+    let dirty_id = "22222222-2222-4222-8222-222222222222";
+    let (status, _) = call(&h.app, "POST", "/sync", Some(&tok), Some(json!({"since": 3, "epoch": old_epoch, "items": [item(dirty_id, "chore", "offline", 127, None, now + 1000)]}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE id=?")
+        .bind(dirty_id)
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "stale generation request must be rejected before dirty rows are inserted"
+    );
+    let (_, snapshot) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"since": 3, "epoch": old_epoch})),
+    )
+    .await;
+    assert_eq!(snapshot["items"].as_array().unwrap().len(), 3);
+    assert_ne!(snapshot["epoch"], old_epoch);
+}
+
+#[tokio::test]
+async fn populated_old_wire_client_and_missing_optional_fields_remain_compatible() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy-wire.db");
+    let database_url = format!("sqlite://{}", path.display());
+    let legacy_options = sqlx::sqlite::SqliteConnectOptions::from_str(&database_url)
+        .unwrap()
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+    let legacy = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(legacy_options)
+        .await
+        .unwrap();
+    sqlx::migrate!("../migrations").run(&legacy).await.unwrap();
+    sqlx::query("INSERT INTO items (user_id,id,kind,name,weekdays,points,sort,active,updated_at,seq) VALUES (1,?, 'chore','legacy preserved',127,10,0,1,1,1)")
+        .bind(C1).execute(&legacy).await.unwrap();
+    sqlx::query("UPDATE meta SET val=1 WHERE key='seq'")
+        .execute(&legacy)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO devices (id,user_id,name,token_hash,fcm_token,created_at,last_seen) VALUES (?,1,?,?,?,?,?)")
+        .bind("legacy-device")
+        .bind("Legacy")
+        .bind(bread_tracker_server::auth::hash("legacy-token"))
+        .bind(Option::<String>::None)
+        .bind(1_i64)
+        .bind(1_i64)
+        .execute(&legacy)
+        .await
+        .unwrap();
+    legacy.close().await;
+    let db = db::connect_existing(&database_url).await.unwrap();
+    let generation = db::reconcile_generation_locked(&db, &path).await.unwrap();
+    let preserved: String = sqlx::query_scalar("SELECT name FROM items WHERE id=?")
+        .bind(C1)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        preserved, "legacy preserved",
+        "upgrade path preserves populated row"
+    );
+    assert!(!generation.is_empty());
+    let state = AppState::new(db, generation, Config::from_env(), Arc::new(push::NoPush));
+    let app = api::router(state);
+    let response = call(
+        &app,
+        "POST",
+        "/sync",
+        Some("legacy-token"),
+        Some(json!({"since": 0, "items": [], "completions": []})),
+    )
+    .await;
+    assert_eq!(response.0, StatusCode::OK);
+    assert_eq!(
+        response.1["items"][0]["name"], "legacy preserved",
+        "wire response: {:#}",
+        response.1
+    );
+    assert!(response.1["epoch"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn new_client_optional_wire_fields_are_ignored_and_legacy_rows_survive() {
+    let h = harness().await;
+    let token = paired(&h).await;
+    let now = store::now_ms();
+    let (status, response) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&token),
+        Some(json!({
+            "since": 0,
+            "epoch": null,
+            "items": [item(C1, "chore", "new client legacy request", 127, None, now)],
+            "completions": []
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["items"][0]["name"], "new client legacy request");
+    assert!(response["epoch"].as_str().is_some());
+}
+
+/// Generous deadline for a debug-build server binary to open its database, migrate,
+/// take the generation lock and bind on a loaded CI runner. The runner is shared with the
+/// other check jobs and the whole workspace suite, so process startup can take far longer
+/// than it does on an idle machine. It only bounds how long a broken child can wedge the
+/// suite; the tests still assert the real behaviour.
+const STARTUP_DEADLINE: StdDuration = StdDuration::from_secs(180);
+
+/// A spawned server binary whose stderr is captured to a file in the test's temp
+/// directory. The child is always killed and reaped when this value drops, so a
+/// failed assertion cannot leave a server (or its database handle) behind.
+struct ServerProcess {
+    child: std::process::Child,
+    log_path: std::path::PathBuf,
+}
+
+impl ServerProcess {
+    fn spawn(mut command: Command, log_path: std::path::PathBuf) -> Self {
+        let log = std::fs::File::create(&log_path).unwrap();
+        let child = command
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap();
+        Self { child, log_path }
+    }
+
+    fn stderr_output(&self) -> String {
+        std::fs::read_to_string(&self.log_path).unwrap_or_default()
+    }
+
+    /// Polls until `address` accepts a connection. Panics with the captured stderr
+    /// if the child exits first or the startup deadline passes.
+    fn wait_until_listening(&mut self, address: std::net::SocketAddr) {
+        let deadline = std::time::Instant::now() + STARTUP_DEADLINE;
+        loop {
+            if std::net::TcpStream::connect_timeout(&address, StdDuration::from_millis(50)).is_ok()
+            {
+                return;
+            }
+            if let Some(status) = self.child.try_wait().unwrap() {
+                panic!(
+                    "server exited during startup with {status} before listening on {address}:\n{}",
+                    self.stderr_output()
+                );
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "server did not become ready on {address} within {STARTUP_DEADLINE:?}:\n{}",
+                    self.stderr_output()
+                );
+            }
+            thread::sleep(StdDuration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for ServerProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[tokio::test]
+async fn pair_cli_completes_while_the_http_server_holds_generation_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("pair-process.db");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let binary = env!("CARGO_BIN_EXE_bread-tracker-server");
+    let mut server_command = Command::new(binary);
+    server_command
+        .env("BREADTRACKER_DATABASE_PATH", &database)
+        .env("BREADTRACKER_LISTEN", address.to_string())
+        .env("BREADTRACKER_FCM_SERVICE_ACCOUNT", "");
+    let mut server =
+        ServerProcess::spawn(server_command, dir.path().join("pair-process.stderr.log"));
+    server.wait_until_listening(address);
+    let mut pair = Command::new(binary)
+        .arg("pair")
+        .env("BREADTRACKER_DATABASE_PATH", &database)
+        .env("BREADTRACKER_LISTEN", address.to_string())
+        .env("BREADTRACKER_FCM_SERVICE_ACCOUNT", "")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pair_deadline = std::time::Instant::now() + STARTUP_DEADLINE;
+    while std::time::Instant::now() < pair_deadline && pair.try_wait().unwrap().is_none() {
+        thread::sleep(StdDuration::from_millis(10));
+    }
+    if pair.try_wait().unwrap().is_none() {
+        let _ = pair.kill();
+        let output = pair.wait_with_output().unwrap();
+        panic!(
+            "pair CLI hung against running server: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let pair = pair.wait_with_output().unwrap();
+    assert!(
+        pair.status.success(),
+        "pair stderr: {}",
+        String::from_utf8_lossy(&pair.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&pair.stdout).trim().is_empty());
+    let code = String::from_utf8_lossy(&pair.stdout).trim().to_owned();
+    let paired = reqwest::Client::new()
+        .post(format!("http://{address}/pair"))
+        .json(&json!({"code": code, "device_name": "process-pair"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        paired.status(),
+        StatusCode::OK,
+        "generated code should redeem on the running server"
+    );
+    let sentinel = database.with_extension("sync-restore-failed");
+    let sidecar = database.with_extension("sync-generation");
+    let sidecar_before = std::fs::read_to_string(&sidecar).unwrap().trim().to_owned();
+    let marker = Command::new(binary)
+        .arg("mark-restored")
+        .env("BREADTRACKER_DATABASE_PATH", &database)
+        .env("BREADTRACKER_LISTEN", address.to_string())
+        .output()
+        .unwrap();
+    assert!(
+        !marker.status.success(),
+        "restore marker must refuse an active server"
+    );
+    assert!(String::from_utf8_lossy(&marker.stderr).contains("server is running"));
+    // A benign refusal must leave the healthy database and its metadata untouched: no
+    // failure sentinel that would poison the next start, and no generation rotation.
+    assert!(
+        !sentinel.exists(),
+        "refusing while the server is healthy must not create {}",
+        sentinel.display()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&sidecar).unwrap().trim(),
+        sidecar_before
+    );
+    // Dropping the guard kills and reaps the server before the database is
+    // reopened by the marker processes below.
+    drop(server);
+    let failed_marker = Command::new(binary)
+        .arg("mark-restored")
+        .env("BREADTRACKER_DATABASE_PATH", &database)
+        .env("BREADTRACKER_LISTEN", address.to_string())
+        .env("BREADTRACKER_INJECT_MARK_FAILURE", "after-journal")
+        .output()
+        .unwrap();
+    assert!(!failed_marker.status.success());
+    assert!(
+        String::from_utf8_lossy(&failed_marker.stderr)
+            .contains("injected restore marker failure after journal publication"),
+        "test must reach the injected boundary, stderr: {}",
+        String::from_utf8_lossy(&failed_marker.stderr)
+    );
+    assert!(
+        sentinel.exists(),
+        "a genuine failed marker stays fail-closed"
+    );
+    let pending = database.with_extension("sync-generation-pending");
+    assert!(pending.exists(), "the recovery journal is durable");
+    // The database generation is unchanged until the pending journal is committed.
+    let inspect = db::connect_existing(&format!("sqlite://{}", database.display()))
+        .await
+        .unwrap();
+    let epoch: String = sqlx::query_scalar("SELECT val FROM meta WHERE key='sync_epoch'")
+        .fetch_one(&inspect)
+        .await
+        .unwrap();
+    inspect.close().await;
+    assert_eq!(epoch, sidecar_before);
+    let refused_start = Command::new(binary)
+        .env("BREADTRACKER_DATABASE_PATH", &database)
+        .env("BREADTRACKER_LISTEN", address.to_string())
+        .env("BREADTRACKER_FCM_SERVICE_ACCOUNT", "")
+        .output()
+        .unwrap();
+    assert!(!refused_start.status.success());
+    assert!(String::from_utf8_lossy(&refused_start.stderr).contains("prior restore"));
+    let refused_marker = Command::new(binary)
+        .arg("mark-restored")
+        .env("BREADTRACKER_DATABASE_PATH", &database)
+        .env("BREADTRACKER_LISTEN", address.to_string())
+        .output()
+        .unwrap();
+    assert!(!refused_marker.status.success());
+    assert!(String::from_utf8_lossy(&refused_marker.stderr).contains("prior restore"));
+}
+
+#[test]
+fn default_database_path_refusal_does_not_create_a_failure_sentinel() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = env!("CARGO_BIN_EXE_bread-tracker-server");
+    let output = Command::new(binary)
+        .arg("mark-restored")
+        .current_dir(dir.path())
+        .env_remove("BREADTRACKER_DATABASE_PATH")
+        .env("BREADTRACKER_LISTEN", "127.0.0.1:0")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "marker must refuse when the default database is absent"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("does not exist"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let derived_sentinel = dir
+        .path()
+        .join("bread-tracker.db")
+        .with_extension("sync-restore-failed");
+    assert!(
+        !derived_sentinel.exists(),
+        "a refusal before mutation must not leave a sentinel beside the default path"
+    );
+    let stray_sentinel = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .contains("sync-restore-failed")
+        });
+    assert!(
+        !stray_sentinel,
+        "a refusal must not leave a sentinel under any spelling of the derived name"
+    );
+}
+
+#[test]
+fn second_server_shares_the_database_and_restore_marking_still_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("concurrent-start.db");
+    let address1 = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let address2 = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let binary = env!("CARGO_BIN_EXE_bread-tracker-server");
+    let command = |address: std::net::SocketAddr| {
+        let mut command = Command::new(binary);
+        command
+            .env("BREADTRACKER_DATABASE_PATH", &database)
+            .env("BREADTRACKER_LISTEN", address.to_string())
+            .env("BREADTRACKER_FCM_SERVICE_ACCOUNT", "");
+        command
+    };
+    // Servers hold the generation lock shared: a second process may serve the same
+    // database, which the shared request budget already relies on. Both reconcile the
+    // generation through the database transaction, so they agree on one epoch.
+    let mut first = ServerProcess::spawn(command(address1), dir.path().join("first.stderr.log"));
+    first.wait_until_listening(address1);
+    let mut second = ServerProcess::spawn(command(address2), dir.path().join("second.stderr.log"));
+    second.wait_until_listening(address2);
+    let sidecar = database.with_extension("sync-generation");
+    let generation = std::fs::read_to_string(&sidecar).unwrap().trim().to_owned();
+    assert!(
+        uuid::Uuid::parse_str(&generation).is_ok(),
+        "startup must publish one generation sidecar, got {generation:?}"
+    );
+    // The marker still needs the exclusive lock, so a healthy server pair refuses it
+    // without touching the sidecar or arming the failure sentinel.
+    let marker = Command::new(binary)
+        .arg("mark-restored")
+        .env("BREADTRACKER_DATABASE_PATH", &database)
+        .env("BREADTRACKER_LISTEN", address1.to_string())
+        .output()
+        .unwrap();
+    assert!(
+        !marker.status.success(),
+        "restore marker must refuse while servers hold the shared generation lock"
+    );
+    assert!(String::from_utf8_lossy(&marker.stderr).contains("server is running"));
+    assert!(!database.with_extension("sync-restore-failed").exists());
+    assert_eq!(
+        std::fs::read_to_string(&sidecar).unwrap().trim(),
+        generation
+    );
+    // One server leaving does not take the database away from the other.
+    drop(first);
+    assert!(
+        second.child.try_wait().unwrap().is_none(),
+        "the surviving server must stay running; stderr:\n{}",
+        second.stderr_output()
+    );
+    assert!(
+        std::net::TcpStream::connect_timeout(&address2, StdDuration::from_millis(50)).is_ok(),
+        "the surviving server must keep serving; stderr:\n{}",
+        second.stderr_output()
+    );
+    drop(second);
+}
+
+#[tokio::test]
+async fn legacy_client_without_generation_still_syncs() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    let (status, response) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [item(C1, "chore", "legacy", 127, None, now)]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["items"][0]["name"], "legacy");
+}
+
+#[tokio::test]
+async fn a_cursor_ahead_of_the_database_gets_everything() {
+    let h = harness().await;
+    let tok = paired(&h).await;
+    let now = store::now_ms();
+    call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"items": [item(C1, "chore", "x", 127, None, now)]})),
+    )
+    .await;
+    let (_, epoch_response) = call(&h.app, "GET", "/sync", Some(&tok), None).await;
+    let (status, response) = call(
+        &h.app,
+        "POST",
+        "/sync",
+        Some(&tok),
+        Some(json!({"since": 999999, "epoch": epoch_response["epoch"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["items"].as_array().unwrap().len(), 1);
+    assert!(response["cursor"].as_i64().unwrap() < 999999);
 }
 
 // ---- user administration and adding your own device ----
@@ -3967,6 +4734,7 @@ async fn actual_transport_error_for_one_owner_does_not_block_another() {
     });
     let state = AppState::new(
         h.state.db.clone(),
+        h.state.generation.read().unwrap().clone(),
         (*h.state.config).clone(),
         sender.clone(),
     );
@@ -4334,7 +5102,7 @@ async fn limited(limits: Limits) -> Harness {
     let mock = Arc::new(MockSender::default());
     let mut config = Config::from_env();
     config.limits = limits;
-    let state = AppState::new(db, config, mock.clone());
+    let state = AppState::new(db, uuid::Uuid::new_v4().to_string(), config, mock.clone());
     Harness {
         app: api::router(state.clone()),
         state,
@@ -4812,6 +5580,145 @@ fn limits_come_from_the_environment_with_sane_fallbacks() {
     assert_eq!(l.max_items, d.max_items, "zero is not a valid limit");
     assert_eq!(l.max_devices, d.max_devices, "garbage falls back");
     assert_eq!(l.max_completions, d.max_completions);
+}
+
+// TRACK-5 regressions: `/pair` uses the shared `public_auth` admission from TRACK-20. These
+// pin the bounded, fail-closed capacity behaviour that the removed in-process limiter tried to
+// provide, beyond the per-source and forwarding tests that already cover the incumbent path.
+
+#[tokio::test]
+async fn successful_pairings_do_not_consume_the_shared_failure_budget() {
+    let h = harness().await;
+    for _ in 0..8 {
+        let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+        assert_eq!(
+            call_from(
+                &h.app,
+                "203.0.113.8:5000",
+                None,
+                "/pair",
+                json!({"code": code})
+            )
+            .await,
+            StatusCode::OK
+        );
+    }
+    let failures: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(failures), 0) FROM public_auth_limits")
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(failures, 0, "a success must not leave a partial charge");
+}
+
+#[tokio::test]
+async fn saturated_source_table_rejects_pair_attempts_without_evicting_live_budgets() {
+    let h = harness().await;
+    for n in 0..bread_tracker_server::public_auth::MAX_SOURCES as u32 {
+        let source = format!("198.51.{}.{}:4000", (n / 256) % 256, n % 256);
+        assert_eq!(
+            call_from(&h.app, &source, None, "/pair", json!({"code": "invalid"})).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    for _ in 0..100 {
+        assert_eq!(
+            call_from(
+                &h.app,
+                "192.0.2.222:4000",
+                None,
+                "/pair",
+                json!({"code": code})
+            )
+            .await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+    assert_eq!(device_rows(&h).await, 0);
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM public_auth_limits")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(rows, bread_tracker_server::public_auth::MAX_SOURCES);
+}
+
+#[tokio::test]
+async fn expired_capacity_is_reclaimed_without_evicting_live_pair_budgets() {
+    let h = harness().await;
+    for n in 0..bread_tracker_server::public_auth::MAX_SOURCES as u32 {
+        let source = format!("198.51.{}.{}:4000", (n / 256) % 256, n % 256);
+        assert_eq!(
+            call_from(&h.app, &source, None, "/pair", json!({"code": "invalid"})).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let blocked = auth::create_pairing_code(&h.state.db).await.unwrap();
+    assert_eq!(
+        call_from(
+            &h.app,
+            "192.0.2.201:4000",
+            None,
+            "/pair",
+            json!({"code": blocked})
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    sqlx::query("UPDATE public_auth_limits SET window_started_at = 0")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let code = auth::create_pairing_code(&h.state.db).await.unwrap();
+    assert_eq!(
+        call_from(
+            &h.app,
+            "192.0.2.202:4000",
+            None,
+            "/pair",
+            json!({"code": code})
+        )
+        .await,
+        StatusCode::OK,
+        "an expired window frees capacity for a new source"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_pair_guesses_get_exactly_five_attempts() {
+    let h = harness().await;
+    let mut tasks = Vec::new();
+    for _ in 0..20 {
+        let app = h.app.clone();
+        tasks.push(tokio::spawn(async move {
+            call_from(
+                &app,
+                "192.0.2.240:4000",
+                None,
+                "/pair",
+                json!({"code": "invalid"}),
+            )
+            .await
+        }));
+    }
+    let mut invalid = 0;
+    let mut throttled = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            StatusCode::UNAUTHORIZED => invalid += 1,
+            StatusCode::TOO_MANY_REQUESTS => throttled += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!(invalid, 5);
+    assert_eq!(throttled, 15);
+}
+
+async fn device_rows(h: &Harness) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM devices")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap()
 }
 
 // ---- account deletion and export ----

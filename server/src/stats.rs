@@ -8,8 +8,15 @@
 //!   repair path). It is the only place that walks completions to build statistics.
 //! - Sync maintains the same aggregates row by row in the same transaction as the accepted
 //!   write, so a reader never sees a half-applied change.
-//! - `/stats` reads only `stats_user`, `stats_day`, `stats_schedule`, `stats_item_date` (for
-//!   streak walks) and the live habit list. It never scans `completions`.
+//! - `/stats` reads only `stats_user`, `stats_day`, `stats_schedule`,
+//!   `stats_schedule_created`, `stats_item_date` (for streak walks) and the live habit list.
+//!   It never scans `completions`, and its schedule work is proportional to distinct live
+//!   creation dates rather than retained history.
+//!
+//! `stats_schedule_created` records, per weekday and creation date, how many live scheduled
+//! items carry that bound. An item counts toward a date only from the day after it was created
+//! (TRACK-65), so the read subtracts the rows whose creation date is on or after the date from
+//! the per-weekday total. Legacy NULL rows never appear there and count on every date.
 //!
 //! Dates are canonicalised through [`crate::xp::parse`], the same parser the shared rules use,
 //! so two stored encodings of one calendar date count once and an unparseable legacy date counts
@@ -33,6 +40,10 @@ pub struct Snapshot {
     pub xp_base: i64,
     pub day_done_scheduled: BTreeMap<String, i64>,
     pub schedule_weekdays: [i64; 7],
+    /// Live scheduled items with a creation date, counted per `(weekday, created_on)`. The
+    /// read subtracts these from the per-weekday totals for dates on or before the creation
+    /// date, which is how an item counts only from the day after it was created.
+    pub schedule_created: BTreeMap<(i64, String), i64>,
 }
 
 /// Build the ledgers from history. Cost is one pass over the user's items and completions; the
@@ -63,6 +74,7 @@ pub fn snapshot(items: &[Item], completions: &[Completion]) -> Snapshot {
 
     let mut xp_base = 0i64;
     let mut schedule_weekdays = [0i64; 7];
+    let mut schedule_created: BTreeMap<(i64, String), i64> = BTreeMap::new();
     for item in live.values() {
         xp_base += item.points * item_days.get(item.id.as_str()).copied().unwrap_or(0);
         let bits = xp::scheduled_weekday_bits(
@@ -71,9 +83,19 @@ pub fn snapshot(items: &[Item], completions: &[Completion]) -> Snapshot {
             item.active,
             item.deleted_at.is_some(),
         );
+        let created = item
+            .created_on
+            .as_deref()
+            .and_then(xp::parse)
+            .map(|day| day.format("%Y-%m-%d").to_string());
         for (weekday, count) in schedule_weekdays.iter_mut().enumerate() {
             if bits & (1 << weekday) != 0 {
                 *count += 1;
+                if let Some(created) = &created {
+                    *schedule_created
+                        .entry((weekday as i64, created.clone()))
+                        .or_insert(0) += 1;
+                }
             }
         }
     }
@@ -91,6 +113,7 @@ pub fn snapshot(items: &[Item], completions: &[Completion]) -> Snapshot {
             item.weekdays,
             item.active,
             item.deleted_at.is_some(),
+            item.created_on.as_deref(),
             day,
         ) {
             *day_done_scheduled.entry(date.clone()).or_insert(0) += 1;
@@ -102,6 +125,7 @@ pub fn snapshot(items: &[Item], completions: &[Completion]) -> Snapshot {
         xp_base,
         day_done_scheduled,
         schedule_weekdays,
+        schedule_created,
     }
 }
 

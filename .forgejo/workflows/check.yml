@@ -26,7 +26,13 @@ jobs:
       - name: clippy
         run: cd src && cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # Two jobs share this runner and the host still builds locally, so file-backed SQLite
+      # tests can be starved past the 5 s production busy timeout. The larger test-only wait
+      # keeps "database is locked" from masking a real assertion failure; the product default
+      # stays at 5 s and no test retries an exclusivity failure.
       - name: test
+        env:
+          BREADTRACKER_BUSY_TIMEOUT_MS: "30000"
         run: cd src && cargo test --workspace --locked
 
   app:
@@ -56,11 +62,28 @@ jobs:
           cd src && source scripts/android-env.sh
           cd app && flutter analyze
 
+      # github.com is unreachable from the runner, so place the committed
+      # prebuilt library in the native-assets hook cache. The script verifies
+      # the pin against the resolved package rather than trusting the commit.
+      - name: seed pinned sqlite3 native asset
+        run: |
+          set -euo pipefail
+          cd src
+          bash tools/ci/sqlite3/seed.sh
+
       - name: test
         run: |
           set -euo pipefail
           cd src && source scripts/android-env.sh
           cd app && flutter test
+
+      - name: restore runbook argv contract
+        run: |
+          set -euo pipefail
+          cd src
+          python3 scripts/check_restore_runbook.py packaging/Containerfile packaging/DEPLOY.md scripts/rehearse_restore.sh
+          python3 scripts/test_check_restore_runbook.py
+          python3 scripts/test_restore_assertion_control.py
 
   # server/src/xp.rs and app/lib/rules.dart must agree on spec/xp_vectors.json. Both full
   # test runs above already read it; this job runs just those two tests side by side and
@@ -87,6 +110,17 @@ jobs:
           cd src
           cargo test --locked -p bread-tracker-server --lib -- xp::tests
 
+      # The app rules test runs the same sqlite3 native-assets hook, so seed the
+      # pinned library here too (pub get first: the script reads the resolved
+      # package from app/.dart_tool/package_config.json).
+      - name: seed pinned sqlite3 native asset
+        run: |
+          set -euo pipefail
+          cd src
+          source scripts/android-env.sh
+          (cd app && flutter pub get >/dev/null)
+          bash tools/ci/sqlite3/seed.sh
+
       - name: app rules
         run: |
           set -euo pipefail
@@ -104,10 +138,20 @@ jobs:
           git -C src fetch -q --depth 1 "https://git.breadway.dev/${GITHUB_REPOSITORY}.git" "${GITHUB_SHA}"
           git -C src checkout -q --detach FETCH_HEAD
 
-      # Build only; nothing is pushed or deployed.
+      # Build only; nothing is pushed or deployed. The INFRA-50 docker shim
+      # requires the runner task prefix (ci-runner-) on every mutating command,
+      # so the build tag and its cleanup both carry that prefix.
       - name: build image
         run: |
           set -euo pipefail
           cd src
-          docker build -f packaging/Containerfile -t "bread-tracker:ci-${GITHUB_SHA}" .
-          docker image rm "bread-tracker:ci-${GITHUB_SHA}"
+          docker build -f packaging/Containerfile -t "ci-runner-bread-tracker:ci-${GITHUB_SHA}" .
+          docker image rm "ci-runner-bread-tracker:ci-${GITHUB_SHA}"
+
+      - name: restore runbook argv contract
+        run: |
+          set -euo pipefail
+          cd src
+          python3 scripts/check_restore_runbook.py packaging/Containerfile packaging/DEPLOY.md scripts/rehearse_restore.sh
+          python3 scripts/test_check_restore_runbook.py
+          python3 scripts/test_restore_assertion_control.py

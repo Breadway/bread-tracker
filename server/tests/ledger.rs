@@ -1,10 +1,12 @@
 //! Real SQLx ledger behavior for the multi-user schema, on populated file databases.
 //!
-//! The default branch has applied 0001 (init) and 0003 (hygiene indexes). The durable pairing
-//! limiter (PR31) reserves 0004. This branch adds 0002 (users, which rebuilds five tables) and
-//! the additive forward repair 0005. SQLx applies any version it has not recorded, so the
-//! ledgers a deployment can be in are all upgraded by the same migration set; these tests
-//! build each ledger for real, fill it with data, upgrade it, and check what survived.
+//! The default branch has applied 0001 (init) and 0003 (hygiene indexes). 0004 (PR31) ships
+//! with this tree but its table is reserved: the live pairing and signup admission is 0009's
+//! `public_auth_limits`. The set also carries 0002 (users, which rebuilds five tables), the
+//! additive forward repair 0005 and the later multi-user migrations through 0013. SQLx applies
+//! any version it has not recorded, so the ledgers a deployment can be in are all upgraded by
+//! the same migration set; these tests build each ledger for real, fill it with data, upgrade
+//! it, and check what survived.
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -58,7 +60,7 @@ fn migrator(versions: &[i64], with_0004: bool) -> Migrator {
         .filter(|x| versions.contains(&x.version))
         .cloned()
         .collect();
-    if with_0004 {
+    if with_0004 && !versions.contains(&4) {
         list.push(Migration::new(
             4,
             Cow::Borrowed("pair rate limits"),
@@ -72,10 +74,10 @@ fn migrator(versions: &[i64], with_0004: bool) -> Migrator {
     m
 }
 
-/// Every migration this branch ships, plus PR31's 0004: the tree after both are integrated.
+/// Every migration this tree ships: PR31's limiter 0004 is embedded, so the integrated set is
+/// exactly what a fresh installation applies.
 fn combined() -> Migrator {
-    let all: Vec<i64> = embedded().migrations.iter().map(|m| m.version).collect();
-    migrator(&all, true)
+    embedded()
 }
 
 async fn open(path: &Path) -> SqlitePool {
@@ -220,6 +222,20 @@ async fn assert_upgraded_and_intact(pool: &SqlitePool) {
             .await
             .unwrap();
     assert_eq!(item, ("Read".to_string(), 15, Some(5000), 3));
+    // TRACK-65: the column is additive, and every item that predates it has no lower bound.
+    assert_eq!(
+        scalar(
+            pool,
+            "SELECT COUNT(*) FROM pragma_table_info('items') WHERE name = 'created_on'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(pool, "SELECT COUNT(*) FROM items WHERE created_on IS NULL").await,
+        3,
+        "pre-existing items must keep no lower bound"
+    );
     let dev: (String, Option<String>, i64, i64) = sqlx::query_as(
         "SELECT name, fcm_token, created_at, last_seen FROM devices WHERE token_hash = 'tok-1'",
     )
@@ -351,7 +367,10 @@ fn published_migration_files_keep_their_checksums() {
     assert_eq!(checksum_of(SQL_0004), SHA_0004);
     // Versions are unique and strictly increasing; nothing collides with 0004.
     let versions: Vec<i64> = m.migrations.iter().map(|x| x.version).collect();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14]);
+    assert_eq!(
+        versions,
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    );
 }
 
 #[tokio::test]
@@ -365,8 +384,8 @@ async fn upgrade_from_0001_only() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 14],
-        false,
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+        true,
     );
     assert_upgraded_and_intact(&pool).await;
 }
@@ -410,8 +429,8 @@ async fn upgrade_from_0001_and_0003_restores_the_hygiene_indexes_0002_dropped() 
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 14],
-        false,
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+        true,
     );
     assert_upgraded_and_intact(&pool).await;
 }
@@ -427,7 +446,7 @@ async fn upgrade_from_0001_0003_and_0004() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -448,7 +467,7 @@ async fn upgrade_from_0001_and_0004_without_0003() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -465,8 +484,8 @@ async fn upgrade_from_the_published_pr43_head_0001_and_0002() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 14],
-        false,
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+        true,
     );
     assert_upgraded_and_intact(&pool).await;
 }
@@ -482,8 +501,8 @@ async fn upgrade_from_0001_0002_0003_in_that_order() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 14],
-        false,
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+        true,
     );
     assert_upgraded_and_intact(&pool).await;
 }
@@ -497,7 +516,7 @@ async fn fresh_database_gets_the_whole_set_in_version_order() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
         true,
     );
     let names = index_names(&pool).await;
@@ -597,7 +616,7 @@ async fn reopening_after_close_retries_while_a_writer_holds_the_lock() {
         "a reopen racing a held write lock must retry SQLITE_BUSY, not fail the second start",
     );
     let expected = ledger(&pool).await;
-    assert_eq!(expected.len(), 12);
+    assert_eq!(expected.len(), 14);
     close_pool(pool).await;
 
     for round in 0..24 {
@@ -610,33 +629,30 @@ async fn reopening_after_close_retries_while_a_writer_holds_the_lock() {
 }
 
 #[tokio::test]
-async fn this_branch_alone_refuses_a_database_that_already_ran_0004() {
-    // PR43 without PR31's migration cannot adopt a database that recorded 0004: SQLx reports
-    // the missing version and the server refuses to start instead of guessing. This is why
-    // the stack must integrate the limiter's 0004 before (or with) this branch.
+async fn a_database_that_already_ran_0004_is_adopted_by_the_integrated_migration_set() {
+    // PR43 plus the separately published PR31 limiter: the ledger records 0001, 0003 and 0004.
+    // Now that 0004 ships in this tree, the same start applies 0002 and 0005 to 0013, keeping
+    // the recorded 0004 checksum and its table untouched.
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("needs0004.db");
+    let path = dir.path().join("adopts0004.db");
     deployed(&path, &[3], true).await;
-    let err = db::connect_with_migrator(&url(&path), None, &embedded())
+    let pool = db::connect_with_migrator(&url(&path), None, &embedded())
         .await
-        .expect_err("must refuse")
-        .to_string();
-    assert!(err.contains("4"), "{err}");
-    // Nothing was changed by the refusal: still the 0001+0003+0004 ledger with legacy tables.
-    let pool = open(&path).await;
+        .unwrap();
+    assert_ledger(
+        &ledger(&pool).await,
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+        true,
+    );
     assert_eq!(
-        scalar(
-            &pool,
-            "SELECT COUNT(*) FROM pragma_table_info('items') WHERE name = 'user_id'"
-        )
-        .await,
+        scalar(&pool, "SELECT COUNT(*) FROM pair_rate_limits").await,
         0
     );
     assert_eq!(
-        scalar(&pool, "SELECT COUNT(*) FROM _sqlx_migrations").await,
+        scalar(&pool, "SELECT COUNT(*) FROM items WHERE user_id = 1").await,
         3
     );
-    assert_eq!(scalar(&pool, "SELECT COUNT(*) FROM items").await, 3);
+    assert_upgraded_and_intact(&pool).await;
 }
 
 #[tokio::test]
@@ -736,7 +752,7 @@ async fn a_failed_0002_rolls_back_completely_and_a_retry_succeeds() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -751,12 +767,12 @@ async fn a_failed_0005_keeps_the_0002_result_and_a_retry_completes_the_repair() 
     let err = db::connect_with_migrator(&url(&path), None, &failing_at(embedded(), 5)).await;
     assert!(err.is_err());
 
-    // 0002 committed in its own transaction. 0005 left nothing behind: no name_key column,
-    // no partial index, nothing recorded.
+    // 0002 committed in its own transaction. 0004 also ran; 0005 left nothing behind: no
+    // name_key column, no partial index, nothing recorded for itself.
     let pool = open(&path).await;
     assert_eq!(
         ledger(&pool).await.iter().map(|r| r.0).collect::<Vec<_>>(),
-        vec![1, 2, 3]
+        vec![1, 2, 3, 4]
     );
     assert_eq!(
         scalar(
@@ -778,8 +794,8 @@ async fn a_failed_0005_keeps_the_0002_result_and_a_retry_completes_the_repair() 
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 14],
-        false,
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+        true,
     );
     assert_upgraded_and_intact(&pool).await;
 }
@@ -840,7 +856,7 @@ async fn upgrade_like_6f9986e(path: &Path, with_0004: bool) {
 }
 
 #[tokio::test]
-async fn a_database_already_upgraded_by_6f9986e_receives_only_the_new_0006() {
+async fn a_database_already_upgraded_by_6f9986e_receives_0004_and_later_migrations() {
     for (name, then, with_0004) in [
         ("a", vec![], false),
         ("b", vec![3], false),
@@ -863,17 +879,21 @@ async fn a_database_already_upgraded_by_6f9986e_receives_only_the_new_0006() {
         );
         close_pool(pool).await;
 
-        let m = if with_0004 { combined() } else { embedded() };
+        let m = embedded();
         let pool = db::connect_with_migrator(&url(&path), None, &m)
             .await
             .unwrap();
         let after = ledger(&pool).await;
-        // Every existing migration is untouched; guard/settings/invites/admission are additive.
-        assert_eq!(after.len(), before.len() + 8, "{name}");
+        // Every recorded row is untouched (same versions and checksums); the integrated
+        // deployment adds every missing version through 0014.
+        assert_eq!(
+            after.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+            "{name}"
+        );
         for row in &before {
             assert!(after.contains(row), "{name}: {row:?} changed");
         }
-        assert_eq!(after.last().unwrap().0, 14);
         assert_upgraded_and_intact(&pool).await;
     }
 }
@@ -890,7 +910,7 @@ async fn a_failed_0006_keeps_everything_before_it_and_a_retry_completes() {
     let pool = open(&path).await;
     assert_eq!(
         ledger(&pool).await.iter().map(|r| r.0).collect::<Vec<_>>(),
-        vec![1, 2, 3, 5]
+        vec![1, 2, 3, 4, 5]
     );
     // 0006 changed nothing: the 0005 rename trigger is still the one in place.
     assert_eq!(
@@ -905,8 +925,8 @@ async fn a_failed_0006_keeps_everything_before_it_and_a_retry_completes() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 14],
-        false,
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+        true,
     );
     assert_upgraded_and_intact(&pool).await;
 }
@@ -1003,7 +1023,7 @@ async fn experimental_neutral_timezone_0005_is_rejected_without_rewriting_data()
 }
 
 #[tokio::test]
-async fn already_published_upstream_0006_gets_only_settings0007_with_values_preserved() {
+async fn already_published_upstream_0006_gets_0004_and_settings0007_with_values_preserved() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("upstream.db");
     deployed(&path, &[2, 3, 5, 6], false).await;
@@ -1012,11 +1032,13 @@ async fn already_published_upstream_0006_gets_only_settings0007_with_values_pres
     close_pool(pool).await;
     let pool = db::connect(&url(&path)).await.unwrap();
     let after = ledger(&pool).await;
-    assert_eq!(after.len(), before.len() + 7);
+    assert_eq!(
+        after.iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    );
     for row in before {
         assert!(after.contains(&row));
     }
-    assert_eq!(after.last().unwrap().0, 14);
     assert_upgraded_and_intact(&pool).await;
     let second = bread_tracker_server::users::create(&pool, "New user", false)
         .await

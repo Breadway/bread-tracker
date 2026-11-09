@@ -16,6 +16,10 @@ class Items extends Table {
   BoolColumn get active => boolean().withDefault(const Constant(true))();
   IntColumn get updatedAt => integer()();
   IntColumn get deletedAt => integer().nullable()();
+
+  /// `YYYY-MM-DD` local creation date, immutable once recorded. Null means the item predates
+  /// TRACK-65 (no lower bound for perfect-day scheduling) or came from an old server.
+  TextColumn get createdOn => text().nullable()();
   IntColumn get seq => integer().withDefault(const Constant(0))();
   BoolColumn get dirty => boolean().withDefault(const Constant(false))();
 
@@ -42,7 +46,19 @@ class AppDb extends _$AppDb {
   AppDb([QueryExecutor? e]) : super(e ?? driftDatabase(name: 'tracker'));
 
   @override
-  int get schemaVersion => 1;
+  int get schemaVersion => 2;
+
+  @override
+  MigrationStrategy get migration => MigrationStrategy(
+    onCreate: (m) => m.createAll(),
+    onUpgrade: (m, from, to) async {
+      // 1 -> 2: TRACK-65 adds the item creation date. Existing rows stay NULL on purpose: they
+      // have no lower bound, so an upgrade changes no XP, level or perfect day.
+      if (from < 2) {
+        await m.addColumn(items, items.createdOn);
+      }
+    },
+  );
 
   Stream<List<ItemRow>> watchItems() =>
       (select(items)
@@ -59,6 +75,20 @@ class AppDb extends _$AppDb {
 
   Future<void> upsertItem(ItemsCompanion c) =>
       into(items).insertOnConflictUpdate(c);
+
+  /// Insert a brand-new item and return whether it was inserted. A row that already exists is
+  /// left completely untouched, including its immutable `created_on`. Callers that pass a
+  /// precomputed id (starter chores) rely on this so a sync landing the same row cannot have its
+  /// creation date rewritten.
+  Future<bool> createItem(ItemsCompanion c) => transaction(() async {
+    final id = c.id.value;
+    final existing = await (select(
+      items,
+    )..where((t) => t.id.equals(id))).getSingleOrNull();
+    if (existing != null) return false;
+    await into(items).insert(c);
+    return true;
+  });
 
   Future<void> setCompletion(
     String itemId,
@@ -90,6 +120,33 @@ class AppDb extends _$AppDb {
     await (update(items)).write(const ItemsCompanion(dirty: Value(true)));
     await (update(completions))
         .write(const CompletionsCompanion(dirty: Value(true)));
+  }
+
+  /// Apply a remote snapshot row only when it is newer than the local row. Dirty status
+  /// is not a freshness indicator: already-synced phone data can be newer than a backup.
+  Future<void> upsertItemIfNewer(ItemsCompanion incoming) async {
+    final id = incoming.id.value;
+    final local = await (select(
+      items,
+    )..where((row) => row.id.equals(id))).getSingleOrNull();
+    if (local != null && local.updatedAt > incoming.updatedAt.value) {
+      return;
+    }
+    await upsertItem(incoming);
+  }
+
+  Future<void> upsertCompletionIfNewer(CompletionsCompanion incoming) async {
+    final itemId = incoming.itemId.value;
+    final date = incoming.date.value;
+    final local =
+        await (select(completions)..where(
+              (row) => row.itemId.equals(itemId) & row.date.equals(date),
+            ))
+            .getSingleOrNull();
+    if (local != null && local.updatedAt > incoming.updatedAt.value) {
+      return;
+    }
+    await into(completions).insertOnConflictUpdate(incoming);
   }
 
   /// Whether there is anything on the phone to lose (a tombstone counts: it is unsynced state).

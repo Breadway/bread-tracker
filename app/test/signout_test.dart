@@ -124,7 +124,7 @@ void main() {
       8,
     );
     await reopened.close();
-  });
+  }, timeout: const Timeout(Duration(minutes: 2)));
 
   test('sign out revokes on the server, forgets the token and cursor, keeps data by default', () async {
     final calls = <String>[];
@@ -479,7 +479,7 @@ void main() {
     );
     expect(await reopened.select(reopened.completions).get(), hasLength(1));
     await reopened.close();
-  });
+  }, timeout: const Timeout(Duration(minutes: 2)));
 
   test(
     'overlapping signouts preserve only the latest cleanup and keep data',

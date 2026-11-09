@@ -1,0 +1,12 @@
+-- TRACK-65: an item keeps an immutable creation date so adding a chore or habit cannot rescore
+-- a day that was already earned.
+--
+-- NULL means "no lower bound": as far as perfect-day scheduling is concerned the item has always
+-- existed. Every item that predates this migration is backfilled as NULL on purpose. Assigning
+-- them a real date would remove them from past schedules and silently reduce existing XP and the
+-- perfect-day list, which is the bug this fixes. Only the sync path records a date, for an item
+-- first seen after this migration, and it never rewrites a stored value.
+--
+-- The column is additive: old clients omit it and old servers ignore it, so neither direction of
+-- the wire protocol breaks.
+ALTER TABLE items ADD COLUMN created_on TEXT;

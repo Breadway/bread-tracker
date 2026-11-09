@@ -28,8 +28,9 @@ class DelayedApi extends Api {
   Future<Map<String, dynamic>> sync(
     int cursor,
     List<Map<String, dynamic>> items,
-    List<Map<String, dynamic>> completions,
-  ) async {
+    List<Map<String, dynamic>> completions, {
+    String? epoch,
+  }) async {
     entered.complete();
     await release.future;
     throw AuthLost();

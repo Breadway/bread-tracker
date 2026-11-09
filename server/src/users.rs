@@ -354,7 +354,7 @@ pub async fn export(db: &Db, user_id: i64) -> Result<Option<serde_json::Value>, 
     .bind(user_id)
     .fetch_all(&mut *tx)
     .await?;
-    let mut items: Vec<crate::model::Item> = sqlx::query_as("SELECT id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, seq FROM items WHERE user_id = ?")
+    let mut items: Vec<crate::model::Item> = sqlx::query_as("SELECT id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, created_on, seq FROM items WHERE user_id = ?")
         .bind(user_id).fetch_all(&mut *tx).await?;
     items.sort_by(|a, b| a.id.cmp(&b.id));
     let mut completions: Vec<crate::model::Completion> = sqlx::query_as("SELECT item_id, date, completed_at, updated_at, deleted_at, seq FROM completions WHERE user_id = ?")

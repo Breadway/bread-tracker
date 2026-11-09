@@ -32,6 +32,7 @@ class _TodosScreenState extends ConsumerState<TodosScreen> {
           kind: 'todo',
           name: name,
           weekdays: 0,
+          creating: true,
           dueDate: _due == null ? null : fmtDay(_due!),
         );
     setState(() {

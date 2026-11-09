@@ -16,6 +16,7 @@ class Items extends Table {
   BoolColumn get active => boolean().withDefault(const Constant(true))();
   IntColumn get updatedAt => integer()();
   IntColumn get deletedAt => integer().nullable()();
+
   /// `YYYY-MM-DD` local creation date, immutable once recorded. Null means the item predates
   /// TRACK-65 (no lower bound for perfect-day scheduling) or came from an old server.
   TextColumn get createdOn => text().nullable()();
@@ -74,6 +75,20 @@ class AppDb extends _$AppDb {
 
   Future<void> upsertItem(ItemsCompanion c) =>
       into(items).insertOnConflictUpdate(c);
+
+  /// Insert a brand-new item and return whether it was inserted. A row that already exists is
+  /// left completely untouched, including its immutable `created_on`. Callers that pass a
+  /// precomputed id (starter chores) rely on this so a sync landing the same row cannot have its
+  /// creation date rewritten.
+  Future<bool> createItem(ItemsCompanion c) => transaction(() async {
+    final id = c.id.value;
+    final existing = await (select(
+      items,
+    )..where((t) => t.id.equals(id))).getSingleOrNull();
+    if (existing != null) return false;
+    await into(items).insert(c);
+    return true;
+  });
 
   Future<void> setCompletion(
     String itemId,

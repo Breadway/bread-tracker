@@ -3,7 +3,7 @@
 //! The default branch has applied 0001 (init) and 0003 (hygiene indexes). 0004 (PR31) ships
 //! with this tree but its table is reserved: the live pairing and signup admission is 0009's
 //! `public_auth_limits`. The set also carries 0002 (users, which rebuilds five tables), the
-//! additive forward repair 0005 and the later multi-user migrations through 0015. SQLx applies
+//! additive forward repair 0005 and the later multi-user migrations through 0016. SQLx applies
 //! any version it has not recorded, so the ledgers a deployment can be in are all upgraded by
 //! the same migration set; these tests build each ledger for real, fill it with data, upgrade
 //! it, and check what survived.
@@ -293,6 +293,29 @@ async fn assert_upgraded_and_intact(pool: &SqlitePool) {
         .await,
         1
     );
+    for table in ["family_codes", "family_code_attempts"] {
+        assert_eq!(
+            scalar(
+                pool,
+                &format!(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '{table}'"
+                )
+            )
+            .await,
+            1,
+            "{table}"
+        );
+    }
+    assert_eq!(
+        scalar(pool, "SELECT COUNT(*) FROM family_codes").await,
+        0,
+        "an upgrade creates no family codes"
+    );
+    assert_eq!(
+        scalar(pool, "SELECT COUNT(*) FROM family_code_attempts").await,
+        0,
+        "an upgrade creates no per-code budgets"
+    );
     let dev: (String, Option<String>, i64, i64) = sqlx::query_as(
         "SELECT name, fcm_token, created_at, last_seen FROM devices WHERE token_hash = 'tok-1'",
     )
@@ -338,6 +361,9 @@ async fn assert_upgraded_and_intact(pool: &SqlitePool) {
         "users_name_key",
         "items_user_created_by_seq",
         "family_links_child",
+        "family_codes_expires_at",
+        "family_codes_child",
+        "family_code_attempts_window",
         REPAIR_INDEX,
     ] {
         assert!(names.contains(&idx.to_string()), "{idx} missing: {names:?}");
@@ -428,7 +454,7 @@ fn published_migration_files_keep_their_checksums() {
     let versions: Vec<i64> = m.migrations.iter().map(|x| x.version).collect();
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     );
 }
 
@@ -443,7 +469,7 @@ async fn upgrade_from_0001_only() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -488,7 +514,7 @@ async fn upgrade_from_0001_and_0003_restores_the_hygiene_indexes_0002_dropped() 
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -505,7 +531,7 @@ async fn upgrade_from_0001_0003_and_0004() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -526,7 +552,7 @@ async fn upgrade_from_0001_and_0004_without_0003() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -543,7 +569,7 @@ async fn upgrade_from_the_published_pr43_head_0001_and_0002() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -560,7 +586,7 @@ async fn upgrade_from_0001_0002_0003_in_that_order() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -612,7 +638,7 @@ async fn fresh_database_gets_the_whole_set_in_version_order() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
         true,
     );
     let names = index_names(&pool).await;
@@ -712,7 +738,7 @@ async fn reopening_after_close_retries_while_a_writer_holds_the_lock() {
         "a reopen racing a held write lock must retry SQLITE_BUSY, not fail the second start",
     );
     let expected = ledger(&pool).await;
-    assert_eq!(expected.len(), 15);
+    assert_eq!(expected.len(), 16);
     close_pool(pool).await;
 
     for round in 0..24 {
@@ -728,7 +754,7 @@ async fn reopening_after_close_retries_while_a_writer_holds_the_lock() {
 async fn a_database_that_already_ran_0004_is_adopted_by_the_integrated_migration_set() {
     // PR43 plus the separately published PR31 limiter: the ledger records 0001, 0003 and 0004.
     // Now that 0004 ships in this tree, the same start applies 0002, 0005 and every later
-    // version through 0015, keeping the recorded 0004 checksum and its table untouched.
+    // version through 0016, keeping the recorded 0004 checksum and its table untouched.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("adopts0004.db");
     deployed(&path, &[3], true).await;
@@ -737,7 +763,7 @@ async fn a_database_that_already_ran_0004_is_adopted_by_the_integrated_migration
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
         true,
     );
     assert_eq!(
@@ -848,7 +874,7 @@ async fn a_failed_0002_rolls_back_completely_and_a_retry_succeeds() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -890,7 +916,7 @@ async fn a_failed_0005_keeps_the_0002_result_and_a_retry_completes_the_repair() 
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -981,10 +1007,10 @@ async fn a_database_already_upgraded_by_6f9986e_receives_0004_and_later_migratio
             .unwrap();
         let after = ledger(&pool).await;
         // Every recorded row is untouched (same versions and checksums); the integrated
-        // deployment adds every missing version through 0015.
+        // deployment adds every missing version through 0016.
         assert_eq!(
             after.iter().map(|r| r.0).collect::<Vec<_>>(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
             "{name}"
         );
         for row in &before {
@@ -1021,7 +1047,7 @@ async fn a_failed_0006_keeps_everything_before_it_and_a_retry_completes() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -1130,7 +1156,7 @@ async fn already_published_upstream_0006_gets_0004_and_settings0007_with_values_
     let after = ledger(&pool).await;
     assert_eq!(
         after.iter().map(|r| r.0).collect::<Vec<_>>(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     );
     for row in before {
         assert!(after.contains(&row));

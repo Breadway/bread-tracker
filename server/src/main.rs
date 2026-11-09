@@ -13,6 +13,8 @@
 //!   bread-tracker-server invite create [--ttl 7d]   print a single-use signup code
 //!   bread-tracker-server invite list                list invites and their state
 //!   bread-tracker-server invite revoke <id>         cancel an unused invite
+//!   bread-tracker-server family list                list family links and their state
+//!   bread-tracker-server family revoke <id>         revoke a family link by id
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +22,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use bread_tracker_server::{
-    api, auth, config::Config, db, devices, invites, push, users, AppState,
+    api, auth, config::Config, db, devices, family, invites, push, users, AppState,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -354,8 +356,55 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Some("family") => {
+            let db = db::connect_with_admin(&config.database_url(), config.admin_name.as_deref())
+                .await
+                .context("opening database")?;
+            match args.get(1).map(String::as_str) {
+                Some("list") => {
+                    only_positionals(&args[2..], 0, "usage: bread-tracker-server family list")?;
+                    let list = family::list_all(&db).await?;
+                    if list.is_empty() {
+                        println!("No family links.");
+                    }
+                    for link in list {
+                        let pending = match (link.status.as_str(), link.pending_expires_at) {
+                            ("pending", Some(expires_at)) => {
+                                format!("  pending until {}", fmt_ms(expires_at))
+                            }
+                            _ => String::new(),
+                        };
+                        println!(
+                            "{:<4}  {} -> {}  {}  {}{}",
+                            link.id,
+                            link.parent_name,
+                            link.child_name,
+                            link.status,
+                            link.permission,
+                            pending
+                        );
+                    }
+                }
+                Some("revoke") => {
+                    let usage = "usage: bread-tracker-server family revoke <id from `family list`>";
+                    only_positionals(&args[2..], 1, usage)?;
+                    let id: i64 = args[2].parse().with_context(|| usage)?;
+                    match family::revoke_by_id(&db, id).await? {
+                        family::AdminRevoked::Revoked { parent, child } => {
+                            println!("Revoked family link {id} ({parent} -> {child}).")
+                        }
+                        family::AdminRevoked::AlreadyRevoked => {
+                            anyhow::bail!("family link {id} is already revoked")
+                        }
+                        family::AdminRevoked::NotFound => anyhow::bail!("no family link {id}"),
+                    }
+                }
+                _ => anyhow::bail!("usage: bread-tracker-server family list | revoke <id>"),
+            }
+            return Ok(());
+        }
         Some(other) => anyhow::bail!(
-            "unknown command {other:?} (expected pair, devices, revoke, user or invite)"
+            "unknown command {other:?} (expected pair, devices, revoke, user, invite or family)"
         ),
         None => {}
     }

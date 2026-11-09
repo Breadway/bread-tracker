@@ -1,0 +1,9 @@
+[Unit]
+Description=Copy Bread Tracker Litestream replica offsite
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/bread-tracker/offsite-backup.env
+ExecStart=/opt/bread-tracker/packaging/offsite-backup.sh
+UMask=0077

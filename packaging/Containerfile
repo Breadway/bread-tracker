@@ -1,7 +1,10 @@
 # bread-tracker-server, single image.
 # Build:  docker build -t bread-tracker:local -f packaging/Containerfile .
 
-FROM docker.io/library/rust:1-bookworm AS build
+# Base images are pinned by digest so a rebuild is reproducible. To pick up security updates,
+# look up the current digest (docker buildx imagetools inspect <image>), update it here and
+# rebuild. Digests below are the multi-arch index digests of rust:1-bookworm and debian:bookworm-slim.
+FROM docker.io/library/rust:1-bookworm@sha256:e12566d5abc17a0da741628782cdb504b68b8961f5bfcf677936bf3e8b32de29 AS build
 WORKDIR /s
 COPY Cargo.toml Cargo.lock ./
 COPY server server
@@ -9,14 +12,21 @@ COPY migrations migrations
 COPY spec spec
 RUN cargo build --release --locked -p bread-tracker-server
 
-FROM docker.io/library/debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates sqlite3 \
-    && rm -rf /var/lib/apt/lists/*
+FROM docker.io/library/debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
+# curl is only for the HEALTHCHECK below. sqlite3 is used by the documented restore helpers.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl sqlite3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 tracker \
+    && useradd --system --uid 10001 --gid tracker --no-create-home --shell /usr/sbin/nologin tracker \
+    && mkdir -p /var/lib/bread-tracker && chown tracker:tracker /var/lib/bread-tracker
 COPY --from=build /s/target/release/bread-tracker-server /usr/local/bin/bread-tracker-server
-# This image stays on the root user to match the existing root-owned production volume.
-# The non-root switch and its upgrade path are owned by TRACK-15 / PR42.
 ENV BREADTRACKER_LISTEN=0.0.0.0:7290 \
     BREADTRACKER_DATABASE_PATH=/var/lib/bread-tracker/bread-tracker.db
 VOLUME /var/lib/bread-tracker
 EXPOSE 7290
+# Runs as an unprivileged user. A data volume created by an older (root) image is owned by root
+# and must be chowned once, which packaging/compose.yaml does with the init-perms service.
+USER tracker
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:7290/healthz || exit 1
 ENTRYPOINT ["/usr/local/bin/bread-tracker-server"]

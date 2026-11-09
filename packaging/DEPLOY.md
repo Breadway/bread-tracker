@@ -12,7 +12,7 @@ Run compose as an ordinary user, not root.
 
 ## Edge
 
-Put a reverse proxy with TLS in front of the container and forward your public name to port 7290. The compose file publishes `${BREADTRACKER_BIND:-127.0.0.1:7290}`, so by default only the host itself can reach it. If the proxy runs on another machine, set `BREADTRACKER_BIND` in `.env` to an address that machine can reach, preferably a private interface such as a VPN address, rather than `0.0.0.0`, which also serves plain HTTP on every interface.
+Hestia's own Caddy (LAN) and Aegis (public) both reverse-proxy `tracker.breadway.dev` to port 7290; the blocks live in the infra repo (`hestia/Caddyfile`, `aegis/Caddyfile`). Aegis reaches Hestia over Tailscale, so bind only the Tailscale interface address, for example `BREADTRACKER_BIND=<server-Tailscale-IP>:7290` in `.env`. Do not use `0.0.0.0`: that also exposes the plain HTTP listener on every LAN interface. If the proxy runs on another machine, set `BREADTRACKER_BIND` to a private address that machine can reach. Confirm the selected address with the operator's Tailscale configuration before deployment.
 
 ## Push (FCM)
 
@@ -23,7 +23,9 @@ BREADTRACKER_FCM_KEY_FILE=/path/to/secrets/bread-tracker-fcm.json
 BREADTRACKER_FCM_SERVICE_ACCOUNT=/run/secrets/fcm.json
 ```
 
-Without it the server runs with push disabled (logged at startup).
+Without it the server runs with push disabled (logged at startup). The one-shot `init-perms`
+container copies the key into the private `bread-tracker-secrets` volume before the server starts,
+so the operator-owned source file is never mounted into the runtime container.
 
 ## Upgrading an existing single-user deployment to the multi-user schema
 
@@ -33,7 +35,7 @@ This stack adds migrations `0002_users.sql`, `0004_pair_rate_limits.sql`,
 `0010_user_disabled.sql`, `0011_authenticated_rate_limits.sql`,
 `0012_install_provenance.sql`, `0013_item_created_on.sql` and
 `0014_stats_ledger.sql`. They are applied automatically at server start, each in its own
-transaction. The embedded set is `1,2,3,4,5,6,7,8,9,10,11,12,13,14,14`. 0004's
+transaction. The embedded set is `1,2,3,4,5,6,7,8,9,10,11,12,13,14`. 0004's
 `pair_rate_limits` table stays reserved and has no writer: the live pairing and signup
 admission is 0009's `public_auth_limits`. A database that already recorded 0004 is adopted
 by the same start, keeping its checksum and table. 0002 adds a `users` table, gives all existing data to the first user (the admin) and
@@ -301,8 +303,11 @@ Litestream writes a file replica to `BREADTRACKER_BACKUP_DIR`. The sync-generati
 
 Restore while the server is stopped. Replace the database with the Litestream restore, then run `mark-restored` against the same database path, before starting the service again. For the default Compose setup:
 
+The image runs as the unprivileged `tracker` user (uid/gid 10001 by default). A data volume created by an older root image is root-owned, so first let the one-shot `init-perms` service adopt it. The tracker helpers below run as the same runtime uid, which keeps every restored file writable by the server without a host-side `chown`:
+
 ```sh
 set -eu
+docker compose -f packaging/compose.yaml --project-directory . run --rm init-perms
 docker compose -f packaging/compose.yaml --project-directory . stop litestream
 docker compose -f packaging/compose.yaml --project-directory . stop bread-tracker
 # Restore into a unique host scratch directory first. Do not point the output at the DB.
@@ -314,9 +319,9 @@ docker run --rm --name "$TASK-litestream" --user 0 \
   litestream/litestream:0.3.13 restore -o /o/restored.db file:///b/litestream
 test "$(sqlite3 "$SCRATCH/restored.db" 'PRAGMA integrity_check;')" = ok
 # All SQLite users must be stopped. Checkpoint errors or a busy WAL abort the command.
-# Keep DB, WAL, SHM and candidate until replacement passes integrity_check. This image
-# runs as root, so the replaced files stay usable without an ownership change.
-docker run --rm --name "$TASK-replace" --user 0 \
+# Keep DB, WAL, SHM and candidate until replacement passes integrity_check. The helper runs
+# as the same uid as the server so the replaced files stay writable without a host chown.
+docker run --rm --name "$TASK-replace" --user "${BREADTRACKER_UID:-10001}:${BREADTRACKER_GID:-10001}" \
   -v bread-tracker-data:/data -v bread-tracker-data:/var/lib/bread-tracker -v "$SCRATCH:/restore" \
   --entrypoint /bin/sh bread-tracker:local -ec '
     sqlite3 /data/bread-tracker.db "PRAGMA wal_checkpoint(TRUNCATE);" > /tmp/checkpoint
@@ -336,6 +341,7 @@ docker run --rm --name "$TASK-replace" --user 0 \
 # bread-tracker-server arguments instead of running the marker subcommand.
 docker run --rm --name "$TASK-marker" \
   -v bread-tracker-data:/var/lib/bread-tracker \
+  --user "${BREADTRACKER_UID:-10001}:${BREADTRACKER_GID:-10001}" \
   --entrypoint /usr/local/bin/bread-tracker-server bread-tracker:local mark-restored
 docker compose -f packaging/compose.yaml --project-directory . up -d litestream
 docker compose -f packaging/compose.yaml --project-directory . up -d bread-tracker
@@ -355,6 +361,7 @@ Only after that check passes, remove the sentinel and the pending journal (if pr
 ```sh
 docker run --rm --name "$TASK-recover" \
   -v bread-tracker-data:/var/lib/bread-tracker \
+  --user "${BREADTRACKER_UID:-10001}:${BREADTRACKER_GID:-10001}" \
   --entrypoint /bin/sh bread-tracker:local -ec '
     rm -f /var/lib/bread-tracker/bread-tracker.sync-restore-failed \
           /var/lib/bread-tracker/bread-tracker.sync-generation-pending'
@@ -365,7 +372,57 @@ docker run --rm --name "$TASK-marker" \
 
 A pending journal alone is recoverable by normal startup, which rolls it forward; the sentinel is what stops that, so remove the sentinel last and only after the evidence check.
 
-The normal operational restore above is intentionally separate from the disposable rehearsal below. This release keeps the tracker image on the root user so the existing root-owned volume opens without an ownership migration; the non-root image and its init-perms upgrade path belong to TRACK-15 / PR42. Stop both services before copying. Do not copy a generation sidecar from backup. The marker creates `.sync-restore-failed` before changing generation metadata and removes it only after success. Server startup and a subsequent marker invocation fail closed if the sentinel remains. Preserve the database, WAL and SHM until the restored candidate has passed integrity validation and replacement succeeds. The restore command is executed by the Litestream image's own default entrypoint; the replacement helper runs in the tracker image as root and leaves the data directory ownership unchanged. `pair` uses a short SQLite transaction and does not take the generation lock.
+The normal operational restore above is intentionally separate from the disposable rehearsal below. This release runs the tracker image as the unprivileged `tracker` user; the compose `init-perms` service adopts a volume created by an older root image, and the restore helpers run as the same uid so no restored file is left root-owned. Stop both services before copying. Do not copy a generation sidecar from backup. The marker creates `.sync-restore-failed` before changing generation metadata and removes it only after success. Server startup and a subsequent marker invocation fail closed if the sentinel remains. Preserve the database, WAL and SHM until the restored candidate has passed integrity validation and replacement succeeds. The restore command is executed by the Litestream image's own default entrypoint; the replacement helper leaves the data directory ownership unchanged. `pair` uses a short SQLite transaction and does not take the generation lock.
+
+### Verifying the replica with restore-test.sh
+
+`packaging/restore-test.sh` is a read-only verification pass for the local replica. It accepts an
+optional positional replica directory; `BREADTRACKER_BACKUP_DIR` sets the default parent directory
+(`$BREADTRACKER_BACKUP_DIR/litestream` by default, and `BREADTRACKER_RESTORE_REPLICA` overrides the
+full path). It restores the newest replica into a fresh temporary directory, runs
+`PRAGMA integrity_check`, checks the required application tables and exits non-zero on invalid or
+incomplete databases. A valid database with zero items is a successful restore: an empty household
+or a freshly paired deployment has no rows yet. Run it as the ordinary deploy user; it needs
+`docker` and host `sqlite3` and writes only to its temporary directory.
+
+Install `packaging/restore-test.service.example` and `packaging/restore-test.timer.example` as
+systemd user or system units after setting the correct project directory and confirming
+Docker/sqlite3 availability. The schedule is daily and persistent; it verifies the local replica
+without modifying live data.
+
+### Offsite copy
+
+The Litestream replica above lives on the same host as the live database. It protects against a
+corrupt database, not against losing the host or its disk. `packaging/offsite-backup.sh` copies the
+replica with rsync and refuses to run until both `BREADTRACKER_OFFSITE_SOURCE` and
+`BREADTRACKER_OFFSITE_DEST` are explicitly supplied from an operator-managed environment file. The
+example service and timer (`packaging/offsite-backup.service.example`,
+`packaging/offsite-backup.timer.example`) are parameterized: the source defaults to the local
+Litestream directory and the destination has no default at all. Choose and secure the SSH or S3
+destination and its credentials outside this repository; no destination is invented here. Run
+`restore-test.sh` against the copied replica too. A physical or external destination, its
+credentials and the actual offsite protection remain an operator gate.
+
+### Container user, healthcheck and base images
+
+- The server runs as an unprivileged user (`tracker`, uid/gid 10001), the container filesystem
+  stays writable only in the data volume, and the image has a `HEALTHCHECK` on `/healthz`
+  (`docker ps` shows `healthy`). Compose also declares a short-interval healthcheck so `litestream`
+  waits for a serving server instead of racing the first snapshot.
+- Upgrading from an image that ran as root: the existing data volume is owned by root. Compose runs
+  a one-shot `init-perms` service that chowns the volume to `BREADTRACKER_UID:BREADTRACKER_GID`
+  (default 10001) before the server starts, so no manual step is needed. The Litestream container
+  runs as the same uid, so `BREADTRACKER_BACKUP_DIR` must be writable by it (`chown 10001 <dir>`).
+- The FCM key file is mounted read-only into the one-shot init container, which copies it into a
+  private named volume owned by `BREADTRACKER_UID:BREADTRACKER_GID` with mode 0400. The operator's
+  source file remains unchanged; do not place unrelated files in that named volume.
+- `rust:1-bookworm` and `debian:bookworm-slim` are pinned by digest in `packaging/Containerfile`.
+  The pins are real multi-arch index digests resolved from the Docker registry; they are a snapshot,
+  not a claim that the mutable tags still point at them. To take base image updates, run
+  `docker buildx imagetools inspect <image>`, put the new digest in the `FROM` lines and rebuild.
+- `BREADTRACKER_CONTAINER_NAME`, `BREADTRACKER_LITESTREAM_NAME`,
+  `BREADTRACKER_INIT_NAME` and `BREADTRACKER_IMAGE` exist so an isolated scratch project can use
+  unique names. Leave them unset in production.
 
 ## Invite signup admission
 

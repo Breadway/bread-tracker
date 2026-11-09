@@ -1,0 +1,7 @@
+[Unit]
+Description=Verify Bread Tracker Litestream restore
+
+[Service]
+Type=oneshot
+ExecStart=/opt/bread-tracker/packaging/restore-test.sh
+UMask=0077

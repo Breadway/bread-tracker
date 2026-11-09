@@ -3,20 +3,56 @@
 #   docker compose -f packaging/compose.yaml --project-directory . up -d --build
 #
 # Optional secrets/settings go in .env (NOT committed):
-#   BREADTRACKER_BIND=127.0.0.1:7290            host bind; configure your reverse proxy separately
+#   BREADTRACKER_UID / BREADTRACKER_GID         runtime account (default 10001:10001); init-perms
+#                                               copies the read-only FCM key into a private named volume.
+#   BREADTRACKER_BIND=127.0.0.1:7290            host bind (Aegis reaches it over Tailscale, see DEPLOY.md)
 #   BREADTRACKER_BACKUP_DIR=/var/backups/bread-tracker
-#   BREADTRACKER_FCM_KEY_FILE=/path/to/secrets/bread-tracker-fcm.json   Firebase service account
+#   BREADTRACKER_OFFSITE_SOURCE=/var/backups/bread-tracker/litestream
+#   BREADTRACKER_OFFSITE_DEST=operator-configured-user@host:/safe/path/litestream
+#   BREADTRACKER_FCM_KEY_FILE=/home/breadway/secrets/bread-tracker-fcm.json   Firebase service account
+#   BREADTRACKER_CONTAINER_NAME / BREADTRACKER_LITESTREAM_NAME / BREADTRACKER_INIT_NAME
+#                                               override only for an isolated scratch project; leave unset in production
 #
 # Pair a phone:  docker compose -f packaging/compose.yaml --project-directory . exec bread-tracker bread-tracker-server pair
 
 services:
+  # One-shot: hand the data volume to the unprivileged user. A volume created by an older image
+  # (which ran as root) is root-owned and the server could not write its database.
+  init-perms:
+    build:
+      context: .
+      dockerfile: packaging/Containerfile
+    image: ${BREADTRACKER_IMAGE:-bread-tracker:local}
+    container_name: ${BREADTRACKER_INIT_NAME:-bread-tracker-init-perms}
+    user: root
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        chown -R ${BREADTRACKER_UID:-10001}:${BREADTRACKER_GID:-10001} /var/lib/bread-tracker &&
+        if [ -f /run/secrets-source/fcm.json ]; then cp /run/secrets-source/fcm.json /run/secrets-target/fcm.json && chown ${BREADTRACKER_UID:-10001}:${BREADTRACKER_GID:-10001} /run/secrets-target/fcm.json && chmod 0400 /run/secrets-target/fcm.json; fi
+    restart: "no"
+    volumes:
+      - bread-tracker-data:/var/lib/bread-tracker
+      - ${BREADTRACKER_FCM_KEY_FILE:-/dev/null}:/run/secrets-source/fcm.json:ro
+      - bread-tracker-secrets:/run/secrets-target
+
   bread-tracker:
     build:
       context: .
       dockerfile: packaging/Containerfile
-    image: bread-tracker:local
-    container_name: bread-tracker
+    image: ${BREADTRACKER_IMAGE:-bread-tracker:local}
+    container_name: ${BREADTRACKER_CONTAINER_NAME:-bread-tracker}
     restart: unless-stopped
+    user: "${BREADTRACKER_UID:-10001}:${BREADTRACKER_GID:-10001}"
+    depends_on:
+      init-perms:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7290/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 10s
     ports:
       - "${BREADTRACKER_BIND:-127.0.0.1:7290}:7290"
     environment:
@@ -31,21 +67,28 @@ services:
       BREADTRACKER_TRUSTED_PROXIES: ${BREADTRACKER_TRUSTED_PROXIES:-}
     volumes:
       - bread-tracker-data:/var/lib/bread-tracker
-      # FCM service account, mounted read-only when BREADTRACKER_FCM_KEY_FILE is set.
-      - ${BREADTRACKER_FCM_KEY_FILE:-/dev/null}:/run/secrets/fcm.json:ro
+      # init-perms copies the operator-owned read-only source into this runtime-owned volume.
+      - bread-tracker-secrets:/run/secrets:ro
 
   # Continuous SQLite backup, same pattern as breadboard. Restore: packaging/DEPLOY.md.
   litestream:
     image: litestream/litestream:0.3.13
-    container_name: bread-tracker-litestream
+    container_name: ${BREADTRACKER_LITESTREAM_NAME:-bread-tracker-litestream}
     restart: unless-stopped
     command: ["replicate"]
+    # Same user as the server so the SQLite -wal/-shm files are never owned by someone else.
+    # BREADTRACKER_BACKUP_DIR must be writable by this uid.
+    user: "${BREADTRACKER_UID:-10001}:${BREADTRACKER_GID:-10001}"
     volumes:
       - bread-tracker-data:/var/lib/bread-tracker
       - ${BREADTRACKER_BACKUP_DIR:-./backups}:/var/backups/bread-tracker
       - ./packaging/litestream.yml:/etc/litestream.yml:ro
     depends_on:
-      - bread-tracker
+      init-perms:
+        condition: service_completed_successfully
+      bread-tracker:
+        condition: service_healthy
 
 volumes:
   bread-tracker-data:
+  bread-tracker-secrets:

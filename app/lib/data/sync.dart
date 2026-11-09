@@ -34,6 +34,13 @@ class _RestoreBatch {
   final List<CompletionRow> completions;
 }
 
+/// The server refused an upload because a restore rotated the generation while the
+/// exchange was in flight. The stored epoch is still the old one, so the correct
+/// recovery is to restart from preflight and let snapshot reconciliation run again.
+class _GenerationChanged implements Exception {
+  const _GenerationChanged();
+}
+
 class SyncEngine {
   SyncEngine(
     this.db,
@@ -88,6 +95,20 @@ class SyncEngine {
   }
 
   Future<SyncStatus> _once() async {
+    for (var attempt = 0; ; attempt++) {
+      try {
+        return await _onceAttempt();
+      } on _GenerationChanged {
+        // A restore landed between two upload batches. Restarting preflight is safe:
+        // the old epoch is still stored, so the next pass discovers the new snapshot,
+        // applies it and reoffers every local row. Bound the retries so a server that
+        // keeps rotating cannot spin this loop forever.
+        if (attempt >= 2) return SyncStatus.offline;
+      }
+    }
+  }
+
+  Future<SyncStatus> _onceAttempt() async {
     rejectionMessage = null;
     if (_invalidated) return SyncStatus.unpaired;
     final storeGeneration = store.authGeneration;
@@ -227,6 +248,11 @@ class SyncEngine {
     return SyncStatus.offline;
   }
 
+  /// The server's generation-mismatch refusal for a nonempty upload. Startup and
+  /// preflight snapshot responses are not errors; this is the mid-exchange case.
+  bool _isGenerationChanged(ApiException error) =>
+      error.statusCode == 400 && error.message.contains('generation changed');
+
   /// Apply a remote snapshot row by row, keeping whichever copy has the newer
   /// `updated_at` regardless of its dirty flag.
   Future<bool> _applySnapshot(
@@ -319,6 +345,7 @@ class SyncEngine {
       } on AuthLost {
         return _authLost(token, storeGeneration, generation, server);
       } on ApiException catch (error) {
+        if (_isGenerationChanged(error)) throw const _GenerationChanged();
         return _apiFailure(error);
       }
       if (!_isCurrent(generation, storeGeneration, server)) {
@@ -327,7 +354,7 @@ class SyncEngine {
       responseEpoch = res['epoch'] as String?;
       if (epoch != null && responseEpoch != null && responseEpoch != epoch) {
         // A second restore landed during this exchange. Restart from preflight.
-        return SyncStatus.offline;
+        throw const _GenerationChanged();
       }
       await db.transaction(() async {
         // Re-check inside the same database write transaction used for applying the
@@ -409,54 +436,68 @@ class SyncEngine {
 
   /// Split dirty rows into requests the server will accept. One empty batch is yielded
   /// when there is nothing to push so the pull side still runs.
+  ///
+  /// Each row is JSON-encoded once to measure it, and the batch total is carried as a
+  /// running byte count. Re-encoding the whole accumulated batch for every candidate row
+  /// made this quadratic: a 5001-row restore spent minutes in the size loop alone.
   Iterable<_RestoreBatch> _exchangeBatches(
     List<ItemRow> items,
     List<CompletionRow> completions,
     String? epoch,
   ) sync* {
+    const maxRows = 5000;
+    const maxBytes = 1024 * 1024;
+    final envelopeBytes = utf8
+        .encode(
+          jsonEncode({
+            'since': 0,
+            'epoch': epoch,
+            'items': const <Object>[],
+            'completions': const <Object>[],
+          }),
+        )
+        .length;
+    var encodedBytes = envelopeBytes;
     var batchItems = <ItemRow>[];
     var batchCompletions = <CompletionRow>[];
     var yielded = false;
 
-    bool overLimit(ItemRow? nextItem, CompletionRow? nextCompletion) {
-      if (batchItems.length + batchCompletions.length + 1 > 5000) return true;
-      final size = utf8
-          .encode(
-            jsonEncode({
-              'since': 0,
-              'epoch': epoch,
-              'items': [
-                for (final value in batchItems) _itemJson(value),
-                if (nextItem != null) _itemJson(nextItem),
-              ],
-              'completions': [
-                for (final value in batchCompletions) _compJson(value),
-                if (nextCompletion != null) _compJson(nextCompletion),
-              ],
-            }),
-          )
-          .length;
-      return size > 1024 * 1024;
+    bool overLimit(int nextBytes, {required bool item}) {
+      if (batchItems.length + batchCompletions.length + 1 > maxRows) {
+        return true;
+      }
+      final comma = item
+          ? (batchItems.isNotEmpty ? 1 : 0)
+          : (batchCompletions.isNotEmpty ? 1 : 0);
+      return encodedBytes + nextBytes + comma > maxBytes;
+    }
+
+    void reset() {
+      batchItems = <ItemRow>[];
+      batchCompletions = <CompletionRow>[];
+      encodedBytes = envelopeBytes;
     }
 
     for (final row in items) {
+      final rowBytes = utf8.encode(jsonEncode(_itemJson(row))).length;
       if ((batchItems.isNotEmpty || batchCompletions.isNotEmpty) &&
-          overLimit(row, null)) {
+          overLimit(rowBytes, item: true)) {
         yield _RestoreBatch(batchItems, batchCompletions);
         yielded = true;
-        batchItems = [];
-        batchCompletions = [];
+        reset();
       }
+      encodedBytes += rowBytes + (batchItems.isNotEmpty ? 1 : 0);
       batchItems.add(row);
     }
     for (final row in completions) {
+      final rowBytes = utf8.encode(jsonEncode(_compJson(row))).length;
       if ((batchItems.isNotEmpty || batchCompletions.isNotEmpty) &&
-          overLimit(null, row)) {
+          overLimit(rowBytes, item: false)) {
         yield _RestoreBatch(batchItems, batchCompletions);
         yielded = true;
-        batchItems = [];
-        batchCompletions = [];
+        reset();
       }
+      encodedBytes += rowBytes + (batchCompletions.isNotEmpty ? 1 : 0);
       batchCompletions.add(row);
     }
     if (batchItems.isNotEmpty || batchCompletions.isNotEmpty || !yielded) {

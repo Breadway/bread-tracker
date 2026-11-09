@@ -4019,11 +4019,26 @@ fn default_database_path_refusal_does_not_create_a_failure_sentinel() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let derived_sentinel = dir
+        .path()
+        .join("bread-tracker.db")
+        .with_extension("sync-restore-failed");
     assert!(
-        !dir.path()
-            .join("bread-tracker.db.sync-restore-failed")
-            .exists(),
+        !derived_sentinel.exists(),
         "a refusal before mutation must not leave a sentinel beside the default path"
+    );
+    let stray_sentinel = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .contains("sync-restore-failed")
+        });
+    assert!(
+        !stray_sentinel,
+        "a refusal must not leave a sentinel under any spelling of the derived name"
     );
 }
 

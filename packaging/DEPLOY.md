@@ -308,11 +308,11 @@ docker run --rm --name "$TASK-litestream" --user 0 \
   litestream/litestream:0.3.13 restore -o /o/restored.db file:///b/litestream
 test "$(sqlite3 "$SCRATCH/restored.db" 'PRAGMA integrity_check;')" = ok
 # All SQLite users must be stopped. Checkpoint errors or a busy WAL abort the command.
-# Keep DB, WAL, SHM and candidate until replacement passes integrity_check. Change
-# ownership of the complete data directory, including generation sidecars and lock files.
+# Keep DB, WAL, SHM and candidate until replacement passes integrity_check. This image
+# runs as root, so the replaced files stay usable without an ownership change.
 docker run --rm --name "$TASK-replace" --user 0 \
   -v bread-tracker-data:/data -v bread-tracker-data:/var/lib/bread-tracker -v "$SCRATCH:/restore" \
-  --entrypoint /usr/local/bin/entrypoint-exec bread-tracker:local /bin/sh -ec '
+  --entrypoint /bin/sh bread-tracker:local -ec '
     sqlite3 /data/bread-tracker.db "PRAGMA wal_checkpoint(TRUNCATE);" > /tmp/checkpoint
     IFS="|" read -r busy log_frames checkpointed < /tmp/checkpoint
     test "$busy" = 0
@@ -325,19 +325,12 @@ docker run --rm --name "$TASK-replace" --user 0 \
     test "$(sqlite3 /data/bread-tracker.db.new "PRAGMA integrity_check;")" = ok
     mv /data/bread-tracker.db.new /data/bread-tracker.db
     rm -f /data/bread-tracker.db-wal /data/bread-tracker.db-shm
-    chown -R 10001:10001 /data
   '
-# Change ownership of the full data directory before marker/server, not the separate
-# FCM secret mount. This includes generation sidecars, lock files and SQLite files.
-docker run --rm --name "$TASK-own" --user 0 -v bread-tracker-data:/data -v bread-tracker-data:/var/lib/bread-tracker \
-  --entrypoint /usr/local/bin/entrypoint-exec bread-tracker:local \
-  /bin/sh -ec 'chown -R 10001:10001 /data'
 # Explicit ENTRYPOINT override is required: otherwise this command is appended to
-# bread-tracker-server and mark-restored will not execute.
-docker run --rm --name "$TASK-marker" --user 10001:10001 \
+# bread-tracker-server arguments instead of running the marker subcommand.
+docker run --rm --name "$TASK-marker" \
   -v bread-tracker-data:/var/lib/bread-tracker \
-  --entrypoint /usr/local/bin/entrypoint-exec bread-tracker:local \
-  /usr/local/bin/bread-tracker-server mark-restored
+  --entrypoint /usr/local/bin/bread-tracker-server bread-tracker:local mark-restored
 docker compose -f packaging/compose.yaml --project-directory . up -d litestream
 docker compose -f packaging/compose.yaml --project-directory . up -d bread-tracker
 rm -rf "$SCRATCH"
@@ -349,20 +342,24 @@ If a marker fails after it has written `.sync-restore-failed`, the server and a 
 python3 scripts/db-evidence.py check "$SCRATCH/restored.db" --ledger-subset 1,2,3,4,5,6,7,8,9,10,11,12
 ```
 
-Only after that check passes, remove the sentinel and the pending journal (if present), then rerun the marker against the same database path:
+The sidecar names are derived from the database path, not appended to the filename. For the default `BREADTRACKER_DATABASE_PATH=/var/lib/bread-tracker/bread-tracker.db` the derived files are `bread-tracker.sync-generation`, `bread-tracker.sync-generation-pending` and `bread-tracker.sync-restore-failed`. The server replaces the database suffix, so appending `sync-*` to the `.db` filename does not exist and `rm -f` there would silently leave the real sentinel in place.
+
+Only after that check passes, remove the sentinel and the pending journal (if present) from the same volume, then rerun the marker against the same database path:
 
 ```sh
-rm -f /var/lib/bread-tracker/bread-tracker.db.sync-restore-failed \
-      /var/lib/bread-tracker/bread-tracker.db.sync-generation-pending
-docker run --rm --name "$TASK-marker" --user 10001:10001 \
+docker run --rm --name "$TASK-recover" \
   -v bread-tracker-data:/var/lib/bread-tracker \
-  --entrypoint /usr/local/bin/entrypoint-exec bread-tracker:local \
-  /usr/local/bin/bread-tracker-server mark-restored
+  --entrypoint /bin/sh bread-tracker:local -ec '
+    rm -f /var/lib/bread-tracker/bread-tracker.sync-restore-failed \
+          /var/lib/bread-tracker/bread-tracker.sync-generation-pending'
+docker run --rm --name "$TASK-marker" \
+  -v bread-tracker-data:/var/lib/bread-tracker \
+  --entrypoint /usr/local/bin/bread-tracker-server bread-tracker:local mark-restored
 ```
 
 A pending journal alone is recoverable by normal startup, which rolls it forward; the sentinel is what stops that, so remove the sentinel last and only after the evidence check.
 
-The uid 10001 ownership change here is the manual path for a volume created by an older root image; a compose init service on the same uid performs the same change when one is present. The normal operational restore above is intentionally separate from the disposable rehearsal below. Stop both services before copying. Do not copy a generation sidecar from backup. The marker creates `.sync-restore-failed` before changing generation metadata and removes it only after success. Server startup and a subsequent marker invocation fail closed if the sentinel remains. Preserve the database, WAL and SHM until the restored candidate has passed integrity validation and replacement succeeds. The restore command is executed by the Litestream image's own default entrypoint; the wrapper exists only in the tracker image. The replacement helper creates no DB connection besides the explicit checkpoint and copy-time validation, then changes ownership of the data directory, including sidecars and lock files, to uid 10001. Ensure the FCM secret file itself is readable by uid 10001 or its supplementary group before restart; do not recursively chown the secret path. `pair` uses a short SQLite transaction and does not take the generation lock.
+The normal operational restore above is intentionally separate from the disposable rehearsal below. This release keeps the tracker image on the root user so the existing root-owned volume opens without an ownership migration; the non-root image and its init-perms upgrade path belong to TRACK-15 / PR42. Stop both services before copying. Do not copy a generation sidecar from backup. The marker creates `.sync-restore-failed` before changing generation metadata and removes it only after success. Server startup and a subsequent marker invocation fail closed if the sentinel remains. Preserve the database, WAL and SHM until the restored candidate has passed integrity validation and replacement succeeds. The restore command is executed by the Litestream image's own default entrypoint; the replacement helper runs in the tracker image as root and leaves the data directory ownership unchanged. `pair` uses a short SQLite transaction and does not take the generation lock.
 
 ## Invite signup admission
 

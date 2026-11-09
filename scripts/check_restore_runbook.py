@@ -18,12 +18,24 @@ match = re.search(r"^ENTRYPOINT\s+\[([^\]]+)\]", containerfile, re.M)
 if not match:
     fail("Containerfile ENTRYPOINT is missing or not JSON-array form")
 entrypoint = re.findall(r'"([^"]+)"', match.group(1))
-if len(entrypoint) != 2 or entrypoint[1] != "/usr/local/bin/bread-tracker-server":
+server_binary = "/usr/local/bin/bread-tracker-server"
+if entrypoint != [server_binary]:
     fail("unexpected image ENTRYPOINT contract")
-wrapper = entrypoint[0]
-if "mark-restored" not in deploy or f"--entrypoint {wrapper}" not in deploy:
-    fail("operational marker must explicitly invoke tracker wrapper")
-operational = deploy.split("## Disposable restore", 1)[0]
+if "mark-restored" not in deploy or f"--entrypoint {server_binary}" not in deploy:
+    fail("operational marker must explicitly select the server binary")
+
+database_env = re.search(r"^\s*BREADTRACKER_DATABASE_PATH=(\S+)\s*$", containerfile, re.M)
+if not database_env:
+    fail("Containerfile must set BREADTRACKER_DATABASE_PATH")
+database_path = Path(database_env.group(1))
+operational_docs = deploy.split("## Disposable restore", 1)[0]
+for extension in ("sync-generation", "sync-generation-pending", "sync-restore-failed"):
+    derived = database_path.with_suffix(f".{extension}")
+    if str(derived) not in operational_docs:
+        fail(f"runbook must name the derived {extension} path {derived}")
+if re.search(r"\.db\.sync-", operational_docs):
+    fail("runbook must not append sync-* to the .db filename; derive with the database extension replaced")
+operational = operational_docs
 litestream = re.search(r"docker run --rm --name \"\$TASK-litestream\"[^\n]*(?:\\\n[^\n]*)*", operational)
 if not litestream or "--entrypoint" in litestream.group(0):
     fail("operational Litestream restore must use its image default entrypoint")
@@ -46,8 +58,10 @@ for cmd in commands:
             fail(f"tracker helper lacks explicit image VOLUME bind: {cmd}")
         if cmd.count(":/var/lib/bread-tracker") != 1:
             fail(f"tracker helper VOLUME destination must be bound exactly once: {cmd}")
-        if "--entrypoint" not in cmd or wrapper not in cmd:
-            fail(f"tracker helper must explicitly select wrapper entrypoint: {cmd}")
+        if "--entrypoint" not in cmd:
+            fail(f"tracker helper must explicitly select an entrypoint: {cmd}")
+        if server_binary not in cmd and "/bin/sh" not in cmd:
+            fail(f"tracker helper must run a shell or the server binary: {cmd}")
     if "litestream/litestream" in cmd and "--entrypoint" in cmd:
         fail("Litestream helper must use its own default entrypoint")
 if re.search(r"(?m)^\s*chown\b", script.split("FIXTURE", 1)[0]):

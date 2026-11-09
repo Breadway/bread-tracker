@@ -28,6 +28,10 @@ class FakeServer {
   bool supportsEpoch = true;
   bool disconnectAfterFirstRequest = false;
   bool firstRequest = false;
+
+  /// When set, the next nonempty upload rotates the generation before it is applied,
+  /// modelling a restore that lands between preflight and the first batch.
+  String? rotateEpochOnUpload;
   final outgoingItemCounts = <int>[];
   final outgoingCompletionCounts = <int>[];
 
@@ -144,6 +148,12 @@ class FakeApi extends Api {
       return server.sync(since, items, completions);
     }
     if (epoch != null && epoch != server.epoch) {
+      if (items.isNotEmpty || completions.isNotEmpty) {
+        throw ApiException(
+          'sync generation changed; apply snapshot before retrying uploads',
+          statusCode: 400,
+        );
+      }
       return {
         'cursor': server.seq,
         'epoch': server.epoch,
@@ -151,6 +161,16 @@ class FakeApi extends Api {
         'completions': server.comps.values.toList(),
         'server_time': 0,
       };
+    }
+    final rotated = server.rotateEpochOnUpload;
+    if (rotated != null && (items.isNotEmpty || completions.isNotEmpty)) {
+      server
+        ..rotateEpochOnUpload = null
+        ..epoch = rotated;
+      throw ApiException(
+        'sync generation changed; apply snapshot before retrying uploads',
+        statusCode: 400,
+      );
     }
     final response = server.sync(since, items, completions);
     return response;
@@ -508,7 +528,7 @@ void main() {
     expect(store.epoch, 'restore-equal');
   });
 
-  test('response-time generation change applies snapshot before reuploading dirty winners', () async {
+  test('preflight generation change applies snapshot before reuploading dirty winners', () async {
     final server = FakeServer();
     final (db, sync, store) = await device(server);
     await db.upsertItem(
@@ -539,6 +559,50 @@ void main() {
     expect(server.items[id1]!['name'], 'new offline');
     expect((await db.select(db.items).getSingle()).name, 'new offline');
     expect(store.epoch, 'restore-after-upload');
+  });
+
+  test('a restore during an upload restarts from preflight instead of reporting a rejection', () async {
+    final server = FakeServer();
+    final (db, sync, store) = await device(server);
+    await db.upsertItem(
+      ItemsCompanion.insert(
+        id: id1,
+        kind: 'chore',
+        name: 'before restore',
+        points: 10,
+        updatedAt: 1000,
+        dirty: const Value(true),
+      ),
+    );
+    expect(await sync.sync(), SyncStatus.idle);
+    expect(store.epoch, 'epoch-1');
+    await db.upsertItem(
+      ItemsCompanion(
+        id: const Value(id1),
+        kind: const Value('chore'),
+        name: const Value('edited during restore'),
+        points: const Value(10),
+        updatedAt: const Value(3000),
+        dirty: const Value(true),
+      ),
+    );
+    // The real server answers a nonempty upload with 400 once the generation moved.
+    server.rotateEpochOnUpload = 'restore-mid-upload';
+
+    expect(await sync.sync(), SyncStatus.idle);
+    expect(
+      sync.rejectionMessage,
+      isNull,
+      reason:
+          'a generation change is a retryable restart, not a policy rejection',
+    );
+    expect(store.epoch, 'restore-mid-upload');
+    expect(server.epoch, 'restore-mid-upload');
+    expect(server.items[id1]!['name'], 'edited during restore');
+    expect(
+      (await db.select(db.items).getSingle()).name,
+      'edited during restore',
+    );
   });
 
   test('an unchanged server does not trigger a full re-push', () async {
@@ -687,7 +751,9 @@ void main() {
       store,
       apiFactory: (_, _) => FakeApi(server),
     );
+    final watch = Stopwatch()..start();
     expect(await restarted.sync(), SyncStatus.idle);
+    watch.stop();
     expect(server.items.length, 5001, reason: 'all rows recovered');
     expect(store.epoch, 'bulk-restore');
     expect(store.cursor, greaterThanOrEqualTo(cursorBeforeRestore));
@@ -695,6 +761,14 @@ void main() {
       server.outgoingItemCounts.where((n) => n > 0).every((n) => n <= 5000),
       isTrue,
       reason: 'no upload may exceed the server row cap',
+    );
+    // The previous per-row re-encode took 24.3 s just to size this batch and 2:11 for
+    // this test. Linear packing completes the whole retry well inside this ceiling,
+    // which still catches a return to quadratic behaviour on a loaded runner.
+    expect(
+      watch.elapsed,
+      lessThan(const Duration(seconds: 30)),
+      reason: '5001-row retry took ${watch.elapsed}',
     );
   });
 

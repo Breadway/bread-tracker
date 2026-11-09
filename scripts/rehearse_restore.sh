@@ -29,8 +29,8 @@ cleanup() {
   if [ -d "$SCRATCH" ] && docker image inspect "$IMG" >/dev/null 2>&1; then
     docker run --rm --name "$TASK-cleanup" --user 0 \
       -v "$SCRATCH/data:/data" -v "$SCRATCH/restore:/restore" -v "$SCRATCH/secret:/secret" \
-      -v "$SCRATCH/data:/var/lib/bread-tracker" --entrypoint /usr/local/bin/entrypoint-exec "$IMG" \
-      /bin/sh -exc "chown -R $(id -u):$(id -g) /data /restore /secret; chmod 0700 /data /restore /secret"
+      -v "$SCRATCH/data:/var/lib/bread-tracker" --entrypoint /bin/sh "$IMG" \
+      -exc "chown -R $(id -u):$(id -g) /data /restore /secret; chmod 0700 /data /restore /secret"
   fi
   docker image rm "$IMG" >/dev/null 2>&1 || true
   rm -rf -- "$SCRATCH"
@@ -59,7 +59,7 @@ FIXTURE
 docker run --rm --name "$TASK-fixture" --user 0 -e CHECKSUM="$CHECKSUM" -v "$SCRATCH/data:/data" \
   -v "$SCRATCH/fixture.sh:/fixture-helper.sh:ro" -v "$SCRATCH/data:/var/lib/bread-tracker" \
   --mount "type=bind,src=$ROOT/migrations/0001_init.sql,dst=/fixture/0001_init.sql,readonly" \
-  --entrypoint /usr/local/bin/entrypoint-exec "$IMG" /bin/sh -exc 'exec /bin/sh /fixture-helper.sh'
+  --entrypoint /bin/sh "$IMG" -exc 'exec /bin/sh /fixture-helper.sh'
 echo 'stage: populated 0001 fixture created'
 cat >"$SCRATCH/candidate.sh" <<'CANDIDATE'
 set -eu
@@ -77,7 +77,7 @@ chown -R 0:0 /restore
 CANDIDATE
 docker run --rm --name "$TASK-candidate" --user 0 -v "$SCRATCH/data:/data" -v "$SCRATCH/restore:/restore" \
   -v "$SCRATCH/candidate.sh:/candidate-helper.sh:ro" -v "$SCRATCH/data:/var/lib/bread-tracker" \
-  --entrypoint /usr/local/bin/entrypoint-exec "$IMG" /bin/sh -exc 'exec /bin/sh /candidate-helper.sh'
+  --entrypoint /bin/sh "$IMG" -exc 'exec /bin/sh /candidate-helper.sh'
 echo 'stage: standalone restore candidate integrity and row checks passed'
 cat >"$SCRATCH/invalid.sh" <<'INVALID'
 set -eu
@@ -88,10 +88,10 @@ after=$(sqlite3 /data/bread-tracker.db "SELECT name FROM items WHERE id='1111111
 test "$after" = "$before"
 INVALID
 docker run --rm --name "$TASK-invalid-fixture" --user 0 -v "$SCRATCH/restore:/restore" -v "$SCRATCH/restore:/var/lib/bread-tracker" \
-  --entrypoint /usr/local/bin/entrypoint-exec "$IMG" /bin/sh -exc 'printf "invalid db\\n" >/restore/invalid.db; chown 0:0 /restore/invalid.db'
+  --entrypoint /bin/sh "$IMG" -exc 'printf "invalid db\\n" >/restore/invalid.db; chown 0:0 /restore/invalid.db'
 docker run --rm --name "$TASK-invalid-check" --user 0 -v "$SCRATCH/data:/data" -v "$SCRATCH/restore:/restore:ro" \
   -v "$SCRATCH/invalid.sh:/invalid-helper.sh:ro" -v "$SCRATCH/data:/var/lib/bread-tracker" \
-  --entrypoint /usr/local/bin/entrypoint-exec "$IMG" /bin/sh -exc 'exec /bin/sh /invalid-helper.sh'
+  --entrypoint /bin/sh "$IMG" -exc 'exec /bin/sh /invalid-helper.sh'
 echo 'stage: invalid candidate rejected without changing existing DB'
 cat >"$SCRATCH/restore.sh" <<'RESTORE'
 set -eu
@@ -106,17 +106,16 @@ test "$(sqlite3 /data/bread-tracker.db.new 'PRAGMA integrity_check;')" = ok
 mv /data/bread-tracker.db.new /data/bread-tracker.db
 rm -f /data/bread-tracker.db-wal /data/bread-tracker.db-shm
 printf 'dummy-not-a-secret\n' >/secret/fcm.json
-chown 0:10001 /secret/fcm.json; chmod 0440 /secret/fcm.json
-chown -R 10001:10001 /data
+chown 0:0 /secret/fcm.json; chmod 0600 /secret/fcm.json
 RESTORE
 docker run --rm --name "$TASK-restore" --user 0 -v "$SCRATCH/data:/data" -v "$SCRATCH/restore:/restore:ro" \
   -v "$SCRATCH/restore.sh:/restore-helper.sh:ro" -v "$SCRATCH/secret:/secret" -v "$SCRATCH/data:/var/lib/bread-tracker" \
-  --entrypoint /usr/local/bin/entrypoint-exec "$IMG" /bin/sh -exc 'exec /bin/sh /restore-helper.sh'
+  --entrypoint /bin/sh "$IMG" -exc 'exec /bin/sh /restore-helper.sh'
 echo 'stage: replacement integrity, preserved row, separate secret prepared'
-docker run --rm --name "$TASK-secret" --user 10001:10001 -v "$SCRATCH/data:/var/lib/bread-tracker" \
-  -v "$SCRATCH/secret/fcm.json:/run/secrets/fcm.json:ro" --entrypoint /usr/local/bin/entrypoint-exec "$IMG" /bin/sh -exc 'test -r /run/secrets/fcm.json'
-docker run --rm --name "$TASK-marker" --user 10001:10001 -v "$SCRATCH/data:/var/lib/bread-tracker" \
-  --entrypoint /usr/local/bin/entrypoint-exec "$IMG" /usr/local/bin/bread-tracker-server mark-restored
+docker run --rm --name "$TASK-secret" -v "$SCRATCH/data:/var/lib/bread-tracker" \
+  -v "$SCRATCH/secret/fcm.json:/run/secrets/fcm.json:ro" --entrypoint /bin/sh "$IMG" -exc 'test -r /run/secrets/fcm.json'
+docker run --rm --name "$TASK-marker" -v "$SCRATCH/data:/var/lib/bread-tracker" \
+  --entrypoint /usr/local/bin/bread-tracker-server "$IMG" mark-restored
 echo 'stage: secret readability and marker passed'
 mkdir -p "$EVIDENCE_DIR"
 chmod 0700 "$EVIDENCE_DIR"
@@ -131,7 +130,7 @@ if [ -s "$EVIDENCE_DIR/$TASK-portcheck.txt" ]; then
   exit 1
 fi
 echo 'stage: port 17291 preflight passed'
-docker run --rm --name "$TASK-server" --user 10001:10001 -v "$SCRATCH/data:/var/lib/bread-tracker" \
+docker run --rm --name "$TASK-server" -v "$SCRATCH/data:/var/lib/bread-tracker" \
   -e BREADTRACKER_DATABASE_PATH=/var/lib/bread-tracker/bread-tracker.db -p 127.0.0.1:17291:7290 "$IMG" >"$EVIDENCE_LOG" 2>&1 &
 SERVER_PID=$!
 SERVER_STARTED=1
@@ -156,5 +155,5 @@ if docker inspect "$TASK-server" >/dev/null 2>&1; then echo 'server container wa
 printf 'Server foreground exit status: %s\n' "$server_status"
 test "$server_status" -eq 0
 docker run --rm --name "$TASK-assert" --user 0 -v "$SCRATCH/data:/data" -v "$SCRATCH/data:/var/lib/bread-tracker" \
-  --entrypoint /usr/local/bin/entrypoint-exec "$IMG" /bin/sh -exc "test \"\$(sqlite3 /data/bread-tracker.db 'SELECT name FROM items;')\" = preserved"
+  --entrypoint /bin/sh "$IMG" -exc "test \"\$(sqlite3 /data/bread-tracker.db 'SELECT name FROM items;')\" = preserved"
 echo 'stage: server exit status zero and restored row preserved'

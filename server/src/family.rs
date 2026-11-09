@@ -6,15 +6,21 @@
 //! status is `active`, which is the seam later item routes use; a pending or revoked link
 //! therefore grants no items and no parent reads.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
+use chrono::{NaiveDate, Utc};
+use chrono_tz::Tz;
 use rand::Rng;
 use sqlx::{Sqlite, SqliteConnection, Transaction};
 
 use crate::auth::{hash, normalize_code, CallerIdentity, CODE_ALPHABET};
+use crate::config::Limits;
 use crate::db::Db;
-use crate::model::{valid_permission, Item};
-use crate::store::{now_ms, ITEM_COLS};
+use crate::model::{valid_permission, Completion, Item};
+use crate::store::{
+    apply_item_ledger, first_seen_date, next_seq, now_ms, LedgerItem, COMPLETION_COLS, ITEM_COLS,
+};
+use crate::xp;
 
 /// Family codes expire after 15 minutes, like pairing codes.
 pub const CODE_TTL_MS: i64 = 15 * 60 * 1000;
@@ -754,7 +760,7 @@ async fn revoke_where(db: &Db, link_id: i64, caller: Option<i64>) -> Result<Revo
                 .await?
         }
     };
-    let Some((status, _parent, _child)) = row else {
+    let Some((status, parent_id, child_id)) = row else {
         return Ok(Revoked::NotFound);
     };
     if status == "revoked" {
@@ -785,12 +791,37 @@ async fn revoke_where(db: &Db, link_id: i64, caller: Option<i64>) -> Result<Revo
             .await?
         }
     };
+    let revoked = updated.rows_affected() == 1;
+    if revoked {
+        // DESIGN.md Revocation: the items the parent added stay on the child's list as the
+        // child's own. Clearing provenance here means no later query can mistake them for
+        // parent data, even before it rechecks the link status.
+        clear_provenance(&mut tx, child_id, parent_id).await?;
+    }
     tx.commit().await?;
-    Ok(if updated.rows_affected() == 1 {
+    Ok(if revoked {
         Revoked::Revoked
     } else {
         Revoked::AlreadyRevoked
     })
+}
+
+/// Hand one parent's assigned items to the child permanently.
+async fn clear_provenance(
+    tx: &mut Transaction<'_, Sqlite>,
+    child_id: i64,
+    parent_id: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE items SET created_by = ?, permission_override = NULL
+         WHERE user_id = ? AND created_by = ?",
+    )
+    .bind(child_id)
+    .bind(child_id)
+    .bind(parent_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// Revoke a link as either party. A link the caller is not on answers `NotFound`.
@@ -801,15 +832,15 @@ pub async fn revoke(db: &Db, user_id: i64, link_id: i64) -> Result<Revoked, sqlx
 /// Revoke any link by id, for the server owner's CLI.
 pub async fn revoke_by_id(db: &Db, link_id: i64) -> Result<AdminRevoked, sqlx::Error> {
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
-    let row: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT l.status, p.name, c.name FROM family_links l
+    let row: Option<(String, i64, i64, String, String)> = sqlx::query_as(
+        "SELECT l.status, l.parent_id, l.child_id, p.name, c.name FROM family_links l
          JOIN users p ON p.id = l.parent_id JOIN users c ON c.id = l.child_id
          WHERE l.id = ?",
     )
     .bind(link_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((status, parent, child)) = row else {
+    let Some((status, parent_id, child_id, parent, child)) = row else {
         return Ok(AdminRevoked::NotFound);
     };
     if status == "revoked" {
@@ -821,6 +852,7 @@ pub async fn revoke_by_id(db: &Db, link_id: i64) -> Result<AdminRevoked, sqlx::E
         .bind(link_id)
         .execute(&mut *tx)
         .await?;
+    clear_provenance(&mut tx, child_id, parent_id).await?;
     tx.commit().await?;
     Ok(AdminRevoked::Revoked { parent, child })
 }
@@ -844,6 +876,397 @@ pub async fn list_all(db: &Db) -> Result<Vec<AdminLinkInfo>, sqlx::Error> {
     )
     .fetch_all(db)
     .await
+}
+
+/// The child's local date. Parent writes are validated against it and assigned-item stats are
+/// anchored to it, so a parent in another timezone sees the child's day, not their own.
+async fn local_today(conn: &mut SqliteConnection, user_id: i64) -> Result<NaiveDate, sqlx::Error> {
+    let timezone: Option<String> =
+        sqlx::query_scalar("SELECT timezone FROM user_settings WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let tz: Tz = timezone
+        .as_deref()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(chrono_tz::UTC);
+    Ok(Utc::now().with_timezone(&tz).date_naive())
+}
+
+/// The editable fields of a parent item write. `None` means leave the stored value alone;
+/// the nested `Option` on a nullable field distinguishes "absent" from an explicit null.
+#[derive(Debug, Clone, Default)]
+pub struct ItemPatch {
+    pub kind: Option<String>,
+    pub name: Option<String>,
+    pub weekdays: Option<i64>,
+    pub remind_time: Option<Option<String>>,
+    pub points: Option<i64>,
+    pub due_date: Option<Option<String>>,
+    pub sort: Option<i64>,
+    pub active: Option<bool>,
+}
+
+impl ItemPatch {
+    pub fn is_empty(&self) -> bool {
+        self.kind.is_none()
+            && self.name.is_none()
+            && self.weekdays.is_none()
+            && self.remind_time.is_none()
+            && self.points.is_none()
+            && self.due_date.is_none()
+            && self.sort.is_none()
+            && self.active.is_none()
+    }
+
+    fn apply(&self, item: &mut Item) {
+        if let Some(kind) = &self.kind {
+            item.kind = kind.clone();
+        }
+        if let Some(name) = &self.name {
+            item.name = name.clone();
+        }
+        if let Some(weekdays) = self.weekdays {
+            item.weekdays = weekdays;
+        }
+        if let Some(remind_time) = &self.remind_time {
+            item.remind_time = remind_time.clone();
+        }
+        if let Some(points) = self.points {
+            item.points = points;
+        }
+        if let Some(due_date) = &self.due_date {
+            item.due_date = due_date.clone();
+        }
+        if let Some(sort) = self.sort {
+            item.sort = sort;
+        }
+        if let Some(active) = self.active {
+            item.active = active;
+        }
+    }
+}
+
+/// Outcome of a parent item write. Every `NotFound` is deliberately indistinguishable from a
+/// child id the caller is not linked to, an item the child owns, and an item that does not
+/// exist, so an id is never confirmed.
+#[derive(Debug)]
+pub enum ItemWriteOutcome {
+    Created(Item),
+    Updated(Item),
+    Deleted,
+    NotFound,
+    /// The child (or another parent) already holds this id.
+    Collision,
+    Invalid(String),
+    LimitReached(String),
+}
+
+/// Create an item on an active child's list. `created_by` is the authenticated parent, the
+/// timestamp is the server's, and the item counts against the child's item quota. The id is
+/// refused if the child (or another parent) already uses it: a parent write may never overwrite
+/// an existing row.
+pub async fn create_item(
+    db: &Db,
+    parent_id: i64,
+    child_id: i64,
+    item: &Item,
+    limits: &Limits,
+) -> Result<ItemWriteOutcome, sqlx::Error> {
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    let permission: Option<String> = sqlx::query_scalar(
+        "SELECT default_permission FROM family_links
+         WHERE parent_id = ? AND child_id = ? AND status = 'active'",
+    )
+    .bind(parent_id)
+    .bind(child_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(permission) = permission else {
+        return Ok(ItemWriteOutcome::NotFound);
+    };
+    let today = local_today(&mut tx, child_id).await?;
+    if let Err(message) = item.validate(today) {
+        return Ok(ItemWriteOutcome::Invalid(message));
+    }
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM items WHERE user_id = ? AND id = ?)")
+            .bind(child_id)
+            .bind(&item.id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if exists {
+        return Ok(ItemWriteOutcome::Collision);
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE user_id = ?")
+        .bind(child_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if count >= limits.max_items {
+        return Ok(ItemWriteOutcome::LimitReached(format!(
+            "item limit reached ({} per account)",
+            limits.max_items
+        )));
+    }
+    let now = now_ms();
+    let created_on = first_seen_date(&mut tx, child_id).await?;
+    let seq = next_seq(&mut tx).await?;
+    let name = item.name.trim();
+    sqlx::query(
+        "INSERT INTO items (user_id, id, kind, name, weekdays, remind_time, points, due_date,
+                            sort, active, updated_at, deleted_at, created_on, created_by,
+                            permission_override, seq)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, ?)",
+    )
+    .bind(child_id)
+    .bind(&item.id)
+    .bind(&item.kind)
+    .bind(name)
+    .bind(item.weekdays)
+    .bind(&item.remind_time)
+    .bind(item.points)
+    .bind(&item.due_date)
+    .bind(item.sort)
+    .bind(item.active)
+    .bind(now)
+    .bind(&created_on)
+    .bind(parent_id)
+    .bind(seq)
+    .execute(&mut *tx)
+    .await?;
+    let current = LedgerItem::from_write(item, Some(created_on.clone()));
+    apply_item_ledger(&mut tx, child_id, &item.id, None, &current).await?;
+    let stored = Item {
+        id: item.id.clone(),
+        kind: item.kind.clone(),
+        name: name.to_string(),
+        weekdays: item.weekdays,
+        remind_time: item.remind_time.clone(),
+        points: item.points,
+        due_date: item.due_date.clone(),
+        sort: item.sort,
+        active: item.active,
+        updated_at: now,
+        deleted_at: None,
+        created_on: Some(created_on),
+        created_by: Some(parent_id),
+        permission_override: None,
+        effective_permission: Some(permission),
+        seq,
+    };
+    tx.commit().await?;
+    Ok(ItemWriteOutcome::Created(stored))
+}
+
+/// Edit one item the caller created for an active child. The stored `created_by` is the only
+/// authority; an item the child owns is a 404, and a deleted item is not editable again. The
+/// server timestamp replaces whatever the parent's clock might claim.
+pub async fn update_item(
+    db: &Db,
+    parent_id: i64,
+    child_id: i64,
+    item_id: &str,
+    patch: &ItemPatch,
+) -> Result<ItemWriteOutcome, sqlx::Error> {
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    let permission: Option<String> = sqlx::query_scalar(
+        "SELECT default_permission FROM family_links
+         WHERE parent_id = ? AND child_id = ? AND status = 'active'",
+    )
+    .bind(parent_id)
+    .bind(child_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(permission) = permission else {
+        return Ok(ItemWriteOutcome::NotFound);
+    };
+    let existing: Option<Item> = sqlx::query_as(&format!(
+        "SELECT {ITEM_COLS} FROM items WHERE user_id = ? AND id = ?"
+    ))
+    .bind(child_id)
+    .bind(item_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(mut stored) = existing else {
+        return Ok(ItemWriteOutcome::NotFound);
+    };
+    if stored.created_by != Some(parent_id) || stored.deleted_at.is_some() {
+        return Ok(ItemWriteOutcome::NotFound);
+    }
+    let previous_item = stored.clone();
+    patch.apply(&mut stored);
+    stored.name = stored.name.trim().to_string();
+    let today = local_today(&mut tx, child_id).await?;
+    if let Err(message) = stored.validate(today) {
+        return Ok(ItemWriteOutcome::Invalid(message));
+    }
+    let now = now_ms();
+    stored.updated_at = now;
+    stored.deleted_at = None;
+    let seq = next_seq(&mut tx).await?;
+    sqlx::query(
+        "UPDATE items SET kind = ?, name = ?, weekdays = ?, remind_time = ?, points = ?,
+                          due_date = ?, sort = ?, active = ?, updated_at = ?, seq = ?
+         WHERE user_id = ? AND id = ? AND created_by = ?",
+    )
+    .bind(&stored.kind)
+    .bind(&stored.name)
+    .bind(stored.weekdays)
+    .bind(&stored.remind_time)
+    .bind(stored.points)
+    .bind(&stored.due_date)
+    .bind(stored.sort)
+    .bind(stored.active)
+    .bind(now)
+    .bind(seq)
+    .bind(child_id)
+    .bind(item_id)
+    .bind(parent_id)
+    .execute(&mut *tx)
+    .await?;
+    let previous = LedgerItem::from_item(&previous_item);
+    let current = LedgerItem::from_item(&stored);
+    apply_item_ledger(&mut tx, child_id, item_id, Some(&previous), &current).await?;
+    stored.seq = seq;
+    stored.effective_permission = Some(
+        effective_permission(stored.permission_override.as_deref(), Some(&permission))
+            .expect("an active link always yields a level"),
+    );
+    tx.commit().await?;
+    Ok(ItemWriteOutcome::Updated(stored))
+}
+
+/// Delete (tombstone) one item the caller created for an active child. The ledger drops the
+/// XP its completions earned, exactly as the child deleting their own item would.
+pub async fn delete_item(
+    db: &Db,
+    parent_id: i64,
+    child_id: i64,
+    item_id: &str,
+) -> Result<ItemWriteOutcome, sqlx::Error> {
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    let active: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM family_links
+         WHERE parent_id = ? AND child_id = ? AND status = 'active'",
+    )
+    .bind(parent_id)
+    .bind(child_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if active.is_none() {
+        return Ok(ItemWriteOutcome::NotFound);
+    }
+    let existing: Option<Item> = sqlx::query_as(&format!(
+        "SELECT {ITEM_COLS} FROM items WHERE user_id = ? AND id = ?"
+    ))
+    .bind(child_id)
+    .bind(item_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(stored) = existing else {
+        return Ok(ItemWriteOutcome::NotFound);
+    };
+    if stored.created_by != Some(parent_id) || stored.deleted_at.is_some() {
+        return Ok(ItemWriteOutcome::NotFound);
+    }
+    let now = now_ms();
+    let seq = next_seq(&mut tx).await?;
+    sqlx::query(
+        "UPDATE items SET deleted_at = ?, updated_at = ?, seq = ?
+         WHERE user_id = ? AND id = ? AND created_by = ?",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(seq)
+    .bind(child_id)
+    .bind(item_id)
+    .bind(parent_id)
+    .execute(&mut *tx)
+    .await?;
+    let previous = LedgerItem::from_item(&stored);
+    let current = LedgerItem {
+        deleted_at: Some(now),
+        ..previous.clone()
+    };
+    apply_item_ledger(&mut tx, child_id, item_id, Some(&previous), &current).await?;
+    tx.commit().await?;
+    Ok(ItemWriteOutcome::Deleted)
+}
+
+/// Everything a parent may read about one active child: only the items that parent created,
+/// only their completions, and assigned-item XP. Filtering happens in SQL before the shared
+/// rules run, so the child's own items, settings, devices, tokens, completions and full stats
+/// never enter the result.
+#[derive(Debug)]
+pub struct AssignedProgress {
+    pub items: Vec<Item>,
+    pub completions: Vec<Completion>,
+    pub stats: xp::Stats,
+}
+
+/// Assigned item XP, computed with the shared rules over the filtered set only.
+///
+/// Perfect-day and streak values are deliberately absent: they depend on the child's whole
+/// schedule, so returning them (even filtered) would reveal whether private items were done.
+/// The item XP component is the same arithmetic `xp::compute` uses.
+fn assigned_stats(items: &[Item], completions: &[Completion], today: NaiveDate) -> xp::Stats {
+    let filtered = xp::compute(items, completions, today);
+    let item_xp = filtered.xp - xp::PERFECT_DAY_BONUS * filtered.perfect_days.len() as i64;
+    xp::Stats::from_parts(item_xp, Vec::new(), BTreeMap::new())
+}
+
+/// Read one active child's assigned items, their completions and their assigned XP in one
+/// deferred snapshot. `None` when the link is not active, so the route answers 404.
+pub async fn assigned_progress(
+    db: &Db,
+    parent_id: i64,
+    child_id: i64,
+) -> Result<Option<AssignedProgress>, sqlx::Error> {
+    let mut tx = db.begin_with("BEGIN DEFERRED").await?;
+    let permission: Option<String> = sqlx::query_scalar(
+        "SELECT default_permission FROM family_links
+         WHERE parent_id = ? AND child_id = ? AND status = 'active'",
+    )
+    .bind(parent_id)
+    .bind(child_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(permission) = permission else {
+        return Ok(None);
+    };
+    let today = local_today(&mut tx, child_id).await?;
+    let mut items: Vec<Item> = sqlx::query_as(&format!(
+        "SELECT {ITEM_COLS} FROM items
+         WHERE user_id = ? AND created_by = ?
+         ORDER BY seq"
+    ))
+    .bind(child_id)
+    .bind(parent_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    for item in &mut items {
+        item.effective_permission =
+            effective_permission(item.permission_override.as_deref(), Some(&permission));
+    }
+    let completions: Vec<Completion> = sqlx::query_as(&format!(
+        "SELECT {COMPLETION_COLS} FROM completions
+         WHERE user_id = ? AND item_id IN (
+             SELECT id FROM items WHERE user_id = ? AND created_by = ?
+         )
+         ORDER BY item_id, date"
+    ))
+    .bind(child_id)
+    .bind(child_id)
+    .bind(parent_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let stats = assigned_stats(&items, &completions, today);
+    tx.commit().await?;
+    Ok(Some(AssignedProgress {
+        items,
+        completions,
+        stats,
+    }))
 }
 
 #[cfg(test)]

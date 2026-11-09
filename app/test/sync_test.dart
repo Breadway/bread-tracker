@@ -29,6 +29,9 @@ class FakeServer {
   bool disconnectAfterFirstRequest = false;
   bool firstRequest = false;
 
+  /// Item ids the server refuses, mapped to the wire field names it names back.
+  final refuseFields = <String, List<String>>{};
+
   /// When set, the next nonempty upload rotates the generation before it is applied,
   /// modelling a restore that lands between preflight and the first batch.
   String? rotateEpochOnUpload;
@@ -97,10 +100,18 @@ class FakeServer {
         'server_time': 0,
       };
     }
+    final refused = <Map<String, dynamic>>[];
     for (final i in pi) {
-      final e = items[i['id']];
+      final id = i['id'] as String;
+      final fields = refuseFields[id];
+      if (fields != null) {
+        final stored = items[id];
+        refused.add({'id': id, 'fields': fields, 'item': ?stored});
+        continue;
+      }
+      final e = items[id];
       if (e != null && e['updated_at'] >= i['updated_at']) continue;
-      items[i['id']] = {...i, 'seq': ++seq};
+      items[id] = {...i, 'seq': ++seq};
     }
     for (final c in pc) {
       final k = '${c['item_id']}|${c['date']}';
@@ -124,6 +135,7 @@ class FakeServer {
                   ? comps.values
                   : comps.values.where((c) => c['seq'] > since))
               .toList(),
+      if (refused.isNotEmpty) 'refused': refused,
       'server_time': 0,
     };
   }
@@ -1219,5 +1231,110 @@ void main() {
       reason: 'default Apis reuse the TCP socket',
     );
     expect(tokens, ['Bearer old-token', 'Bearer rotated-token']);
+  });
+
+  test(
+    'a refused edit reverts to the server row and is never retried',
+    () async {
+      final server = FakeServer();
+      final (db, sync, _) = await device(server);
+      await db.upsertItem(
+        ItemsCompanion.insert(
+          id: id1,
+          kind: 'chore',
+          name: 'Bins',
+          points: 10,
+          updatedAt: 1000,
+          dirty: const Value(true),
+        ),
+      );
+      expect(await sync.sync(), SyncStatus.idle);
+      expect(sync.refusalMessage, isNull);
+
+      // The child edits a field the effective permission does not allow while offline.
+      await db.upsertItem(
+        ItemsCompanion(
+          id: const Value(id1),
+          kind: const Value('chore'),
+          name: const Value('Hijacked'),
+          points: const Value(10),
+          updatedAt: const Value(2000),
+          dirty: const Value(true),
+        ),
+      );
+      server.refuseFields[id1] = ['name'];
+
+      expect(await sync.sync(), SyncStatus.idle);
+      final reverted = await db.select(db.items).getSingle();
+      expect(reverted.name, 'Bins', reason: 'the server row won the refusal');
+      expect(reverted.updatedAt, 1000);
+      expect(reverted.dirty, isFalse, reason: 'a refused row is not retried');
+      expect(server.items[id1]!['name'], 'Bins');
+      expect(sync.refusalMessage, contains('Bins'));
+      expect(sync.refusalMessage, contains('name'));
+
+      // The next pass has nothing to push, and the one-shot message is gone.
+      final before = server.outgoingItemCounts.length;
+      expect(await sync.sync(), SyncStatus.idle);
+      expect(server.outgoingItemCounts.skip(before), everyElement(0));
+      expect(sync.refusalMessage, isNull);
+    },
+  );
+
+  test('a refused row does not block another row in the same batch', () async {
+    final server = FakeServer();
+    final (db, sync, _) = await device(server);
+    await db.upsertItem(
+      ItemsCompanion.insert(
+        id: id1,
+        kind: 'chore',
+        name: 'Bins',
+        points: 10,
+        updatedAt: 1000,
+        dirty: const Value(true),
+      ),
+    );
+    await sync.sync();
+
+    await db.upsertItem(
+      ItemsCompanion(
+        id: const Value(id1),
+        kind: const Value('chore'),
+        name: const Value('Hijacked'),
+        points: const Value(10),
+        updatedAt: const Value(2000),
+        dirty: const Value(true),
+      ),
+    );
+    await db.upsertItem(
+      ItemsCompanion.insert(
+        id: id2,
+        kind: 'habit',
+        name: 'Read',
+        points: 15,
+        updatedAt: 2000,
+        dirty: const Value(true),
+      ),
+    );
+    server.refuseFields[id1] = ['name'];
+
+    expect(await sync.sync(), SyncStatus.idle);
+    expect((await db.select(db.items).get()).length, 2);
+    final own = await (db.select(
+      db.items,
+    )..where((t) => t.id.equals(id1))).getSingle();
+    expect(own.name, 'Bins');
+    expect(own.dirty, isFalse);
+    final accepted = await (db.select(
+      db.items,
+    )..where((t) => t.id.equals(id2))).getSingle();
+    expect(accepted.name, 'Read');
+    expect(accepted.dirty, isFalse);
+    expect(server.items[id2]!['name'], 'Read');
+    expect(
+      await (db.select(db.items)..where((t) => t.dirty.equals(true))).get(),
+      isEmpty,
+      reason: 'the refusal must not leave the batch half-dirty',
+    );
   });
 }

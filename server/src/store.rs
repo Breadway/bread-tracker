@@ -1,13 +1,13 @@
 //! Sync storage: last-write-wins upserts with a server-assigned change counter.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{Datelike, Duration, NaiveDate};
 use sqlx::{Connection, SqliteConnection};
 
 use crate::db::Db;
 use crate::family;
-use crate::model::{Completion, Item, SyncResponse};
+use crate::model::{Completion, Item, RefusedItem, SyncResponse};
 use crate::xp;
 
 const DAY_MS: i64 = 86_400_000;
@@ -27,7 +27,10 @@ pub(crate) async fn next_seq(conn: &mut SqliteConnection) -> Result<i64, sqlx::E
 /// The date, not a timestamp: perfect-day scheduling is per local date, and an item created in
 /// the evening must not be scheduled for that same day. Missing or unparseable settings fall
 /// back to UTC, matching the rest of the settings handling.
-async fn first_seen_date(conn: &mut SqliteConnection, user_id: i64) -> Result<String, sqlx::Error> {
+pub(crate) async fn first_seen_date(
+    conn: &mut SqliteConnection,
+    user_id: i64,
+) -> Result<String, sqlx::Error> {
     let timezone: Option<String> =
         sqlx::query_scalar("SELECT timezone FROM user_settings WHERE user_id = ?")
             .bind(user_id)
@@ -59,28 +62,101 @@ pub enum PushError {
 
 pub(crate) const ITEM_COLS: &str =
     "id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, created_on, created_by, permission_override, seq";
-const COMPLETION_COLS: &str = "item_id, date, completed_at, updated_at, deleted_at, seq";
+pub(crate) const COMPLETION_COLS: &str = "item_id, date, completed_at, updated_at, deleted_at, seq";
 
 fn pull_sql(table: &str, cols: &str) -> String {
     format!("SELECT {cols} FROM {table} WHERE user_id = ? AND seq > ? AND seq <= ? ORDER BY seq")
 }
 
-/// Stored item fields read before an upsert: `updated_at` plus everything the ledger needs.
-type StoredItemRow = (i64, String, i64, i64, bool, Option<i64>, Option<String>);
+/// The wire fields whose stored value differs from the incoming row. The app pushes whole
+/// rows, so a field being present is not a change; comparing values is what keeps an unchanged
+/// row from being refused and a genuine edit from slipping through.
+fn changed_item_fields(stored: &Item, incoming: &Item) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    if stored.kind != incoming.kind {
+        changed.push("kind");
+    }
+    if stored.name != incoming.name.trim() {
+        changed.push("name");
+    }
+    if stored.weekdays != incoming.weekdays {
+        changed.push("weekdays");
+    }
+    if stored.remind_time != incoming.remind_time {
+        changed.push("remind_time");
+    }
+    if stored.points != incoming.points {
+        changed.push("points");
+    }
+    if stored.due_date != incoming.due_date {
+        changed.push("due_date");
+    }
+    if stored.sort != incoming.sort {
+        changed.push("sort");
+    }
+    if stored.active != incoming.active {
+        changed.push("active");
+    }
+    // Deleting or resurrecting is the tombstone transition, not the timestamp value: a client
+    // may re-push the same tombstone with a different clock and that is not a new edit.
+    if stored.deleted_at.is_some() != incoming.deleted_at.is_some() {
+        changed.push("deleted_at");
+    }
+    changed
+}
+
+/// Whether `level` allows changing `field`. The tables mirror DESIGN.md: completions are always
+/// allowed separately and are never part of this list. `full` allows every item field.
+fn field_allowed(level: &str, field: &str) -> bool {
+    match level {
+        "full" => true,
+        "complete_and_reschedule" => {
+            matches!(field, "due_date" | "weekdays" | "remind_time" | "active")
+        }
+        _ => false,
+    }
+}
+
 /// The fields of the completion's item that decide its ledger contribution.
 type CompletionItemRow = (String, i64, i64, bool, Option<i64>, Option<String>);
 
 /// The item fields a statistics ledger update can depend on, captured before an upsert.
-struct LedgerItem {
-    kind: String,
-    weekdays: i64,
-    points: i64,
-    active: bool,
-    deleted_at: Option<i64>,
-    created_on: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LedgerItem {
+    pub(crate) kind: String,
+    pub(crate) weekdays: i64,
+    pub(crate) points: i64,
+    pub(crate) active: bool,
+    pub(crate) deleted_at: Option<i64>,
+    pub(crate) created_on: Option<String>,
 }
 
 impl LedgerItem {
+    /// The stored contribution fields of an item row.
+    pub(crate) fn from_item(item: &Item) -> Self {
+        Self {
+            kind: item.kind.clone(),
+            weekdays: item.weekdays,
+            points: item.points,
+            active: item.active,
+            deleted_at: item.deleted_at,
+            created_on: item.created_on.clone(),
+        }
+    }
+
+    /// The contribution fields a write will store. `created_on` is passed explicitly because
+    /// the server keeps the stored value on an existing row instead of trusting the payload.
+    pub(crate) fn from_write(item: &Item, created_on: Option<String>) -> Self {
+        Self {
+            kind: item.kind.clone(),
+            weekdays: item.weekdays,
+            points: item.points,
+            active: item.active,
+            deleted_at: item.deleted_at,
+            created_on,
+        }
+    }
+
     fn live(&self) -> bool {
         self.deleted_at.is_none()
     }
@@ -292,6 +368,66 @@ async fn ledger_schedule_delta(
     Ok(())
 }
 
+/// Move the statistics ledger from `previous` to `current` after an item row was written.
+///
+/// Shared by the sync upsert and the parent item routes: DESIGN.md requires every writer of
+/// `items` to maintain the same aggregates, and using one helper keeps the two paths from
+/// drifting. `done_days` comes from `stats_item_date`, so a points change scales the XP already
+/// earned by the item's completed dates.
+pub(crate) async fn apply_item_ledger(
+    conn: &mut SqliteConnection,
+    user_id: i64,
+    item_id: &str,
+    previous: Option<&LedgerItem>,
+    current: &LedgerItem,
+) -> Result<(), sqlx::Error> {
+    let done_days: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM stats_item_date WHERE user_id = ? AND item_id = ?",
+    )
+    .bind(user_id)
+    .bind(item_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    let old_xp = previous
+        .filter(|p| p.live())
+        .map(|p| p.points * done_days)
+        .unwrap_or(0);
+    let new_xp = if current.live() {
+        current.points * done_days
+    } else {
+        0
+    };
+    ledger_xp_add(conn, user_id, new_xp - old_xp).await?;
+
+    let old_bits = previous.map(LedgerItem::weekday_bits).unwrap_or(0);
+    let new_bits = current.weekday_bits();
+    if old_bits != new_bits
+        || previous.and_then(LedgerItem::created_bound) != current.created_bound()
+    {
+        let dates: Vec<String> = sqlx::query_scalar(
+            "SELECT date FROM stats_item_date WHERE user_id = ? AND item_id = ?",
+        )
+        .bind(user_id)
+        .bind(item_id)
+        .fetch_all(&mut *conn)
+        .await?;
+        for date in dates {
+            let Some(day) = crate::xp::parse(&date) else {
+                continue;
+            };
+            // Evaluate the full predicate on each side: the creation bound means a weekday bit
+            // is not enough to decide whether this date counted.
+            let was = previous.is_some_and(|item| item.scheduled_on(day));
+            let now = current.scheduled_on(day);
+            if was != now {
+                ledger_day_add(conn, user_id, &date, if now { 1 } else { -1 }).await?;
+            }
+        }
+        ledger_schedule_delta(conn, user_id, previous, current).await?;
+    }
+    Ok(())
+}
+
 /// Base XP, day and schedule queries. Kept as constants so `/stats` and its query-plan test
 /// execute exactly the same statements.
 const STATS_XP_SQL: &str = "SELECT COALESCE((SELECT xp_base FROM stats_user WHERE user_id = ?), 0)";
@@ -354,14 +490,18 @@ impl UserDb {
     ) -> Result<(), PushError> {
         self.apply_push_limited(items, completions, &crate::config::Limits::default())
             .await
+            .map(|_| ())
     }
 
+    /// Apply a push, returning the item rows a family permission refused. A refused row is not
+    /// written at all and carries the stored server row so the client can revert it. Completions
+    /// are never refused: a child may always tick and un-tick any item on their own list.
     pub async fn apply_push_limited(
         &self,
         items: &[Item],
         completions: &[Completion],
         limits: &crate::config::Limits,
-    ) -> Result<(), PushError> {
+    ) -> Result<Vec<RefusedItem>, PushError> {
         // BEGIN IMMEDIATE serializes admission across processes, so normal contention
         // waits instead of upgrading a read snapshot. If SQLite still reports busy after
         // its busy timeout, reuse the shared one-retry policy rather than surfacing an
@@ -379,7 +519,7 @@ impl UserDb {
         items: &[Item],
         completions: &[Completion],
         limits: &crate::config::Limits,
-    ) -> Result<(), PushError> {
+    ) -> Result<Vec<RefusedItem>, PushError> {
         let ceiling = now_ms() + DAY_MS;
         let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
         let mut item_count: i64 =
@@ -420,19 +560,71 @@ impl UserDb {
         // legacy NULL, so a later push can never move the day an item starts counting toward
         // perfect days and retroactively rescore history.
         let first_seen = first_seen_date(&mut tx, self.user_id).await?;
+        let mut refused = Vec::new();
+        // A child may have several active parents; resolve each parent's default once.
+        let mut link_defaults: HashMap<i64, Option<String>> = HashMap::new();
         for it in items {
             let updated = it.updated_at.min(ceiling);
-            let existing: Option<StoredItemRow> = sqlx::query_as(
-                "SELECT updated_at, kind, weekdays, points, active, deleted_at, created_on
-                     FROM items WHERE user_id = ? AND id = ?",
-            )
+            let existing: Option<Item> = sqlx::query_as(&format!(
+                "SELECT {ITEM_COLS} FROM items WHERE user_id = ? AND id = ?"
+            ))
             .bind(self.user_id)
             .bind(&it.id)
             .fetch_optional(&mut *tx)
             .await?;
-            if existing.as_ref().is_some_and(|e| e.0 >= updated) {
+            if existing.as_ref().is_some_and(|e| e.updated_at >= updated) {
                 continue;
             }
+
+            // TRACK-57: an item a parent assigned stays server-enforced per field. The caller
+            // owns the row (it lives under their user_id) but the stored `created_by` is the
+            // authority, never the payload. Only an active link grants a level; a pending or
+            // revoked link grants nothing, so the item behaves as the child's own again.
+            if let Some(stored) = &existing {
+                if let Some(creator) = stored.created_by.filter(|c| *c != self.user_id) {
+                    let default = match link_defaults.get(&creator) {
+                        Some(default) => default.clone(),
+                        None => {
+                            let default: Option<String> = sqlx::query_scalar(
+                                "SELECT default_permission FROM family_links
+                                 WHERE parent_id = ? AND child_id = ? AND status = 'active'",
+                            )
+                            .bind(creator)
+                            .bind(self.user_id)
+                            .fetch_optional(&mut *tx)
+                            .await?;
+                            link_defaults.insert(creator, default.clone());
+                            default
+                        }
+                    };
+                    if let Some(default) = &default {
+                        let level = family::effective_permission(
+                            stored.permission_override.as_deref(),
+                            Some(default.as_str()),
+                        )
+                        .expect("an active link always yields a level");
+                        let disallowed: Vec<String> = changed_item_fields(stored, it)
+                            .into_iter()
+                            .filter(|field| !field_allowed(&level, field))
+                            .map(str::to_string)
+                            .collect();
+                        if !disallowed.is_empty() {
+                            // Refuse the whole row, not just the fields: accepting the allowed
+                            // half would silently mix a child's reschedule with an edit the
+                            // parent's configuration did not permit.
+                            let mut row = stored.clone();
+                            row.effective_permission = Some(level);
+                            refused.push(RefusedItem {
+                                id: it.id.clone(),
+                                fields: disallowed,
+                                item: Some(row),
+                            });
+                            continue;
+                        }
+                    }
+                }
+            }
+
             if existing.is_none() {
                 if item_count >= limits.max_items {
                     return Err(PushError::LimitReached(format!(
@@ -443,7 +635,7 @@ impl UserDb {
                 item_count += 1;
             }
             let created_on = match &existing {
-                Some((_, _, _, _, _, _, stored)) => stored.clone(),
+                Some(stored) => stored.created_on.clone(),
                 None => Some(it.created_on.clone().unwrap_or_else(|| first_seen.clone())),
             };
             let seq = next_seq(&mut tx).await?;
@@ -481,68 +673,9 @@ impl UserDb {
             // liveness change which weekday mask applies, and the stored creation date bounds
             // it per date. `created_on` is the persisted value, so an edit that sends a new
             // one cannot move history.
-            let previous = existing.map(|e| LedgerItem {
-                kind: e.1,
-                weekdays: e.2,
-                points: e.3,
-                active: e.4,
-                deleted_at: e.5,
-                created_on: e.6,
-            });
-            let current = LedgerItem {
-                kind: it.kind.clone(),
-                weekdays: it.weekdays,
-                points: it.points,
-                active: it.active,
-                deleted_at: it.deleted_at,
-                created_on: created_on.clone(),
-            };
-            let done_days: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM stats_item_date WHERE user_id = ? AND item_id = ?",
-            )
-            .bind(self.user_id)
-            .bind(&it.id)
-            .fetch_one(&mut *tx)
-            .await?;
-            let old_xp = previous
-                .as_ref()
-                .filter(|p| p.live())
-                .map(|p| p.points * done_days)
-                .unwrap_or(0);
-            let new_xp = if current.live() {
-                current.points * done_days
-            } else {
-                0
-            };
-            ledger_xp_add(&mut tx, self.user_id, new_xp - old_xp).await?;
-
-            let old_bits = previous.as_ref().map(LedgerItem::weekday_bits).unwrap_or(0);
-            let new_bits = current.weekday_bits();
-            if old_bits != new_bits
-                || previous.as_ref().and_then(LedgerItem::created_bound) != current.created_bound()
-            {
-                let dates: Vec<String> = sqlx::query_scalar(
-                    "SELECT date FROM stats_item_date WHERE user_id = ? AND item_id = ?",
-                )
-                .bind(self.user_id)
-                .bind(&it.id)
-                .fetch_all(&mut *tx)
-                .await?;
-                for date in dates {
-                    let Some(day) = crate::xp::parse(&date) else {
-                        continue;
-                    };
-                    // Evaluate the full predicate on each side: the creation bound means a
-                    // weekday bit is not enough to decide whether this date counted.
-                    let was = previous.as_ref().is_some_and(|item| item.scheduled_on(day));
-                    let now = current.scheduled_on(day);
-                    if was != now {
-                        ledger_day_add(&mut tx, self.user_id, &date, if now { 1 } else { -1 })
-                            .await?;
-                    }
-                }
-                ledger_schedule_delta(&mut tx, self.user_id, previous.as_ref(), &current).await?;
-            }
+            let previous = existing.as_ref().map(LedgerItem::from_item);
+            let current = LedgerItem::from_write(it, created_on);
+            apply_item_ledger(&mut tx, self.user_id, &it.id, previous.as_ref(), &current).await?;
         }
 
         for c in completions {
@@ -684,7 +817,7 @@ impl UserDb {
         }
 
         tx.commit().await?;
-        Ok(())
+        Ok(refused)
     }
 
     /// This user's rows changed after `since`, read from one snapshot together with the new
@@ -725,6 +858,7 @@ impl UserDb {
             cursor,
             items,
             completions,
+            refused: Vec::new(),
             server_time: now_ms(),
         })
     }

@@ -58,6 +58,10 @@ class SyncEngine {
   String? _server;
   String? rejectionMessage;
 
+  /// One-shot human-readable summary of item rows the server refused because of a family
+  /// permission. Reset at the start of the next sync pass.
+  String? refusalMessage;
+
   void invalidate() {
     _generation++;
     _invalidated = true;
@@ -110,6 +114,7 @@ class SyncEngine {
 
   Future<SyncStatus> _onceAttempt() async {
     rejectionMessage = null;
+    refusalMessage = null;
     if (_invalidated) return SyncStatus.unpaired;
     final storeGeneration = store.authGeneration;
     final token = await store.readTokenForGeneration(storeGeneration);
@@ -402,6 +407,30 @@ class SyncEngine {
           await db
               .into(db.completions)
               .insertOnConflictUpdate(_compCompanion(j));
+        }
+        // A refused row was not written by the server. Revert it to the stored server state
+        // even though the local dirty copy has the newer timestamp, and mark it clean so it is
+        // never retried. The server includes the stored row in the refusal for exactly this.
+        final refused =
+            (res['refused'] as List?)?.cast<Map<String, dynamic>>() ??
+            const <Map<String, dynamic>>[];
+        for (final refusal in refused) {
+          final item = refusal['item'];
+          if (item is Map) {
+            await db.upsertItem(_itemCompanion(item.cast<String, dynamic>()));
+          }
+        }
+        if (refused.isNotEmpty) {
+          final parts = refused
+              .map((refusal) {
+                final item = refusal['item'];
+                final name = item is Map ? item['name'] as String? : null;
+                final fields =
+                    (refusal['fields'] as List?)?.join(', ') ?? 'edit';
+                return '${name ?? refusal['id']} ($fields)';
+              })
+              .join(', ');
+          refusalMessage = 'Some changes were refused: $parts';
         }
       });
       cursor = res['cursor'] as int;

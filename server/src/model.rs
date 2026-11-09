@@ -134,6 +134,19 @@ impl Completion {
     }
 }
 
+/// One item row the child's sync was not allowed to change. The row was not written, so the
+/// client must revert to `item` (the stored server state) instead of retrying the edit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RefusedItem {
+    pub id: String,
+    /// The wire field names that the effective permission did not allow.
+    pub fields: Vec<String>,
+    /// The stored server row, so the client can revert without a second round trip. Optional so
+    /// an older or partial server response is still parseable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<Item>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SyncRequest {
     #[serde(default)]
@@ -154,5 +167,9 @@ pub struct SyncResponse {
     pub cursor: i64,
     pub items: Vec<Item>,
     pub completions: Vec<Completion>,
+    /// Additive: item rows the caller's family permission refused. Old clients ignore the
+    /// field; new clients revert the named rows and never retry them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<RefusedItem>,
     pub server_time: i64,
 }

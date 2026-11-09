@@ -16,7 +16,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::auth::{self, DeviceId, UserId};
 use crate::error::{ApiError, ApiResult};
-use crate::model::{SyncRequest, SyncResponse};
+use crate::model::{Completion, Item, SyncRequest, SyncResponse};
 use crate::public_auth::{self, ClientIp};
 use crate::push::{Message, SendOutcome};
 use crate::store::{PushError, UserDb, UserSettings};
@@ -57,6 +57,16 @@ pub fn router(state: AppState) -> Router {
             "/family/links/{id}",
             put(family_update_link).delete(family_unlink),
         )
+        .route("/family/children", get(family_children))
+        .route(
+            "/family/children/{id}/items",
+            get(family_child_items).post(family_child_create_item),
+        )
+        .route(
+            "/family/children/{id}/items/{item}",
+            put(family_child_update_item).delete(family_child_delete_item),
+        )
+        .route("/family/children/{id}/stats", get(family_child_stats))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,
@@ -475,6 +485,243 @@ async fn family_unlink(
     }
 }
 
+#[derive(Serialize)]
+struct FamilyChildResp {
+    user_id: i64,
+    name: String,
+    permission: String,
+}
+
+#[derive(Serialize)]
+struct FamilyChildrenResp {
+    children: Vec<FamilyChildResp>,
+}
+
+/// The parent's view of one active child. Only active links appear, so a pending or revoked
+/// link never confirms that a child exists.
+async fn family_children(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+) -> ApiResult<Json<FamilyChildrenResp>> {
+    let children = family::active_children(&st.db, uid)
+        .await?
+        .into_iter()
+        .map(|party| FamilyChildResp {
+            user_id: party.user_id,
+            name: party.name,
+            permission: party.permission,
+        })
+        .collect();
+    Ok(Json(FamilyChildrenResp { children }))
+}
+
+fn default_weekdays() -> i64 {
+    127
+}
+
+fn default_active() -> bool {
+    true
+}
+
+fn default_points(kind: &str) -> i64 {
+    match kind {
+        "habit" => 15,
+        "todo" => 20,
+        _ => 10,
+    }
+}
+
+#[derive(Deserialize)]
+struct FamilyItemCreateReq {
+    #[serde(default)]
+    id: Option<String>,
+    kind: String,
+    name: String,
+    #[serde(default = "default_weekdays")]
+    weekdays: i64,
+    #[serde(default)]
+    remind_time: Option<String>,
+    #[serde(default)]
+    points: Option<i64>,
+    #[serde(default)]
+    due_date: Option<String>,
+    #[serde(default)]
+    sort: i64,
+    #[serde(default = "default_active")]
+    active: bool,
+}
+
+impl FamilyItemCreateReq {
+    fn into_item(self) -> Item {
+        let points = self.points.unwrap_or_else(|| default_points(&self.kind));
+        Item {
+            id: self.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            kind: self.kind,
+            name: self.name,
+            weekdays: self.weekdays,
+            remind_time: self.remind_time,
+            points,
+            due_date: self.due_date,
+            sort: self.sort,
+            active: self.active,
+            updated_at: 0,
+            deleted_at: None,
+            created_on: None,
+            created_by: None,
+            permission_override: None,
+            effective_permission: None,
+            seq: 0,
+        }
+    }
+}
+
+/// Deserialize a nullable field while keeping "absent" distinct from an explicit null.
+fn some_option<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<String>::deserialize(deserializer)?))
+}
+
+#[derive(Deserialize)]
+struct FamilyItemUpdateReq {
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    weekdays: Option<i64>,
+    #[serde(default, deserialize_with = "some_option")]
+    remind_time: Option<Option<String>>,
+    #[serde(default)]
+    points: Option<i64>,
+    #[serde(default, deserialize_with = "some_option")]
+    due_date: Option<Option<String>>,
+    #[serde(default)]
+    sort: Option<i64>,
+    #[serde(default)]
+    active: Option<bool>,
+}
+
+impl From<FamilyItemUpdateReq> for family::ItemPatch {
+    fn from(req: FamilyItemUpdateReq) -> Self {
+        Self {
+            kind: req.kind,
+            name: req.name,
+            weekdays: req.weekdays,
+            remind_time: req.remind_time,
+            points: req.points,
+            due_date: req.due_date,
+            sort: req.sort,
+            active: req.active,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct FamilyProgressResp {
+    items: Vec<Item>,
+    completions: Vec<Completion>,
+    stats: xp::Stats,
+}
+
+/// Authenticated parent: create an item on an active child's list. Provenance and the
+/// timestamp are server-set, and the id is refused rather than overwriting an existing row.
+async fn family_child_create_item(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+    Path(child_id): Path<i64>,
+    Json(req): Json<FamilyItemCreateReq>,
+) -> ApiResult<Json<Item>> {
+    match family::create_item(&st.db, uid, child_id, &req.into_item(), &st.config.limits).await? {
+        family::ItemWriteOutcome::Created(item) => Ok(Json(item)),
+        family::ItemWriteOutcome::NotFound => Err(ApiError::NotFound),
+        family::ItemWriteOutcome::Collision => {
+            Err(ApiError::Conflict("that item id already exists".into()))
+        }
+        family::ItemWriteOutcome::Invalid(message) => Err(ApiError::BadRequest(message)),
+        family::ItemWriteOutcome::LimitReached(message) => Err(ApiError::LimitReached(message)),
+        family::ItemWriteOutcome::Updated(_) | family::ItemWriteOutcome::Deleted => {
+            unreachable!("create_item only creates")
+        }
+    }
+}
+
+/// Authenticated parent: edit one item the caller created for an active child. An item the
+/// child owns is a 404, exactly like an unknown child id.
+async fn family_child_update_item(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+    Path((child_id, item_id)): Path<(i64, String)>,
+    Json(req): Json<FamilyItemUpdateReq>,
+) -> ApiResult<Json<Item>> {
+    let patch = family::ItemPatch::from(req);
+    if patch.is_empty() {
+        return Err(ApiError::BadRequest(
+            "send at least one item field to change".into(),
+        ));
+    }
+    match family::update_item(&st.db, uid, child_id, &item_id, &patch).await? {
+        family::ItemWriteOutcome::Updated(item) => Ok(Json(item)),
+        family::ItemWriteOutcome::NotFound => Err(ApiError::NotFound),
+        family::ItemWriteOutcome::Invalid(message) => Err(ApiError::BadRequest(message)),
+        family::ItemWriteOutcome::Created(_)
+        | family::ItemWriteOutcome::Deleted
+        | family::ItemWriteOutcome::Collision
+        | family::ItemWriteOutcome::LimitReached(_) => {
+            unreachable!("update_item only updates")
+        }
+    }
+}
+
+/// Authenticated parent: delete (tombstone) one item the caller created for an active child.
+async fn family_child_delete_item(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+    Path((child_id, item_id)): Path<(i64, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    match family::delete_item(&st.db, uid, child_id, &item_id).await? {
+        family::ItemWriteOutcome::Deleted => Ok(Json(serde_json::json!({ "ok": true }))),
+        family::ItemWriteOutcome::NotFound => Err(ApiError::NotFound),
+        family::ItemWriteOutcome::Created(_)
+        | family::ItemWriteOutcome::Updated(_)
+        | family::ItemWriteOutcome::Invalid(_)
+        | family::ItemWriteOutcome::Collision
+        | family::ItemWriteOutcome::LimitReached(_) => {
+            unreachable!("delete_item only deletes")
+        }
+    }
+}
+
+/// Authenticated parent: only the items this parent created for an active child, only their
+/// completions, and assigned-item XP. The filter runs before the shared rules.
+async fn family_child_items(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+    Path(child_id): Path<i64>,
+) -> ApiResult<Json<FamilyProgressResp>> {
+    let progress = family::assigned_progress(&st.db, uid, child_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(FamilyProgressResp {
+        items: progress.items,
+        completions: progress.completions,
+        stats: progress.stats,
+    }))
+}
+
+/// Authenticated parent: assigned-item XP only, never the child's full statistics.
+async fn family_child_stats(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+    Path(child_id): Path<i64>,
+) -> ApiResult<Json<xp::Stats>> {
+    let progress = family::assigned_progress(&st.db, uid, child_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(progress.stats))
+}
+
 #[derive(Deserialize)]
 struct SignupReq {
     invite: String,
@@ -632,11 +879,11 @@ async fn sync(
     // transaction (tombstoned items count, so an old offline client still syncs after another
     // device deleted the item). An unknown reference, or one that only another user holds,
     // rejects the whole batch with nothing written.
-    match user
+    let refused = match user
         .apply_push_limited(&req.items, &req.completions, &st.config.limits)
         .await
     {
-        Ok(()) => {}
+        Ok(refused) => refused,
         Err(PushError::UnknownItem) => {
             return Err(ApiError::BadRequest(
                 "completion references an unknown item".into(),
@@ -648,9 +895,10 @@ async fn sync(
         }
         Err(PushError::Db(e)) => return Err(e.into()),
         Err(PushError::LimitReached(message)) => return Err(ApiError::LimitReached(message)),
-    }
+    };
     let mut response = user.pull(req.since).await?;
     response.epoch = Some(generation);
+    response.refused = refused;
     Ok(Json(response))
 }
 

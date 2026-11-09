@@ -515,9 +515,7 @@ async fn stats(
             .date_naive(),
     };
     let user = UserDb::new(&st.db, uid);
-    let items = user.all_items().await?;
-    let completions = user.all_completions().await?;
-    Ok(Json(xp::compute(&items, &completions, today)))
+    Ok(Json(user.stats(today).await?))
 }
 
 #[derive(Serialize, Deserialize)]

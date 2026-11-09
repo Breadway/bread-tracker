@@ -367,7 +367,10 @@ fn published_migration_files_keep_their_checksums() {
     assert_eq!(checksum_of(SQL_0004), SHA_0004);
     // Versions are unique and strictly increasing; nothing collides with 0004.
     let versions: Vec<i64> = m.migrations.iter().map(|x| x.version).collect();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    assert_eq!(
+        versions,
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    );
 }
 
 #[tokio::test]
@@ -381,7 +384,7 @@ async fn upgrade_from_0001_only() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -426,7 +429,7 @@ async fn upgrade_from_0001_and_0003_restores_the_hygiene_indexes_0002_dropped() 
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -443,7 +446,7 @@ async fn upgrade_from_0001_0003_and_0004() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -464,7 +467,7 @@ async fn upgrade_from_0001_and_0004_without_0003() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -481,7 +484,7 @@ async fn upgrade_from_the_published_pr43_head_0001_and_0002() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -498,7 +501,7 @@ async fn upgrade_from_0001_0002_0003_in_that_order() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -513,7 +516,7 @@ async fn fresh_database_gets_the_whole_set_in_version_order() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
         true,
     );
     let names = index_names(&pool).await;
@@ -613,7 +616,7 @@ async fn reopening_after_close_retries_while_a_writer_holds_the_lock() {
         "a reopen racing a held write lock must retry SQLITE_BUSY, not fail the second start",
     );
     let expected = ledger(&pool).await;
-    assert_eq!(expected.len(), 13);
+    assert_eq!(expected.len(), 14);
     close_pool(pool).await;
 
     for round in 0..24 {
@@ -638,7 +641,7 @@ async fn a_database_that_already_ran_0004_is_adopted_by_the_integrated_migration
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
         true,
     );
     assert_eq!(
@@ -749,7 +752,7 @@ async fn a_failed_0002_rolls_back_completely_and_a_retry_succeeds() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -791,7 +794,7 @@ async fn a_failed_0005_keeps_the_0002_result_and_a_retry_completes_the_repair() 
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -881,11 +884,11 @@ async fn a_database_already_upgraded_by_6f9986e_receives_0004_and_later_migratio
             .await
             .unwrap();
         let after = ledger(&pool).await;
-        // Every recorded row is untouched (same versions, same checksums). The integrated
-        // deployment adds 0004 when it was absent, plus the later migrations through 0013.
+        // Every recorded row is untouched (same versions and checksums); the integrated
+        // deployment adds every missing version through 0014.
         assert_eq!(
             after.iter().map(|r| r.0).collect::<Vec<_>>(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
             "{name}"
         );
         for row in &before {
@@ -922,7 +925,7 @@ async fn a_failed_0006_keeps_everything_before_it_and_a_retry_completes() {
         .unwrap();
     assert_ledger(
         &ledger(&pool).await,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
         true,
     );
     assert_upgraded_and_intact(&pool).await;
@@ -1029,11 +1032,9 @@ async fn already_published_upstream_0006_gets_0004_and_settings0007_with_values_
     close_pool(pool).await;
     let pool = db::connect(&url(&path)).await.unwrap();
     let after = ledger(&pool).await;
-    // A deployment that integrated the multi-user stack before PR31 lacked 0004; this start
-    // adds the limiter's 0004 and the later migrations, leaving every recorded row intact.
     assert_eq!(
         after.iter().map(|r| r.0).collect::<Vec<_>>(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     );
     for row in before {
         assert!(after.contains(&row));

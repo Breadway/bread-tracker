@@ -33,20 +33,50 @@ pub struct Stats {
     pub streaks: BTreeMap<String, i64>,
 }
 
+impl Stats {
+    /// Assemble a result from parts whose XP is already complete (base plus perfect bonuses).
+    /// Keeping the level/rank arithmetic here means a stats aggregate cannot fork the rules.
+    pub fn from_parts(xp: i64, perfect_days: Vec<String>, streaks: BTreeMap<String, i64>) -> Stats {
+        let level = xp / XP_PER_LEVEL + 1;
+        Stats {
+            xp,
+            level,
+            rank: rank_for(level).to_string(),
+            into_level: xp % XP_PER_LEVEL,
+            per_level: XP_PER_LEVEL,
+            perfect_days,
+            streaks,
+        }
+    }
+}
+
 pub fn rank_for(level: i64) -> &'static str {
     RANKS[((level - 1).max(0) as usize).min(RANKS.len() - 1)]
 }
 
-fn parse(d: &str) -> Option<NaiveDate> {
+pub(crate) fn parse(d: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()
+}
+
+/// Weekdays on which an item counts as scheduled, as a 7-bit mask (bit 0 = Monday).
+///
+/// An item only contributes to a day's schedule while it is live, active and a chore or habit.
+/// The incremental stats ledger stores the same mask per weekday, so a schedule change is a
+/// mask difference; the per-date creation bound is applied separately because it depends on the
+/// date rather than the weekday. `scheduled_on` and the ledger therefore evaluate the same
+/// predicate instead of two similar ones.
+pub(crate) fn scheduled_weekday_bits(kind: &str, weekdays: i64, active: bool, deleted: bool) -> u8 {
+    if deleted || !active || (kind != "chore" && kind != "habit") {
+        return 0;
+    }
+    (weekdays as u8) & 0x7f
 }
 
 /// Whether an item exists yet on `date`. A missing creation date (every item that predates
 /// TRACK-65, and any item an old client created before the server recorded one) has no lower
 /// bound, so its history scores exactly as it did before the upgrade.
-fn existed_on(item: &Item, date: NaiveDate) -> bool {
-    item.created_on
-        .as_deref()
+fn existed_on_parts(created_on: Option<&str>, date: NaiveDate) -> bool {
+    created_on
         .and_then(parse)
         .is_none_or(|created| date > created)
 }
@@ -56,10 +86,30 @@ fn existed_on(item: &Item, date: NaiveDate) -> bool {
 /// The item counts only from the day AFTER creation, so adding one today cannot remove a
 /// perfect-day bonus already earned today, and adding one later cannot rescore an earlier day.
 fn scheduled_on(item: &Item, date: NaiveDate) -> bool {
-    item.active
-        && (item.kind == "chore" || item.kind == "habit")
-        && existed_on(item, date)
-        && item.weekdays & (1 << date.weekday().num_days_from_monday()) != 0
+    scheduled_on_parts(
+        &item.kind,
+        item.weekdays,
+        item.active,
+        item.deleted_at.is_some(),
+        item.created_on.as_deref(),
+        date,
+    )
+}
+
+/// [`scheduled_on`] from already-extracted item fields, so the incremental ledger and the
+/// full-history reference evaluate the same predicate instead of two similar ones.
+pub(crate) fn scheduled_on_parts(
+    kind: &str,
+    weekdays: i64,
+    active: bool,
+    deleted: bool,
+    created_on: Option<&str>,
+    date: NaiveDate,
+) -> bool {
+    scheduled_weekday_bits(kind, weekdays, active, deleted)
+        & (1 << date.weekday().num_days_from_monday())
+        != 0
+        && existed_on_parts(created_on, date)
 }
 
 pub fn compute(items: &[Item], completions: &[Completion], today: NaiveDate) -> Stats {
@@ -112,16 +162,7 @@ pub fn compute(items: &[Item], completions: &[Completion], today: NaiveDate) -> 
         streaks.insert(item.id.clone(), n);
     }
 
-    let level = xp / XP_PER_LEVEL + 1;
-    Stats {
-        xp,
-        level,
-        rank: rank_for(level).to_string(),
-        into_level: xp % XP_PER_LEVEL,
-        per_level: XP_PER_LEVEL,
-        perfect_days,
-        streaks,
-    }
+    Stats::from_parts(xp, perfect_days, streaks)
 }
 
 #[cfg(test)]

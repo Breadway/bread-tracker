@@ -314,6 +314,9 @@ async fn prepare(
     record_install_provenance(pool).await?;
     migrator.run(pool).await?;
     crate::users::reconcile_name_keys(pool).await?;
+    // TRACK-72: an upgraded database builds its statistics ledger once, per account, before
+    // the listener starts. A fresh or already-built database does nothing here.
+    crate::stats::backfill_pending(pool).await?;
     if let Some(name) = admin_name {
         crate::users::apply_admin_name(pool, name).await?;
     }

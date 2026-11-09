@@ -345,6 +345,7 @@ async fn failed_insert_over_http_leaves_the_code_for_the_retry() {
         .unwrap();
     let app = api::router(AppState::new(
         pool.clone(),
+        "test-generation".to_owned(),
         Config::from_env(),
         Arc::new(MockSender::default()),
     ));
@@ -482,6 +483,7 @@ async fn each_users_device_sees_only_its_own_rows() {
 
     let app = api::router(AppState::new(
         pool,
+        "test-generation".to_owned(),
         Config::from_env(),
         Arc::new(MockSender::default()),
     ));
@@ -546,7 +548,12 @@ mod scheduler_boundary {
 
     fn state(pool: &SqlitePool) -> (AppState, Arc<push::MockSender>) {
         let mock = Arc::new(push::MockSender::default());
-        let st = AppState::new(pool.clone(), Config::from_env(), mock.clone());
+        let st = AppState::new(
+            pool.clone(),
+            "test-generation".to_owned(),
+            Config::from_env(),
+            mock.clone(),
+        );
         (st, mock)
     }
 

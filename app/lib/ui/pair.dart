@@ -384,6 +384,9 @@ class _PairScreenState extends ConsumerState<PairScreen> {
       }
       controller.pairingPersisted();
       _invalidatePendingPairingResult();
+      // A (re)paired server may be empty or rebuilt, so offer it everything we have.
+      // The cursor was reset above; marking rows dirty makes the next sync push them.
+      await ref.read(dbProvider).markAllDirty();
       ref.read(pairedStateRevisionProvider.notifier).refresh();
       controller.syncNow();
       ref.read(pushProvider).register(requestPermission: true);

@@ -362,7 +362,9 @@ async fn pull(
     Extension(UserId(uid)): Extension<UserId>,
     Query(q): Query<PullQuery>,
 ) -> ApiResult<Json<SyncResponse>> {
-    Ok(Json(UserDb::new(&st.db, uid).pull(q.since).await?))
+    let mut response = UserDb::new(&st.db, uid).pull(q.since).await?;
+    response.epoch = Some(st.generation.read().unwrap().clone());
+    Ok(Json(response))
 }
 
 /// Push local changes, then return everything changed since `since` (one round trip).
@@ -383,11 +385,31 @@ async fn sync(
     for c in &req.completions {
         c.validate(today).map_err(ApiError::BadRequest)?;
     }
+    let user = UserDb::new(&st.db, uid);
+    let generation = st.generation.read().unwrap().clone();
+    // New clients send an empty sync as preflight. On a true generation mismatch, return a
+    // full read-only snapshot in one transaction without accepting writes, so a restore is
+    // detected before any push can advance the sequence and mask it. Legacy clients omit the
+    // epoch and keep the historical push-then-pull contract.
+    if req
+        .epoch
+        .as_deref()
+        .is_some_and(|epoch| epoch != generation)
+    {
+        let mut full = user.pull(0).await?;
+        full.epoch = Some(generation);
+        if req.items.is_empty() && req.completions.is_empty() {
+            return Ok(Json(full));
+        }
+        return Err(ApiError::BadRequest(
+            "sync generation changed; apply snapshot before retrying uploads".into(),
+        ));
+    }
+
     // Completion references are validated against the caller's own items inside the write
     // transaction (tombstoned items count, so an old offline client still syncs after another
     // device deleted the item). An unknown reference, or one that only another user holds,
     // rejects the whole batch with nothing written.
-    let user = UserDb::new(&st.db, uid);
     match user
         .apply_push_limited(&req.items, &req.completions, &st.config.limits)
         .await
@@ -405,7 +427,9 @@ async fn sync(
         Err(PushError::Db(e)) => return Err(e.into()),
         Err(PushError::LimitReached(message)) => return Err(ApiError::LimitReached(message)),
     }
-    Ok(Json(user.pull(req.since).await?))
+    let mut response = user.pull(req.since).await?;
+    response.epoch = Some(generation);
+    Ok(Json(response))
 }
 
 #[derive(Deserialize)]

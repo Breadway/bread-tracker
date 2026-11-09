@@ -5,7 +5,7 @@ rsync -a --delete --exclude target --exclude .git ./ your-server:~/bread-tracker
 ssh your-server 'cd ~/bread-tracker && mkdir -p /var/backups/bread-tracker 2>/dev/null; \
   docker compose -f packaging/compose.yaml --project-directory . up -d --build'
 curl -s http://127.0.0.1:7290/healthz            # on the server: ok
-docker exec bread-tracker bread-tracker-server pair   # one-time pairing code for the phone
+docker compose -f packaging/compose.yaml --project-directory . exec bread-tracker bread-tracker-server pair   # one-time pairing code for the phone
 ```
 
 Run compose as an ordinary user, not root.
@@ -25,16 +25,6 @@ BREADTRACKER_FCM_SERVICE_ACCOUNT=/run/secrets/fcm.json
 
 Without it the server runs with push disabled (logged at startup).
 
-## Backup and restore
-
-Litestream writes a file replica to `BREADTRACKER_BACKUP_DIR`. Restore into a scratch file to verify:
-
-```sh
-docker run --rm -v /var/backups/bread-tracker:/b -v /tmp:/o litestream/litestream:0.3.13 \
-  restore -o /o/restored.db file:///b/litestream
-sqlite3 /tmp/restored.db 'select count(*) from items;'
-```
-
 ## Upgrading an existing single-user deployment to the multi-user schema
 
 This stack adds migrations `0002_users.sql`, `0004_pair_rate_limits.sql`,
@@ -52,8 +42,8 @@ tightens the name-key guard. 0012 records whether the database was an empty file
 run and gives only a genuinely new installation the neutral UTC default; an existing household
 keeps its timezone even when it has no devices left. 0013 adds the nullable `items.created_on`
 creation date; existing rows stay NULL, meaning no lower bound, so an upgrade changes no
-existing XP, level or perfect day. Phones keep working without an app update: the sync API did
-not change.
+existing XP, level or perfect day. Phones keep working without an app update: the sync
+generation fields are additive, and a request without them keeps the old behaviour.
 
 **This source branch is not a deployment approval.** Routes, reminder settings and scheduler
 are per-user here, but the upstream candidates and the rest of the multi-user stack still need
@@ -83,11 +73,12 @@ Never modify its ledger, recreate production, or remove reviewer evidence. See D
   runbook stops every writer before the copy and does not start them again until step 4, so
   the maintenance window from step 2 to step 4 admits no new writes. Once the new release has
   served phones, rolling back loses every write accepted after the copy. Phones keep their
-  local rows, but they push only rows marked dirty and do not resend rows that already
-  synced, so roll back after live use only with explicit consent to that recovery point and
-  data loss. Otherwise fix forward. A restored server can also have a lower `meta.seq` than a
-  phone's stored `cursor`, so that phone can stop pulling rows it would otherwise receive.
-  That client recovery is not shipped by this release and is untested (see below).
+  local rows. This release reconciles by `updated_at`, treats a generation change or a server
+  cursor behind the phone's cursor as a rollback, and then reoffers all local rows, but a
+  rollback after live use can still discard a server-only write from that window, so use it
+  only with explicit consent to that recovery point and data loss. Otherwise fix forward. A
+  restored server can also have a lower `meta.seq` than a phone's stored `cursor`; that case
+  is handled as a rollback by the same path and is covered by tests, not by a real device.
 * The Litestream replica is a second copy, not the recovery point, and it is only trusted
   after the mandatory gate (step 3) shows it holds exactly the same data as the frozen copy.
   Its file names and modification times prove nothing about what is inside, so the gate
@@ -274,7 +265,10 @@ copy of the volume, as in step 2, and compare with the step 2 output: the same c
 `meta.seq`, migrations and data digest. Do not point the checker at `$COPY` and call that the
 restored result.
 
-Keep `$RUN`, `$COPY` and `$PREV_IMAGE_ID` until the new release has run well.
+Keep `$RUN`, `$COPY` and `$PREV_IMAGE_ID` until the new release has run well. The sync
+generation phones use is the separate `.sync-generation` sidecar rotated by `mark-restored`,
+not Litestream's own generation. Litestream notices that the database file was replaced and
+starts a new generation; confirm with `docker logs bread-tracker-litestream`.
 
 ### What this runbook has and has not verified
 
@@ -290,13 +284,84 @@ Not run for this change: the full Compose rollback above (stop, restore, retag,
 `up --no-build`, health), restarting the old image on the restored volume, Litestream resuming
 after the file replacement (it starts a new generation), and phone recovery after a restore.
 They are operator deployment checks, not an approved rollback. A Litestream generation is the
-replica's internal lineage, not a server identity or sync epoch. Phones have no server epoch in
-this release: the app's `generation` and `epoch` fields are in-memory race guards, and the
-durable sync state is the local `cursor` plus `dirty` rows. After a restore an older server can
-be below the phone's cursor, so the phone can stop pulling rows, while clean rows are not
-pushed again. Plan a client reset or re-pair as part of the untested recovery, and do not treat
-success of the copy, replica, new startup or database replacement as full-scope rollback
+replica's internal lineage, not a server identity or sync epoch. The server does record a
+durable sync epoch and the app reconciles against it before uploading, but a full Compose
+restart of the old image with Litestream resuming a generation, and phone recovery after a
+restore, still need an operator run; they need no other pull request to be merged first. Do not
+treat success of the copy, replica, new startup or database replacement as full-scope rollback
 approval.
+
+## Backup and restore
+
+Litestream writes a file replica to `BREADTRACKER_BACKUP_DIR`. The sync-generation sidecar is deliberately stored outside SQLite, so an older database replica does not roll back the generation clients use to identify the server state. Every database restore must rotate that generation before the server accepts sync requests. If the sidecar survives a partial restore and the database cursor rewinds below a phone's cursor, the app treats that as a rollback and reoffers its clean rows instead of trusting the old cursor.
+
+Restore while the server is stopped. Replace the database with the Litestream restore, then run `mark-restored` against the same database path, before starting the service again. For the default Compose setup:
+
+```sh
+set -eu
+docker compose -f packaging/compose.yaml --project-directory . stop litestream
+docker compose -f packaging/compose.yaml --project-directory . stop bread-tracker
+# Restore into a unique host scratch directory first. Do not point the output at the DB.
+TASK="track2-restore-$(date +%s)-$$"
+SCRATCH="/var/tmp/$TASK"
+mkdir -m 700 "$SCRATCH"
+docker run --rm --name "$TASK-litestream" --user 0 \
+  -v /var/backups/bread-tracker:/b:ro -v "$SCRATCH:/o" \
+  litestream/litestream:0.3.13 restore -o /o/restored.db file:///b/litestream
+test "$(sqlite3 "$SCRATCH/restored.db" 'PRAGMA integrity_check;')" = ok
+# All SQLite users must be stopped. Checkpoint errors or a busy WAL abort the command.
+# Keep DB, WAL, SHM and candidate until replacement passes integrity_check. This image
+# runs as root, so the replaced files stay usable without an ownership change.
+docker run --rm --name "$TASK-replace" --user 0 \
+  -v bread-tracker-data:/data -v bread-tracker-data:/var/lib/bread-tracker -v "$SCRATCH:/restore" \
+  --entrypoint /bin/sh bread-tracker:local -ec '
+    sqlite3 /data/bread-tracker.db "PRAGMA wal_checkpoint(TRUNCATE);" > /tmp/checkpoint
+    IFS="|" read -r busy log_frames checkpointed < /tmp/checkpoint
+    test "$busy" = 0
+    if [ "$log_frames" = "-1" ]; then
+      test "$checkpointed" = "-1"
+    else
+      test "$log_frames" = "$checkpointed"
+    fi
+    cp /restore/restored.db /data/bread-tracker.db.new
+    test "$(sqlite3 /data/bread-tracker.db.new "PRAGMA integrity_check;")" = ok
+    mv /data/bread-tracker.db.new /data/bread-tracker.db
+    rm -f /data/bread-tracker.db-wal /data/bread-tracker.db-shm
+  '
+# Explicit ENTRYPOINT override is required: otherwise this command is appended to
+# bread-tracker-server arguments instead of running the marker subcommand.
+docker run --rm --name "$TASK-marker" \
+  -v bread-tracker-data:/var/lib/bread-tracker \
+  --entrypoint /usr/local/bin/bread-tracker-server bread-tracker:local mark-restored
+docker compose -f packaging/compose.yaml --project-directory . up -d litestream
+docker compose -f packaging/compose.yaml --project-directory . up -d bread-tracker
+rm -rf "$SCRATCH"
+```
+
+If a marker fails after it has written `.sync-restore-failed`, the server and a new marker both refuse to run. Do not delete the database. Find the failing command's output, stop both services, and verify the restored database with
+
+```sh
+python3 scripts/db-evidence.py check "$SCRATCH/restored.db" --ledger-subset 1,2,3,4,5,6,7,8,9,10,11,12
+```
+
+The sidecar names are derived from the database path, not appended to the filename. For the default `BREADTRACKER_DATABASE_PATH=/var/lib/bread-tracker/bread-tracker.db` the derived files are `bread-tracker.sync-generation`, `bread-tracker.sync-generation-pending` and `bread-tracker.sync-restore-failed`. The server replaces the database suffix, so appending `sync-*` to the `.db` filename does not exist and `rm -f` there would silently leave the real sentinel in place.
+
+Only after that check passes, remove the sentinel and the pending journal (if present) from the same volume, then rerun the marker against the same database path:
+
+```sh
+docker run --rm --name "$TASK-recover" \
+  -v bread-tracker-data:/var/lib/bread-tracker \
+  --entrypoint /bin/sh bread-tracker:local -ec '
+    rm -f /var/lib/bread-tracker/bread-tracker.sync-restore-failed \
+          /var/lib/bread-tracker/bread-tracker.sync-generation-pending'
+docker run --rm --name "$TASK-marker" \
+  -v bread-tracker-data:/var/lib/bread-tracker \
+  --entrypoint /usr/local/bin/bread-tracker-server bread-tracker:local mark-restored
+```
+
+A pending journal alone is recoverable by normal startup, which rolls it forward; the sentinel is what stops that, so remove the sentinel last and only after the evidence check.
+
+The normal operational restore above is intentionally separate from the disposable rehearsal below. This release keeps the tracker image on the root user so the existing root-owned volume opens without an ownership migration; the non-root image and its init-perms upgrade path belong to TRACK-15 / PR42. Stop both services before copying. Do not copy a generation sidecar from backup. The marker creates `.sync-restore-failed` before changing generation metadata and removes it only after success. Server startup and a subsequent marker invocation fail closed if the sentinel remains. Preserve the database, WAL and SHM until the restored candidate has passed integrity validation and replacement succeeds. The restore command is executed by the Litestream image's own default entrypoint; the replacement helper runs in the tracker image as root and leaves the data directory ownership unchanged. `pair` uses a short SQLite transaction and does not take the generation lock.
 
 ## Invite signup admission
 
@@ -325,3 +390,13 @@ Send an invite code and the server address to the new person through a private c
 ## Limits
 
 The defaults suit a small shared server (20 users, 2000 items and 50000 completions each, 10 devices each, 120 requests a minute per device). Change them in `.env` with `BREADTRACKER_MAX_USERS`, `BREADTRACKER_MAX_ITEMS_PER_USER`, `BREADTRACKER_MAX_COMPLETIONS_PER_USER`, `BREADTRACKER_MAX_DEVICES_PER_USER` and `BREADTRACKER_REQUESTS_PER_MINUTE`. The existing deployment is well below them. To stop someone without deleting their data: `user disable NAME` (and `user enable NAME`).
+
+## Disposable restore rehearsal
+
+Run the standalone rehearsal from a scratch checkout built from this revision. It uses only task-prefixed `--rm` containers, bind-mounted scratch directories and host port 17291. It does not use Compose or named volumes. Do not run it against production. The script prepares fixture files and the separate dummy secret inside root-run helpers, so it requires no host `chown` or `sudo`.
+
+```sh
+scripts/rehearse_restore.sh
+```
+
+The script checkpoints and integrity-checks the candidate, validates it before replacement, verifies marker and server startup, and tests secret readability without printing its contents. It uses a valid SQLx migration ledger with the SHA-384 checksum of the exact embedded 0001 migration. The server runs in the foreground under a host background PID: after health succeeds, the script verifies the exact task container name, stops only that container, and waits on the host `docker run` process for the exit status. Cleanup refuses to remove bind data while that container remains, uses a root helper to restore host uid/gid ownership, then removes only its exact scratch path and image. Runtime Docker verification is deliberately separate from static CI checks.

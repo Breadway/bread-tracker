@@ -277,11 +277,17 @@ impl UserDb {
     /// cursor. The cursor is the global change counter, so it also advances when other users
     /// write; their rows are never returned and the gaps are harmless. Both reads search the
     /// `(user_id, seq)` index; see [`UserDb::pull_query_plans`].
+    ///
+    /// A `since` above the current cursor means the caller's database was restored to an
+    /// older copy. Reading from 0 returns everything in the same snapshot instead of an empty
+    /// page that would leave the caller stuck until new writes pushed `seq` past its cursor.
+    /// Nothing is written, so this cannot mask a restore by advancing `seq` first.
     pub async fn pull(&self, since: i64) -> Result<SyncResponse, sqlx::Error> {
         let mut tx = self.db.begin().await?;
         let cursor: i64 = sqlx::query_scalar("SELECT val FROM meta WHERE key = 'seq'")
             .fetch_one(&mut *tx)
             .await?;
+        let since = if since > cursor { 0 } else { since };
         let items = sqlx::query_as::<_, Item>(&pull_sql("items", ITEM_COLS))
             .bind(self.user_id)
             .bind(since)
@@ -297,6 +303,7 @@ impl UserDb {
                 .await?;
         tx.commit().await?;
         Ok(SyncResponse {
+            epoch: None,
             cursor,
             items,
             completions,

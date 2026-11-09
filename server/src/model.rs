@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 
 pub const KINDS: [&str; 3] = ["chore", "habit", "todo"];
 
+/// Permission levels a family link or item override can hold. The database enforces the same
+/// list; no client-write path accepts either field, so these are server-set in a later change.
+pub const PERMISSIONS: [&str; 3] = ["complete_only", "complete_and_reschedule", "full"];
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Item {
     pub id: String,
@@ -25,6 +29,14 @@ pub struct Item {
     /// the first value it sees and never overwrites it (see `store::UserDb::apply_push`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_on: Option<String>,
+    /// The user who created this item. Server-set provenance: a client's value is ignored,
+    /// and an item created through the normal sync path is attributed to its owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<i64>,
+    /// An item-level permission override. NULL means the family link's default applies.
+    /// Server-set for now; clients cannot write it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_override: Option<String>,
     #[serde(default)]
     pub seq: i64,
 }

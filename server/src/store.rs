@@ -57,7 +57,7 @@ pub enum PushError {
 }
 
 const ITEM_COLS: &str =
-    "id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, created_on, seq";
+    "id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, created_on, created_by, permission_override, seq";
 const COMPLETION_COLS: &str = "item_id, date, completed_at, updated_at, deleted_at, seq";
 
 fn pull_sql(table: &str, cols: &str) -> String {
@@ -447,8 +447,8 @@ impl UserDb {
             };
             let seq = next_seq(&mut tx).await?;
             sqlx::query(
-                "INSERT INTO items (user_id, id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, created_on, seq)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "INSERT INTO items (user_id, id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, created_on, created_by, seq)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(user_id, id) DO UPDATE SET
                    kind = excluded.kind, name = excluded.name, weekdays = excluded.weekdays,
                    remind_time = excluded.remind_time, points = excluded.points, due_date = excluded.due_date,
@@ -468,6 +468,10 @@ impl UserDb {
             .bind(updated)
             .bind(it.deleted_at)
             .bind(created_on.clone())
+            // TRACK-55: provenance is server-set. A normal sync write belongs to the caller, and
+            // a conflict keeps the creator already stored. `permission_override` stays NULL
+            // until a dedicated family route sets it.
+            .bind(self.user_id)
             .bind(seq)
             .execute(&mut *tx)
             .await?;

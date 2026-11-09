@@ -40,6 +40,8 @@ fn item(id: &str, kind: &str, weekdays: i64, points: i64) -> Item {
         // creation date. A NULL (legacy) creation date is exercised in the populated upgrade
         // test, where rows are written directly and never pass through the sync path.
         created_on: Some("2020-01-01".to_string()),
+        created_by: None,
+        permission_override: None,
         seq: 0,
     }
 }

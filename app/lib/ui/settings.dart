@@ -53,6 +53,7 @@ class SettingsScreen extends ConsumerWidget {
     }
 
     final rejection = ref.read(syncEngineProvider).rejectionMessage;
+    final refusal = ref.read(syncEngineProvider).refusalMessage;
     String policy(String recovery) => rejection == null || rejection.isEmpty
         ? recovery
         : '$recovery $rejection';
@@ -77,7 +78,7 @@ class SettingsScreen extends ConsumerWidget {
         paired
             ? 'This phone is no longer paired. Pair it again.'
             : 'Not paired',
-      SyncStatus.idle => paired ? 'Up to date' : 'Not paired',
+      SyncStatus.idle => refusal ?? (paired ? 'Up to date' : 'Not paired'),
     };
 
     return SafeArea(

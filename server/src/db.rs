@@ -948,6 +948,7 @@ mod generation_tests {
                 created_on: None,
                 created_by: None,
                 permission_override: None,
+                effective_permission: None,
                 seq: 3,
             },
         )]);
@@ -966,6 +967,7 @@ mod generation_tests {
             created_on: None,
             created_by: None,
             permission_override: None,
+            effective_permission: None,
             seq: 1,
         };
         apply_restore_snapshot_to_values(

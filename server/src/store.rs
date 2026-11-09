@@ -6,6 +6,7 @@ use chrono::{Datelike, Duration, NaiveDate};
 use sqlx::{Connection, SqliteConnection};
 
 use crate::db::Db;
+use crate::family;
 use crate::model::{Completion, Item, SyncResponse};
 use crate::xp;
 
@@ -15,7 +16,7 @@ pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-async fn next_seq(conn: &mut SqliteConnection) -> Result<i64, sqlx::Error> {
+pub(crate) async fn next_seq(conn: &mut SqliteConnection) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar("UPDATE meta SET val = val + 1 WHERE key = 'seq' RETURNING val")
         .fetch_one(conn)
         .await
@@ -56,7 +57,7 @@ pub enum PushError {
     Db(#[from] sqlx::Error),
 }
 
-const ITEM_COLS: &str =
+pub(crate) const ITEM_COLS: &str =
     "id, kind, name, weekdays, remind_time, points, due_date, sort, active, updated_at, deleted_at, created_on, created_by, permission_override, seq";
 const COMPLETION_COLS: &str = "item_id, date, completed_at, updated_at, deleted_at, seq";
 
@@ -701,12 +702,16 @@ impl UserDb {
             .fetch_one(&mut *tx)
             .await?;
         let since = if since > cursor { 0 } else { since };
-        let items = sqlx::query_as::<_, Item>(&pull_sql("items", ITEM_COLS))
+        let mut items = sqlx::query_as::<_, Item>(&pull_sql("items", ITEM_COLS))
             .bind(self.user_id)
             .bind(since)
             .bind(cursor)
             .fetch_all(&mut *tx)
             .await?;
+        // TRACK-58: effective permission is derived after the indexed pull, not joined into it,
+        // so the `(user_id, seq)` plan is unchanged. The lookup is scoped to this child and
+        // runs in the same read snapshot as the rows.
+        family::apply_effective_permissions(&mut tx, self.user_id, &mut items).await?;
         let completions =
             sqlx::query_as::<_, Completion>(&pull_sql("completions", COMPLETION_COLS))
                 .bind(self.user_id)

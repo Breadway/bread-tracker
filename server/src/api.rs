@@ -53,7 +53,10 @@ pub fn router(state: AppState) -> Router {
         .route("/family/code", post(family_code))
         .route("/family/links", get(family_links).post(family_create_link))
         .route("/family/links/{id}/accept", post(family_accept))
-        .route("/family/links/{id}", delete(family_unlink))
+        .route(
+            "/family/links/{id}",
+            put(family_update_link).delete(family_unlink),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,
@@ -285,12 +288,23 @@ struct FamilyRedeemReq {
     code: String,
 }
 
+/// Partial update: omit a field to leave it alone. The API rejects an empty body so a typo in
+/// the field name cannot look like a successful no-op.
+#[derive(Deserialize)]
+struct FamilyLinkUpdateReq {
+    #[serde(default)]
+    default_permission: Option<String>,
+    #[serde(default)]
+    notify_on_complete: Option<bool>,
+}
+
 #[derive(Serialize)]
 struct FamilyLinkResp {
     id: i64,
     direction: String,
     status: String,
     permission: String,
+    notify_on_complete: bool,
     other_name: String,
     created_at: i64,
     accepted_at: Option<i64>,
@@ -307,6 +321,7 @@ impl From<family::LinkInfo> for FamilyLinkResp {
             direction: link.direction,
             status: link.status,
             permission: link.permission,
+            notify_on_complete: link.notify_on_complete,
             other_name: link.other_name,
             created_at: link.created_at,
             accepted_at: link.accepted_at,
@@ -332,6 +347,46 @@ async fn family_links(
         .map(FamilyLinkResp::from)
         .collect();
     Ok(Json(FamilyLinksResp { links }))
+}
+
+/// Authenticated parent: change the link's default permission and/or completion alerts.
+/// `PUT /family/links/{id}` takes either field, at least one. The child and an unowned id get
+/// 404, and a pending or revoked link is a 409. Changing the default also advances the
+/// sequence of this parent's items under the child without touching their `updated_at`, so the
+/// child's next pull learns the new effective permission without a false edit.
+async fn family_update_link(
+    State(st): State<AppState>,
+    Extension(UserId(uid)): Extension<UserId>,
+    Path(id): Path<i64>,
+    Json(req): Json<FamilyLinkUpdateReq>,
+) -> ApiResult<Json<FamilyLinkResp>> {
+    if req.default_permission.is_none() && req.notify_on_complete.is_none() {
+        return Err(ApiError::BadRequest(
+            "send default_permission or notify_on_complete".into(),
+        ));
+    }
+    match family::update_link(
+        &st.db,
+        uid,
+        id,
+        req.default_permission.as_deref(),
+        req.notify_on_complete,
+    )
+    .await?
+    {
+        family::LinkUpdateOutcome::Updated(link) => {
+            tracing::info!(user = uid, link = id, "family link updated");
+            Ok(Json(FamilyLinkResp::from(link)))
+        }
+        family::LinkUpdateOutcome::NotFound => Err(ApiError::NotFound),
+        family::LinkUpdateOutcome::NotActive => Err(ApiError::Conflict(
+            "only an active family link can be changed".into(),
+        )),
+        family::LinkUpdateOutcome::InvalidPermission => Err(ApiError::BadRequest(format!(
+            "default_permission must be one of {}",
+            crate::model::PERMISSIONS.join(", ")
+        ))),
+    }
 }
 
 /// Authenticated: redeem a child's family code into a *pending* link. Both the shared

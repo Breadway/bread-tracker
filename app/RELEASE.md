@@ -85,3 +85,20 @@ There is no store listing. Either:
 
 Debug-signed APKs (`debug` mode) install the same way but can only be updated by another APK signed
 with the same debug key, so use release builds for anyone other than a developer.
+
+## Switching an install from debug to release
+
+Android only replaces an installed app with one signed by the same key. A debug build and a release
+build use different keys, so a release APK cannot be installed over an existing debug install:
+`adb install -r` fails with `INSTALL_FAILED_UPDATE_INCOMPATIBLE` because the signatures do not
+match. The debug app has to be uninstalled first:
+
+```sh
+adb uninstall dev.breadway.tracker
+adb install app/build/app/outputs/flutter-apk/app-release.apk
+```
+
+The uninstall wipes the app's local data, including items, completions, settings and the saved
+account pairing. Sync the phone before switching, and use **Settings > Export my data** to keep a
+JSON copy of items and completions outside the app. Updates that keep the same signing key (debug
+to debug, release to release) preserve data.

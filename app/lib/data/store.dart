@@ -39,6 +39,7 @@ class PairingPersistenceReceipt {
     required this.previousToken,
     required this.previousServer,
     required this.previousCursor,
+    required this.previousEpoch,
   });
   final PairingOwnership ownership;
   final String token;
@@ -46,6 +47,7 @@ class PairingPersistenceReceipt {
   final String? previousToken;
   final String previousServer;
   final int previousCursor;
+  final String? previousEpoch;
 }
 
 class PairingPersistenceFailure implements Exception {
@@ -117,6 +119,7 @@ class Store {
       }
       final previousServer = serverUrl;
       final previousCursor = cursor;
+      final previousEpoch = epoch;
       receipt = PairingPersistenceReceipt(
         ownership: owner,
         token: token,
@@ -124,6 +127,7 @@ class Store {
         previousToken: previousToken,
         previousServer: previousServer,
         previousCursor: previousCursor,
+        previousEpoch: previousEpoch,
       );
       var serverChanged = false;
       var tokenWriteAttempted = false;
@@ -187,12 +191,15 @@ class Store {
             final serverRestored = serverUrl == previousServer;
             if (cursorResetAttempted && credentialRestored) {
               await _restoreCursorIfAttemptValue(previousCursor, 0);
+              await _restoreEpochIfAttemptValue(previousEpoch);
             }
             final cursorRestored = cursor == previousCursor;
+            final epochRestored = epoch == previousEpoch;
             restored =
                 credentialRestored &&
                 serverRestored &&
                 cursorRestored &&
+                epochRestored &&
                 await _secure.read(key: 'token') == previousToken;
           }
         } catch (_) {
@@ -238,9 +245,11 @@ class Store {
           await _secure.read(key: 'token') == receipt.previousToken) {
         await setServerUrl(receipt.previousServer);
         await setCursor(receipt.previousCursor);
+        await _setEpochAttempt(receipt.previousEpoch);
         preferencesRestored =
             serverUrl == receipt.previousServer &&
-            cursor == receipt.previousCursor;
+            cursor == receipt.previousCursor &&
+            epoch == receipt.previousEpoch;
       }
       rolledBack =
           _authGeneration == owner.generation &&
@@ -249,7 +258,8 @@ class Store {
           preferencesRestored &&
           serverUrl == receipt.previousServer &&
           await _secure.read(key: 'token') == receipt.previousToken &&
-          cursor == receipt.previousCursor;
+          cursor == receipt.previousCursor &&
+          epoch == receipt.previousEpoch;
     });
     return rolledBack;
   }
@@ -506,22 +516,52 @@ class Store {
     }
   }
 
-  Future<void> resetSync() async {
-    final previous = cursor;
+  /// Identity of the server database the cursor belongs to (null until first sync).
+  String? get epoch => prefs.getString('epoch');
+
+  Future<void> setEpoch(String v) async {
+    final previous = epoch;
     try {
       await _checkPreferenceWrite(
-        () => prefs.remove('cursor'),
-        'Sync cursor reset was not durably saved.',
+        () => prefs.setString('epoch', v),
+        'Sync generation was not durably saved.',
       );
-      if (cursor != 0) {
-        throw StateError('Sync cursor reset was not durably saved.');
+      if (epoch != v) {
+        throw StateError('Sync generation was not durably saved.');
       }
     } catch (cause) {
       try {
-        await _restoreCursorIfAttemptValue(previous, 0);
+        await _restoreEpochIfAttemptValue(previous);
       } catch (_) {
         _preferencesReliable = false;
-        throw StateError('Sync cursor reset failed and rollback is uncertain.');
+        throw StateError(
+          'Sync generation write failed and rollback is uncertain.',
+        );
+      }
+      Error.throwWithStackTrace(cause, StackTrace.current);
+    }
+  }
+
+  /// Forget the cursor and the server generation, so the next sync pulls everything.
+  Future<void> resetSync() async {
+    final previousCursor = cursor;
+    final previousEpoch = epoch;
+    try {
+      await _checkPreferenceWrite(
+        () async =>
+            await prefs.remove('cursor') && await prefs.remove('epoch'),
+        'Sync identity reset was not durably saved.',
+      );
+      if (cursor != 0 || epoch != null) {
+        throw StateError('Sync identity reset was not durably saved.');
+      }
+    } catch (cause) {
+      try {
+        await _restoreCursorIfAttemptValue(previousCursor, 0);
+        await _restoreEpochIfAttemptValue(previousEpoch);
+      } catch (_) {
+        _preferencesReliable = false;
+        throw StateError('Sync reset failed and rollback is uncertain.');
       }
       Error.throwWithStackTrace(cause, StackTrace.current);
     }
@@ -562,6 +602,25 @@ class Store {
         throw StateError('Cursor rollback could not be verified.');
       }
     }
+  }
+
+  Future<void> _setEpochAttempt(String? value) async {
+    if (value == null) {
+      await prefs.remove('epoch');
+    } else {
+      await prefs.setString('epoch', value);
+    }
+    await prefs.reload();
+    if (epoch != value) {
+      throw StateError('Sync generation rollback could not be verified.');
+    }
+  }
+
+  Future<void> _restoreEpochIfAttemptValue(String? previous) async {
+    if (!_preferencesReliable) return;
+    await prefs.reload();
+    if (epoch == previous) return;
+    await _setEpochAttempt(previous);
   }
 
   Future<void> _checkPreferenceWrite(
@@ -608,6 +667,25 @@ class Store {
         return;
       }
       await setCursor(value);
+      written =
+          _authGeneration == expectedGeneration &&
+          (expectedServer == null || serverUrl == expectedServer);
+    });
+    return written;
+  }
+
+  Future<bool> setEpochIfGeneration(
+    String value,
+    int expectedGeneration, {
+    String? expectedServer,
+  }) async {
+    var written = false;
+    await _serializeCredentialMutation(() async {
+      if (_authGeneration != expectedGeneration ||
+          (expectedServer != null && serverUrl != expectedServer)) {
+        return;
+      }
+      await setEpoch(value);
       written =
           _authGeneration == expectedGeneration &&
           (expectedServer == null || serverUrl == expectedServer);

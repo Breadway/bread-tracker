@@ -229,6 +229,19 @@ pub async fn connect_with_migrator(
     // Parse before the retry loop: a bad value is a configuration error, not a transient lock
     // that another attempt could resolve.
     let busy_timeout = busy_timeout_from_env()?;
+    connect_with_migrator_and_busy_timeout(database_url, admin_name, migrator, busy_timeout).await
+}
+
+/// [`connect_with_migrator`] with the connection busy timeout passed explicitly.
+///
+/// Tests use this to pin the production 5 s wait in a process whose environment may carry the
+/// loaded-CI override, without mutating process-global environment from a parallel suite.
+pub async fn connect_with_migrator_and_busy_timeout(
+    database_url: &str,
+    admin_name: Option<&str>,
+    migrator: &sqlx::migrate::Migrator,
+    busy_timeout: Duration,
+) -> anyhow::Result<Db> {
     let deadline = tokio::time::Instant::now() + OPEN_RETRY_BUDGET;
     let mut delay = OPEN_RETRY_FIRST;
     loop {

@@ -2,8 +2,10 @@
 
 Separate from the Nextcloud Chores calendar and the Gotify cron reminders. Server and
 database live on a server you host; the Android app (Flutter) is offline-first and syncs to it.
-The server is shared: each person has their own account, isolated from the others (see Users
-below).
+The server is shared: each person has their own account, and isolation is per user (see Users
+below). The one exception is an explicit family link that the child accepts (see Family): a
+linked parent can assign items to the child's list and see only those items and their progress.
+Without a link there is no sharing, and a child is fully usable with no parent.
 
 ## Rules (shared by server `server/src/xp.rs` and the app; vectors in `spec/xp_vectors.json`)
 
@@ -16,9 +18,12 @@ below).
 
 ## Sync
 
-- Rows: `items` (key `user_id` + `id`) and `completions` (key `user_id` + `item_id` + `date`); every request only sees the caller's own rows. Every row has `updated_at` (client unix ms) and `deleted_at` (tombstone, so an un-tick or delete syncs).
+- Rows: `items` (key `user_id` + `id`) and `completions` (key `user_id` + `item_id` + `date`); every sync request only sees the caller's own rows (the family routes in Family are separate). Every row has `updated_at` (client unix ms) and `deleted_at` (tombstone, so an un-tick or delete syncs).
 - Server assigns a monotonic `seq` to every accepted write. The cursor is a `seq`, so clock skew cannot lose rows.
-- `POST /sync {since, items, completions}` pushes local changes then returns every row with `seq > since` plus the new `cursor`, in one round trip. `GET /sync?since=` is pull only.
+- `POST /sync {since, items, completions}` pushes local changes then returns every row with `seq > since` plus the new `cursor`, in one round trip. `GET /sync?since=` is pull only, and a `since` above the current cursor returns the user's whole snapshot from the same read transaction (nothing is written, so a restore cannot be masked by a push first).
+- **Restore generation.** New clients first send an empty preflight request with their known generation. If the generation differs, the server returns a complete read-only snapshot without accepting writes; the app reconciles that snapshot by `updated_at`, marks all local rows for upload, then sends every dirty row in bounded batches. The new generation is committed only after the last batch succeeds, so an interrupted restore resumes on the next sync instead of stranding rows above the server cap. `GET /sync?since=` remains pull only.
+- **Restore storage.** The server generation is stored in `BREADTRACKER_DATABASE_PATH` with extension `.sync-generation`, outside SQLite and database backups. The server initializes a missing sidecar once and preserves it across ordinary restarts. After restoring a SQLite backup, stop the server, restore the database, then run `bread-tracker-server mark-restored` with the same `BREADTRACKER_DATABASE_PATH` and start the server. This atomically rotates the sidecar. Do not restore or copy the sidecar with the database backup. Arbitrary DB restores without this operation cannot be detected reliably. Old clients omit generation and continue their legacy push/pull sync; new clients treat a server response without generation as legacy and use legacy sync. Missing client generation is initialized from the server and does not signal a restore.
+- **Pairing** resets the cursor and generation and marks all local rows dirty, so re-pairing to an empty or rebuilt server pushes the phone's data back.
 - Conflicts: last write wins by `updated_at`; ties keep the server row. Timestamps more than a day in the future are clamped.
 - Batches are limited to 5000 rows and 2 MiB. A completion dated more than 7 days ahead of the server's UTC date, or before 2020, is rejected; `completed_at` is clamped like `updated_at`.
 - Housekeeping runs hourly in the scheduler: `reminders_sent` older than two days and expired pairing codes are deleted. Tombstoned items and completions are retained because the current cursor protocol has no per-device acknowledgement or forced-full-resync contract; pruning them could strand an offline client. XP and streak statistics use all retained history. A bounded-history or retention policy requires an explicit backward-compatible protocol/product decision before implementation.
@@ -77,10 +82,10 @@ SQLx identifies a migration by its numeric version and the SHA-384 of its file, 
 | 0001 | `0001_init.sql` | default | initial schema |
 | 0002 | `0002_users.sql` | default | users, `user_id` and per-user keys; rebuilds five tables |
 | 0003 | `0003_hygiene_indexes.sql` | default (TRACK-8) | scheduler and to-do suppression indexes |
-| 0004 | `0004_pair_rate_limits.sql` | PR31 (TRACK-5), reserved | durable pairing failure budgets |
+| 0004 | `0004_pair_rate_limits.sql` | PR31 (TRACK-5), additive and retained | reserved per-source budget table; the live admission path is 0009 |
 | 0005 | `0005_users_forward_repair.sql` | default, published at 6f9986e (treat as applied) | restores 0003's indexes, name key, durable admin naming |
 | 0006 | `0006_users_name_key_guard.sql` | default | replaces 0005's rename trigger so a non-ASCII raw rename cannot leave a stale key |
-| 0007 | `0007_user_settings.sql` | PR45 | per-user settings and owner/date/partial scheduler indexes |
+| 0007 | `0007_user_settings.sql` | default | per-user settings and owner/date/partial scheduler indexes |
 | 0008 | `0008_invites.sql` | PR46 | single-use invite codes |
 | 0009 | `0009_public_auth_limits.sql` | PR46 | shared durable pairing/signup admission |
 | 0010 | `0010_user_disabled.sql` | PR51 | non-destructive account disabling |
@@ -90,13 +95,13 @@ SQLx identifies a migration by its numeric version and the SHA-384 of its file, 
 
 Why 0005 exists. 0003 was applied on deployments before 0002 can run, and 0002 rebuilds `items` and `completions`, which drops every index on them. SQLx will not rerun the recorded 0003, so those indexes would silently disappear and the scheduler would scan the whole history again. 0005 recreates them with `IF NOT EXISTS`, so it is a no-op wherever they survived (a fresh database, where 0002 runs before 0003). It also adds `completions_item_date (item_id, date)`, because the primary key `(user_id, item_id, date)` cannot serve the to-do suppression lookup by item id.
 
-Ledgers this set upgrades, each proven on a populated file database in `server/tests/ledger.rs`: 0001 only; 0001+0003; 0001+0003+0004; 0001+0004; 0001+0002 (the earlier PR43 head); 0001+0002+0003; and a fresh database. Also proven there: published checksums of 0001, 0003 and 0004 are unchanged, a failure inside 0002 rolls back to the untouched legacy database and a retry succeeds, a failure inside 0005 keeps the 0002 result and a retry completes it, an edited recorded migration is refused, and this branch without PR31's 0004 refuses a database that already recorded 0004 rather than guessing.
+Ledgers this set upgrades, each proven on a populated file database in `server/tests/ledger.rs`: 0001 only; 0001+0003; 0001+0003+0004; 0001+0004; 0001+0002 (the earlier PR43 head); 0001+0002+0003; and a fresh database. Also proven there: published checksums of 0001, 0003 and 0004 are unchanged, a failure inside 0002 rolls back to the untouched legacy database and a retry succeeds, a failure inside 0005 keeps the 0002 result and a retry completes it, an edited recorded migration is refused, and a database that already recorded 0004 is adopted with that version's checksum, table and data untouched.
 
 Failure boundaries. Every migration commits in its own transaction, so a failure rolls back only that migration. If 0005 or 0006 fails, 0002 stays committed (`ledger.rs` proves it): the server refuses to start, the database is a valid intermediate state, and starting again after fixing the cause completes the rest. It is not "the original database": returning to the previous release means restoring a full pre-upgrade copy, taken with all writers stopped. See the runbook in `packaging/DEPLOY.md` for the maintenance window and the write-loss boundary.
 
 Owner-approved experimental-ledger policy (TRACK-76): all experimental multi-user databases are disposable. This does NOT authorize deleting reviewer evidence, other sessions' fixtures, source, or production data. Actual default/upstream migrations 0001, 0002, hygiene0003, optional limiter0004, repair0005 and guard0006 keep their immutable bytes/checksums. The settings migration was relocated from an old experimental version to `0007_user_settings.sql`, with new owner-aware indexes. The old bytes are preserved as a test fixture. A real preserved review database demonstrated settings003 checksum `1e89bcb129fcdeadb396a48b8310419532c080e8b4a6e7e329532d7fbed72074ac4a43f70bb0a389f16cc885343b865f`; that is incompatible with default's hygiene003, not an alternative spelling. Startup rejects it explicitly before migrations and never edits its ledger. The rejected PR49 head also recorded a `0005_neutral_default_timezone.sql` whose checksum (`401b8424ab749e4d1644fee4ea86f401143869ed8e2f227f46475ae519bf92b5fd59c3106f4be298bc57f92f58d7ae11`) is not the published 0005; startup names that ledger too, because the UTC it already wrote cannot be reconstructed. Migration 0012 uses the next free version instead of reusing 0005.
 
-Recreating an experiment: preserve the old file and branch/evidence; positively identify a database you created for the task (not a production or reviewer file); choose a new empty path in your owned scratch directory and start the current binary with BREADTRACKER_DATABASE_PATH pointing there. This recreates only a disposable experiment, not a data-preserving production upgrade. Never edit `_sqlx_migrations`, delete unrelated files, or point production at an empty path to bypass a mismatch. Any non-disposable ledger mismatch stops for operator intervention. The multi-user stack owns versions 0008 to 0012 (invites, public-authentication admission, disabling, authenticated request budgets, install provenance); a later schema change takes 0013 or above and must not reuse an earlier number. A database that recorded the real limiter0004 still needs separately integrated PR31 migration/runtime; the fixture does not ship that runtime. PR35/36/38 are not inherent schema prerequisites.
+Recreating an experiment: preserve the old file and branch/evidence; positively identify a database you created for the task (not a production or reviewer file); choose a new empty path in your owned scratch directory and start the current binary with BREADTRACKER_DATABASE_PATH pointing there. This recreates only a disposable experiment, not a data-preserving production upgrade. Never edit `_sqlx_migrations`, delete unrelated files, or point production at an empty path to bypass a mismatch. Any non-disposable ledger mismatch stops for operator intervention. The multi-user stack owns versions 0008 to 0012 (invites, public-authentication admission, disabling, authenticated request budgets, install provenance); a later schema change takes 0013 or above and must not reuse an earlier number. PR31's limiter0004 is embedded by this tree, so a database that recorded it is upgraded in place by the same migrator; its table remains reserved and has no live writer. PR35/36/38 are not inherent schema prerequisites.
 
 Scheduler query cost: 0007 adds `(user_id, remind_time)` with the live-reminder partial predicate, `(user_id, kind, id)` for to-do selection, `(user_id, date, item_id)` for completions and sent markers. Date/todo completion queries use UNION so each arm uses its index and duplicate projections are removed. `server/tests/scheduler_work.rs` executes the actual full projections with 10,000 items, 120,000 completions and 10,000 markers: zero-result work is 21/127/61 VM steps, compared with old experimental full scans of about 90,000/1,370,000 steps. This is not a constant all-history bound: real candidate to-dos and their historical completions still cost work proportional to their matching rows; stats and sync return retained data as before. Any-date to-do suppression, quiet-window original-date release and per-user marker uniqueness remain unchanged.
 
@@ -106,7 +111,7 @@ Accounts are created only with an invite code, made by the server owner on the c
 
 `POST /signup {invite, name, device_name?, timezone?}` is public. In one transaction it claims the invite, creates the user, applies the phone's timezone to the user's default settings row (an unknown timezone is ignored, so the account stays on UTC) and creates the first device, then returns `{user_id, name, device_id, token}`. The claim is a single `UPDATE ... WHERE used_at IS NULL AND revoked_at IS NULL AND expires_at > now`, the first write of the transaction, so concurrent redemptions are serialised and exactly one wins. If a later step fails, including a taken name, the whole transaction rolls back and the invite stays usable. Names are 1 to 40 letters, digits, spaces, `.`, `_` or `-`, unique ignoring case (409 when taken). A user created this way is never an admin; admins exist only through the migration.
 
-An unknown, used, expired or revoked code all answer the same 401, so a caller cannot tell which codes exist. Pairing and signup share a durable SQLite source budget: five failures per ten minutes, including malformed JSON and invalid names. Admission, validation and redemption hold one `BEGIN IMMEDIATE` transaction. Success does not consume the budget; failed redemptions roll back their effects before failure accounting commits. At 1,024 active source budgets, new sources are rejected before lookup until an expired slot is available; live budgets are never evicted. A blocked source cannot redeem even a valid code. Forwarded addresses are accepted only from explicitly configured `BREADTRACKER_TRUSTED_PROXIES`; deployers must verify the actual transport peer and proxy header sanitization. No deployment topology is inferred from unit tests. Migration 0009 is separate from the reserved PR31 migration 0004; importing a database with recorded 0004 still requires its actual migration/runtime integration.
+An unknown, used, expired or revoked code all answer the same 401, so a caller cannot tell which codes exist. Pairing and signup share a durable SQLite source budget: five failures per ten minutes, including malformed JSON and invalid names. Admission, validation and redemption hold one `BEGIN IMMEDIATE` transaction. Success does not consume the budget; failed redemptions roll back their effects before failure accounting commits. At 1,024 active source budgets, new sources are rejected before lookup until an expired slot is available; live budgets are never evicted. A blocked source cannot redeem even a valid code. Forwarded addresses are accepted only from explicitly configured `BREADTRACKER_TRUSTED_PROXIES`; deployers must verify the actual transport peer and proxy header sanitization. No deployment topology is inferred from unit tests. Migration 0009 is the live admission table; PR31's migration 0004 is embedded for ledger continuity, so a database that recorded it is upgraded in place while the runtime no longer writes its table.
 
 ## Administration and your own devices
 
@@ -128,6 +133,57 @@ The phone's database is one store, shared by whichever account signs in, so the 
 - Whenever the screen cannot rule out a wipe (the phone has data and a history) it first asks for confirmation, saying that unsynced changes to the old account are lost. Cancel changes nothing.
 - **Sign out** revokes the device on the server and forgets the token and cursor. With "keep data" the account is remembered, so signing back in to the same account keeps the data and signing in to another wipes it; "sign out and delete data" also forgets the account.
 - Against a server that predates accounts the app reports "too old for this version" rather than guessing.
+
+## Family
+
+A parent can assign chores, habits and to-dos to a linked child's list. The child keeps their own
+account, phone and full use of the app with no parent linked; a family link is optional, and only
+the child can accept one. The multi-user chain (TRACK-17 to TRACK-20) is integrated on `feature/app`
+(see Users and migrations), so family work builds on that foundation and no longer waits for it.
+
+### Links
+
+- One row per pair in `family_links(id, parent_id, child_id, status, default_permission, notify_on_complete, created_at, accepted_at)`, unique on `(parent_id, child_id)`; status is pending, active or revoked, and a user cannot link to themselves. The schema, provenance and override columns belong to TRACK-55; existing items default `created_by` to their owner so nothing changes for current users.
+- The child offers a short-lived single-use family code from Settings. The parent redeems it to create a pending link, and the child confirms who is asking before it becomes active. A parent can never link unilaterally, and pending links expire.
+- Either side can unlink at any time. Revocation ends the parent's access immediately, including anything the parent's devices have not pulled yet.
+- Roles are per link direction, never per account: one child may have several parents, one parent several children, and a user may be both a parent in one link and a child in another. The child always sees who can assign to them.
+
+### Item provenance and visibility
+
+- A parent-added item is stored under the child's `user_id` with `created_by` set to the parent. The child's normal sync pull delivers it through the same cursor; the child needs no new endpoint.
+- `created_by` is immutable provenance that the server sets. It is never trusted from a client payload, on the child's `/sync` or on the parent routes. An item the child creates keeps `created_by` = the child.
+- Parent writes use dedicated authenticated routes (list children, create, update and delete an assigned item, read assigned-item progress), never the parent's `/sync`. Parent reads return only items the parent assigned plus completions and XP progress for those. They never return the child's own items, settings, devices, push tokens or full stats.
+- The child's app learns `created_by` and a read-only `effective_permission` with each item so it can label assigned items and grey out controls, but the server remains the authority.
+
+### Permission levels
+
+The effective level is the item's override when set, otherwise the link's default. A new link defaults to complete_only. The server computes the level and enforces it on every write.
+
+| Level | The child may write |
+| --- | --- |
+| `complete_only` | completions, including completion tombstones (an un-tick) |
+| `complete_and_reschedule` | the above plus `due_date`, `weekdays`, `remind_time` and `active` |
+| `full` | the above plus `name`, `points` and delete |
+
+- A write outside the effective level is refused per row with a reason the app can show and revert. It must not fail the whole batch silently.
+- Changing a link's default permission takes effect on the child's next pull and does not rewrite history. The server advances the `seq` of that parent's items under the child, and does not touch their `updated_at`, so the child's cursor-based pull delivers the new effective permission without pretending the item itself was edited. An item override still wins.
+- Tightening a level changes future edits only; edits the child already made stay.
+
+### Revocation
+
+When a link is revoked, the items the parent added stay on the child's list as the child's own: `created_by` is cleared to the child, and the child can delete them like any other item. The parent stops seeing those items and the child's progress immediately, and the parent's devices receive nothing more about the child on their next sync.
+
+### XP, levels, streaks and perfect days
+
+- Parent-assigned items earn XP, levels and streaks exactly like the child's own items, and they join perfect-day scheduling. The shared rules in `spec/xp_vectors.json` do not fork.
+- Perfect days follow TRACK-65's immutable creation date: an item joins a day's schedule only from the day after it was created, and the server's timestamp, not a client clock, sets that date. A parent adding an item today therefore cannot revoke a perfect day that was already earned.
+- The parent sees the child's XP for the items the parent assigned, not the child's total or any XP from the child's own items.
+
+### Completion alerts
+
+- Completion alerts are per link, default off, and controlled by the parent.
+- They are batched so a child ticking several items produces one message, respect the parent's own reminders switch and quiet hours, and are suppressed rather than deferred inside quiet hours.
+- The payload carries only the name of the assigned item and no tokens. The child's reminders are unchanged and go to the child only.
 
 ## Defaults for new users
 

@@ -4,6 +4,7 @@
 //!   bread-tracker-server pair [--user <name>]   print a one-time pairing code (valid 15 minutes)
 //!   bread-tracker-server devices [--user <name>]   list paired devices
 //!   bread-tracker-server revoke <id>   remove a device (id or unique prefix, from `devices`)
+//!   bread-tracker-server mark-restored  rotate generation after restoring a DB
 //!   bread-tracker-server user list             list users
 //!   bread-tracker-server user remove <name> --yes   delete a user and all their data
 //!   bread-tracker-server user export <name>    print everything stored for a user as JSON
@@ -14,6 +15,7 @@
 //!   bread-tracker-server invite revoke <id>         cancel an unused invite
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -33,20 +35,92 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env();
+    let command = std::env::args().nth(1);
+    let restore_failed_path = config.database_path.with_extension("sync-restore-failed");
     if let Some(parent) = config
         .database_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
     {
-        std::fs::create_dir_all(parent).ok();
+        std::fs::create_dir_all(parent)?;
     }
-    let db = db::connect_with_admin(&config.database_url(), config.admin_name.as_deref())
-        .await
-        .context("opening database")?;
+    let is_marking_restore = command.as_deref() == Some("mark-restored");
+    if !is_marking_restore && restore_failed_path.exists() {
+        anyhow::bail!("a prior restore or generation marker failed; verify the database and follow the recovery steps in packaging/DEPLOY.md before starting");
+    }
+    if is_marking_restore && restore_failed_path.exists() {
+        anyhow::bail!("a prior restore marker failed; verify or restore the database and complete the documented recovery before attempting another marker");
+    }
+    if is_marking_restore {
+        if !config.database_path.exists() {
+            anyhow::bail!(
+                "database {} does not exist; restore it before marking generation",
+                config.database_path.display()
+            );
+        }
+        // Acquire exclusive ownership before touching any metadata. A benign refusal because
+        // a healthy server still holds the lock must leave the database and its files
+        // exactly as they were, so the failure guard is armed only after this succeeds.
+        let _generation_lock =
+            db::GenerationLock::try_acquire_lifetime_exclusive(&config.database_path)
+                .context("server is running; stop it before marking a restored database")?;
+        let generation_db = db::connect_existing(&config.database_url())
+            .await
+            .context("opening database to mark restored generation")?;
+        let generation = db::next_generation(&config.database_path)?;
+
+        // Ownership is validated and the mutation is about to begin: from here on, any
+        // unexpected exit must leave a sentinel so the next start cannot use half-rotated
+        // state. The explicit sentinel below is the durable record; the guard covers panics.
+        let marker_completed = Arc::new(AtomicBool::new(false));
+        let _marker_failure_guard = MarkerFailureGuard {
+            completed: marker_completed.clone(),
+            path: restore_failed_path.clone(),
+        };
+        let mut failure_marker = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&restore_failed_path)
+            .with_context(|| {
+                format!(
+                    "restore marker already exists at {}; verify database before retry",
+                    restore_failed_path.display()
+                )
+            })?;
+        use std::io::Write;
+        writeln!(failure_marker, "restore in progress")?;
+        failure_marker.sync_all()?;
+        std::fs::File::open(
+            restore_failed_path
+                .parent()
+                .unwrap_or(std::path::Path::new(".")),
+        )?
+        .sync_all()?;
+        db::mark_restored(&generation_db, &config.database_path, &generation).await?;
+        match std::fs::remove_file(&restore_failed_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        std::fs::File::open(
+            restore_failed_path
+                .parent()
+                .unwrap_or(std::path::Path::new(".")),
+        )?
+        .sync_all()?;
+        marker_completed.store(true, Ordering::SeqCst);
+        println!("Sync generation rotated. Start the server to resume sync.");
+        return Ok(());
+    }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("pair") => {
+            // A short SQLite transaction can coexist with a running server; pairing must not
+            // wait for the serving process to exit, and it never takes the generation lock.
+            let db = db::connect_with_admin(&config.database_url(), config.admin_name.as_deref())
+                .await
+                .context("opening database")?;
             let user = resolve_user_flag(&db, &args[1..]).await?;
             println!("{}", auth::create_pairing_code_for(&db, user.id).await?);
             eprintln!(
@@ -56,6 +130,9 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some("devices") => {
+            let db = db::connect_with_admin(&config.database_url(), config.admin_name.as_deref())
+                .await
+                .context("opening database")?;
             let selected = resolve_user_flag(&db, &args[1..]).await?;
             let filter = if args.len() > 1 {
                 Some(selected.id)
@@ -80,6 +157,9 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some("device") => {
+            let db = db::connect_with_admin(&config.database_url(), config.admin_name.as_deref())
+                .await
+                .context("opening database")?;
             match args.get(1).map(String::as_str) {
                 Some("list") => {
                     let selected = resolve_user_flag(&db, &args[2..]).await?;
@@ -109,6 +189,9 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some("user") => {
+            let db = db::connect_with_admin(&config.database_url(), config.admin_name.as_deref())
+                .await
+                .context("opening database")?;
             match args.get(1).map(String::as_str) {
                 Some("list") => {
                     only_positionals(
@@ -187,6 +270,9 @@ async fn main() -> anyhow::Result<()> {
                 "usage: bread-tracker-server revoke <device id or prefix>",
             )?;
             let id = &args[1];
+            let db = db::connect_with_admin(&config.database_url(), config.admin_name.as_deref())
+                .await
+                .context("opening database")?;
             match devices::revoke(&db, id).await? {
                 devices::Revoked::Removed(name) => println!("Revoked device \"{name}\"."),
                 devices::Revoked::NotFound => anyhow::bail!(
@@ -199,6 +285,9 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some("invite") => {
+            let db = db::connect_with_admin(&config.database_url(), config.admin_name.as_deref())
+                .await
+                .context("opening database")?;
             match args.get(1).map(String::as_str) {
                 Some("create") => {
                     let usage = "usage: bread-tracker-server invite create [--ttl 7d]";
@@ -271,6 +360,20 @@ async fn main() -> anyhow::Result<()> {
         None => {}
     }
 
+    // A running server holds the generation lock shared for its listener lifetime. Servers
+    // sharing one database keep working (the shared request budget relies on that), and
+    // generation reconciliation is serialised by the database transaction it opens, so the
+    // sidecar, journal and SQLite row still agree for every process. Restore marking needs
+    // the exclusive lock, so it refuses while any server holds this one. Pair is a short
+    // SQLite transaction and does not acquire the generation file lock. Take the lock before
+    // opening or migrating the database so a refused start changes nothing.
+    let generation_lock = db::GenerationLock::try_acquire_shared(&config.database_path)
+        .context("a restore operation is marking this database")?;
+    let db = db::connect_with_admin(&config.database_url(), config.admin_name.as_deref())
+        .await
+        .context("opening database")?;
+    let generation = db::reconcile_generation_locked(&db, &config.database_path).await?;
+
     let sender: Arc<dyn push::PushSender> = match &config.fcm_service_account {
         Some(path) => Arc::new(push::Fcm::from_file(path).context("loading FCM service account")?),
         None => {
@@ -287,7 +390,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let listen = config.listen.clone();
-    let state = AppState::new(db, config, sender);
+    let state = AppState::new(db, generation, config, sender);
+    let _generation_lock = generation_lock;
     push::spawn_scheduler(state.clone());
 
     let addr: SocketAddr = listen.parse().context("parsing BREADTRACKER_LISTEN")?;
@@ -343,6 +447,31 @@ fn remove_name(args: &[String]) -> anyhow::Result<(&str, bool)> {
         }
     }
     Ok((name, confirmed))
+}
+
+/// Armed only once the marker owns the database exclusively and is about to mutate it. A
+/// benign refusal (for example the server still holding the lock) therefore never creates a
+/// sentinel that would poison the next healthy start.
+struct MarkerFailureGuard {
+    completed: Arc<AtomicBool>,
+    path: std::path::PathBuf,
+}
+
+impl Drop for MarkerFailureGuard {
+    fn drop(&mut self) {
+        if self.completed.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&self.path)
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "restore marker exited before completion");
+            let _ = file.sync_all();
+        }
+    }
 }
 
 fn fmt_ms(ms: i64) -> String {

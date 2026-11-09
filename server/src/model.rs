@@ -90,6 +90,8 @@ impl Completion {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SyncRequest {
     #[serde(default)]
+    pub epoch: Option<String>,
+    #[serde(default)]
     pub since: i64,
     #[serde(default)]
     pub items: Vec<Item>,
@@ -99,6 +101,9 @@ pub struct SyncRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SyncResponse {
+    /// Database generation. Missing remains compatible with older servers and clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<String>,
     pub cursor: i64,
     pub items: Vec<Item>,
     pub completions: Vec<Completion>,

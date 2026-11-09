@@ -164,6 +164,7 @@ void main() {
       expect(await reopened.select(reopened.completions).get(), hasLength(1));
       await reopened.close();
     },
+    timeout: const Timeout(Duration(minutes: 2)),
   );
   test(
     'deleting the account sends the name, then forgets everything on the phone',

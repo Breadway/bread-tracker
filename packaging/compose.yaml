@@ -13,7 +13,7 @@
 #   BREADTRACKER_CONTAINER_NAME / BREADTRACKER_LITESTREAM_NAME   override only for an isolated
 #                                               scratch project; leave unset in production
 #
-# Pair a phone:  docker exec bread-tracker bread-tracker-server pair
+# Pair a phone:  docker compose -f packaging/compose.yaml --project-directory . exec bread-tracker bread-tracker-server pair
 
 services:
   # One-shot: hand the data volume to the unprivileged user. A volume created by an older image

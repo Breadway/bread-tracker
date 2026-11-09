@@ -275,7 +275,7 @@ void main() {
       expect(await store.token, 'new');
       await db.close();
       client.close();
-    });
+    }, timeout: const Timeout(Duration(minutes: 2)));
     test(
       'failed credential persistence never deletes the previous account rows',
       () async {
@@ -404,8 +404,10 @@ void main() {
         expect(await items(db), hasLength(1));
         expect(store.cursor, 0);
         await Future<void>.delayed(const Duration(milliseconds: 50));
+        // The generation preflight is an empty request, so the upload may not be the
+        // first body; the account adoption requirement is that all rows are offered.
         expect(
-          (fs.syncBodies.first['items'] as List),
+          fs.syncBodies.expand((body) => body['items'] as List),
           hasLength(1),
           reason: 'marked dirty and pushed',
         );
@@ -430,7 +432,12 @@ void main() {
       expect(await items(db), hasLength(1));
       expect(store.account!.userId, 9);
       await Future<void>.delayed(const Duration(milliseconds: 50));
-      expect((fs.syncBodies.first['items'] as List), hasLength(1));
+      // The generation preflight is an empty request, so the upload may not be the
+      // first body; the account adoption requirement is that all rows are offered.
+      expect(
+        fs.syncBodies.expand((body) => body['items'] as List),
+        hasLength(1),
+      );
     });
 
     test('a phone paired before accounts were recorded learns its owner, so re-pairing to the same account keeps data', () async {

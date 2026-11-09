@@ -13,8 +13,8 @@ COPY spec spec
 RUN cargo build --release --locked -p bread-tracker-server
 
 FROM docker.io/library/debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
-# curl is only for the HEALTHCHECK below.
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+# curl is only for the HEALTHCHECK below. sqlite3 is used by the documented restore helpers.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl sqlite3 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 tracker \
     && useradd --system --uid 10001 --gid tracker --no-create-home --shell /usr/sbin/nologin tracker \
@@ -29,4 +29,4 @@ EXPOSE 7290
 USER tracker
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS http://127.0.0.1:7290/healthz || exit 1
-ENTRYPOINT ["bread-tracker-server"]
+ENTRYPOINT ["/usr/local/bin/bread-tracker-server"]

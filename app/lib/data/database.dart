@@ -92,6 +92,33 @@ class AppDb extends _$AppDb {
         .write(const CompletionsCompanion(dirty: Value(true)));
   }
 
+  /// Apply a remote snapshot row only when it is newer than the local row. Dirty status
+  /// is not a freshness indicator: already-synced phone data can be newer than a backup.
+  Future<void> upsertItemIfNewer(ItemsCompanion incoming) async {
+    final id = incoming.id.value;
+    final local = await (select(
+      items,
+    )..where((row) => row.id.equals(id))).getSingleOrNull();
+    if (local != null && local.updatedAt > incoming.updatedAt.value) {
+      return;
+    }
+    await upsertItem(incoming);
+  }
+
+  Future<void> upsertCompletionIfNewer(CompletionsCompanion incoming) async {
+    final itemId = incoming.itemId.value;
+    final date = incoming.date.value;
+    final local =
+        await (select(completions)..where(
+              (row) => row.itemId.equals(itemId) & row.date.equals(date),
+            ))
+            .getSingleOrNull();
+    if (local != null && local.updatedAt > incoming.updatedAt.value) {
+      return;
+    }
+    await into(completions).insertOnConflictUpdate(incoming);
+  }
+
   /// Whether there is anything on the phone to lose (a tombstone counts: it is unsynced state).
   Future<bool> hasLocalData() async {
     final i = await (select(items)..limit(1)).get();

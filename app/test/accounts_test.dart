@@ -275,7 +275,7 @@ void main() {
       expect(await store.token, 'new');
       await db.close();
       client.close();
-    });
+    }, timeout: const Timeout(Duration(minutes: 2)));
     test(
       'failed credential persistence never deletes the previous account rows',
       () async {

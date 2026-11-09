@@ -9,8 +9,10 @@
 //! it, and check what survived.
 
 use std::borrow::Cow;
+use std::io;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bread_tracker_server::db;
@@ -18,6 +20,35 @@ use sha2::{Digest, Sha384};
 use sqlx::migrate::{Migration, MigrationType, Migrator};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
+
+/// Writes a tracing subscriber's output into memory so a test can assert on the log.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = CapturedLog;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl CapturedLog {
+    fn contents(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
 
 const I1: &str = "11111111-1111-4111-8111-111111111111";
 const I2: &str = "22222222-2222-4222-8222-222222222222";
@@ -678,8 +709,13 @@ async fn reopening_after_close_retries_while_a_writer_holds_the_lock() {
     // both halves here: a writer holds the write lock past the 5s connection busy timeout
     // while the reopen runs, so an unretried open fails, then a loop exercises the ordinary
     // close/reopen path.
+    //
+    // TRACK-121: pass the busy timeout explicitly. The loaded CI job sets
+    // BREADTRACKER_BUSY_TIMEOUT_MS=30000 for the whole suite, and reading it here let the first
+    // open wait out the hold, so the retry was no longer exercised in CI.
     use sqlx::Connection;
 
+    let busy_timeout = Duration::from_secs(5);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("locked.db");
     deployed(&path, &[3], false).await;
@@ -701,13 +737,31 @@ async fn reopening_after_close_retries_while_a_writer_holds_the_lock() {
         .unwrap();
 
     let release = tokio::spawn(async move {
-        // Longer than the 5s busy_timeout, so the first open attempt cannot wait it out.
+        // Longer than the explicit 5s busy_timeout, so the first open attempt cannot wait it out.
         tokio::time::sleep(Duration::from_millis(5_600)).await;
         sqlx::query("COMMIT").execute(&mut writer).await.unwrap();
     });
 
-    let reopened = db::connect_with_migrator(&url(&path), None, &embedded()).await;
+    // Capture the open path's warning. `set_default` is thread-local and `#[tokio::test]` uses
+    // a current-thread runtime, so this sees this test's retry without a global subscriber.
+    let log = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(log.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let _capture = tracing::subscriber::set_default(subscriber);
+
+    let reopened =
+        db::connect_with_migrator_and_busy_timeout(&url(&path), None, &embedded(), busy_timeout)
+            .await;
     release.await.unwrap();
+    assert!(
+        log.contents()
+            .contains("database is busy while opening; retrying"),
+        "the reopen must exercise the open-path BUSY retry; log:\n{}",
+        log.contents()
+    );
     let pool = reopened.expect(
         "a reopen racing a held write lock must retry SQLITE_BUSY, not fail the second start",
     );

@@ -11,4 +11,5 @@ flutter analyze
 flutter test
 ```
 
-Building an APK needs `android/app/google-services.json`, which is not in the repository.
+Building an APK works without `android/app/google-services.json`; the file is only needed for
+Firebase push registration. It is not in the repository. See [RELEASE.md](RELEASE.md).

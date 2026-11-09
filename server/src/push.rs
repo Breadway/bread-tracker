@@ -328,7 +328,8 @@ fn parse_quiet(start: &str, end: &str) -> Option<(NaiveTime, NaiveTime)> {
     Some((s, e))
 }
 
-/// One scheduler pass over every user. Returns the number of reminders sent.
+/// One scheduler pass over every user. Returns the number of messages sent: reminders to their
+/// own owners plus batched family completion alerts to parents.
 ///
 /// Each user's timezone, quiet hours, enabled switch, rows and devices are scoped independently.
 /// An error for one user is logged and never prevents the next user's pass.
@@ -346,6 +347,12 @@ pub async fn tick(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize
             Ok(n) => count += n,
             Err(e) => tracing::error!(user = uid, error = ?e, "reminder tick failed for user"),
         }
+    }
+    // TRACK-61: the parent alert pass runs alongside reminders, in the same 30 second tick.
+    // A failure there is logged and never stops reminder delivery.
+    match tick_family_alerts(st, now_utc).await {
+        Ok(n) => count += n,
+        Err(e) => tracing::error!(error = ?e, "family alert tick failed"),
     }
     Ok(count)
 }
@@ -434,6 +441,184 @@ async fn tick_user(st: &AppState, user: UserDb, now_utc: DateTime<Utc>) -> anyho
 
 /// Ticks between cleanup passes (30 s each, so about an hour).
 const PRUNE_EVERY_TICKS: u64 = 120;
+
+/// A completion alert waits this long before a tick may send it, so the completions of one
+/// sync (or a few quick syncs) coalesce into one message. It covers two 30 second ticks.
+pub const ALERT_BATCH_WINDOW_MS: i64 = 60_000;
+
+/// How many assigned item names one message may carry. A larger backlog is sent over several
+/// ticks, which keeps an FCM payload well inside its 4 KB limit.
+const MAX_ALERTS_PER_MESSAGE: i64 = 10;
+
+fn alert_text(names: &[String]) -> (String, String) {
+    match names {
+        [one] => (one.clone(), "Assigned item completed".to_string()),
+        _ => (format!("{} items completed", names.len()), names.join(", ")),
+    }
+}
+
+/// One family completion-alert pass. Returns the number of messages sent.
+pub async fn tick_family_alerts(st: &AppState, now_utc: DateTime<Utc>) -> anyhow::Result<usize> {
+    if !st.push.enabled() {
+        return Ok(0);
+    }
+    let cutoff = now_utc.timestamp_millis() - ALERT_BATCH_WINDOW_MS;
+    let parents: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT parent_id FROM family_alerts WHERE sent_at IS NULL ORDER BY parent_id",
+    )
+    .fetch_all(&st.db)
+    .await?;
+    let mut count = 0;
+    for parent in parents {
+        match tick_alerts_for(st, parent, now_utc, cutoff).await {
+            Ok(n) => count += n,
+            Err(e) => {
+                tracing::error!(user = parent, error = ?e, "family alert tick failed for user")
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// Resolve every pending alert for one parent without sending it. Used when the parent's own
+/// settings or account state mean nothing may go out: the suppression is final, never deferred.
+async fn resolve_pending_alerts(
+    db: &crate::db::Db,
+    parent_id: i64,
+    now: i64,
+) -> Result<u64, sqlx::Error> {
+    Ok(
+        sqlx::query("UPDATE family_alerts SET sent_at = ? WHERE parent_id = ? AND sent_at IS NULL")
+            .bind(now)
+            .bind(parent_id)
+            .execute(db)
+            .await?
+            .rows_affected(),
+    )
+}
+
+async fn tick_alerts_for(
+    st: &AppState,
+    parent_id: i64,
+    now_utc: DateTime<Utc>,
+    cutoff: i64,
+) -> anyhow::Result<usize> {
+    let disabled: Option<Option<i64>> =
+        sqlx::query_scalar("SELECT disabled_at FROM users WHERE id = ?")
+            .bind(parent_id)
+            .fetch_optional(&st.db)
+            .await?;
+    let Some(disabled_at) = disabled else {
+        // The account is gone; its rows cascade, but a stale pass can still see one.
+        resolve_pending_alerts(&st.db, parent_id, now_ms()).await?;
+        return Ok(0);
+    };
+    let settings = UserDb::new(&st.db, parent_id).settings().await?;
+    let now = settings.tz().from_utc_datetime(&now_utc.naive_utc());
+    let quiet = parse_quiet(&settings.quiet_start, &settings.quiet_end);
+    if disabled_at.is_some() || !settings.reminders_enabled || in_quiet_hours(now.time(), quiet) {
+        resolve_pending_alerts(&st.db, parent_id, now_ms()).await?;
+        return Ok(0);
+    }
+
+    // Sent-time recheck: a row is only deliverable while its link is active with alerts on and
+    // the item is still a live item that parent assigned. Anything else is resolved without a
+    // message, so a revoke, a toggle off or a deleted item cannot be undone and replayed.
+    sqlx::query(
+        "UPDATE family_alerts SET sent_at = ?
+         WHERE parent_id = ? AND sent_at IS NULL AND NOT EXISTS (
+             SELECT 1 FROM family_links l
+             JOIN items i ON i.user_id = family_alerts.child_id AND i.id = family_alerts.item_id
+             WHERE l.parent_id = family_alerts.parent_id
+               AND l.child_id = family_alerts.child_id
+               AND l.status = 'active' AND l.notify_on_complete = 1
+               AND i.created_by = family_alerts.parent_id AND i.deleted_at IS NULL
+         )",
+    )
+    .bind(now_ms())
+    .bind(parent_id)
+    .execute(&st.db)
+    .await?;
+
+    let pending: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT a.id, i.name FROM family_alerts a
+         JOIN family_links l
+           ON l.parent_id = a.parent_id AND l.child_id = a.child_id
+          AND l.status = 'active' AND l.notify_on_complete = 1
+         JOIN items i
+           ON i.user_id = a.child_id AND i.id = a.item_id
+          AND i.created_by = a.parent_id AND i.deleted_at IS NULL
+         WHERE a.parent_id = ? AND a.sent_at IS NULL AND a.created_at <= ?
+         ORDER BY a.created_at, a.id
+         LIMIT ?",
+    )
+    .bind(parent_id)
+    .bind(cutoff)
+    .bind(MAX_ALERTS_PER_MESSAGE)
+    .fetch_all(&st.db)
+    .await?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
+    let devices: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, fcm_token FROM devices WHERE user_id = ? AND fcm_token IS NOT NULL AND fcm_token != ''",
+    )
+    .bind(parent_id)
+    .fetch_all(&st.db)
+    .await?;
+    if devices.is_empty() {
+        return Ok(0); // left pending, so it still goes out after a device registers
+    }
+
+    let names: Vec<String> = pending.iter().map(|(_, name)| name.clone()).collect();
+    let (title, body) = alert_text(&names);
+    let mut delivered = false;
+    for (device_id, token) in &devices {
+        // No item ids, counts, child details or tokens in the payload: only the assigned
+        // item's name reaches the parent's own devices.
+        let msg = Message {
+            token: token.clone(),
+            title: title.clone(),
+            body: body.clone(),
+            data: HashMap::new(),
+        };
+        match st.push.send(&msg).await {
+            Ok(SendOutcome::Sent) => delivered = true,
+            Ok(SendOutcome::Unregistered) => {
+                tracing::info!(user = parent_id, device = %device_id, "fcm token unregistered, clearing");
+                sqlx::query(
+                    "UPDATE devices SET fcm_token = NULL WHERE id = ? AND user_id = ? AND fcm_token = ?",
+                )
+                .bind(device_id)
+                .bind(parent_id)
+                .bind(token)
+                .execute(&st.db)
+                .await?;
+            }
+            Err(e) => tracing::warn!(
+                user = parent_id,
+                error = ?e,
+                "family alert send failed"
+            ),
+        }
+    }
+    if !delivered {
+        return Ok(0); // every send failed or every token was dead; retry next tick
+    }
+
+    let ids: Vec<i64> = pending.iter().map(|(id, _)| *id).collect();
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let sql = format!(
+        "UPDATE family_alerts SET sent_at = ? WHERE sent_at IS NULL AND id IN ({placeholders})"
+    );
+    let mut q = sqlx::query(&sql).bind(now_ms());
+    for id in ids {
+        q = q.bind(id);
+    }
+    q.execute(&st.db).await?;
+    Ok(1)
+}
 
 pub fn spawn_scheduler(st: AppState) {
     tokio::spawn(async move {

@@ -1193,6 +1193,43 @@ pub async fn delete_item(
     Ok(ItemWriteOutcome::Deleted)
 }
 
+/// Queue one completion alert for a parent, inside the child's sync transaction.
+///
+/// The insert is gated on an active link with `notify_on_complete` on, so a toggle that is off
+/// (or a link that was revoked) enqueues nothing. `INSERT OR IGNORE` against the unique
+/// (parent, child, item, date) key makes a retried sync idempotent, and doing it in the same
+/// transaction as the accepted completion means there is no window where the completion is
+/// stored but its alert is lost. The date is the canonical `YYYY-MM-DD` the statistics ledger
+/// uses, so two spellings of one completion cannot create two alerts.
+pub async fn enqueue_completion_alert(
+    tx: &mut Transaction<'_, Sqlite>,
+    parent_id: i64,
+    child_id: i64,
+    item_id: &str,
+    date: &str,
+    now: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO family_alerts (parent_id, child_id, item_id, date, created_at)
+         SELECT ?, ?, ?, ?, ?
+         WHERE EXISTS (
+             SELECT 1 FROM family_links
+             WHERE parent_id = ? AND child_id = ?
+               AND status = 'active' AND notify_on_complete = 1
+         )",
+    )
+    .bind(parent_id)
+    .bind(child_id)
+    .bind(item_id)
+    .bind(date)
+    .bind(now)
+    .bind(parent_id)
+    .bind(child_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Everything a parent may read about one active child: only the items that parent created,
 /// only their completions, and assigned-item XP. Filtering happens in SQL before the shared
 /// rules run, so the child's own items, settings, devices, tokens, completions and full stats

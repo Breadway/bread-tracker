@@ -118,7 +118,15 @@ fn field_allowed(level: &str, field: &str) -> bool {
 }
 
 /// The fields of the completion's item that decide its ledger contribution.
-type CompletionItemRow = (String, i64, i64, bool, Option<i64>, Option<String>);
+type CompletionItemRow = (
+    String,
+    i64,
+    i64,
+    bool,
+    Option<i64>,
+    Option<String>,
+    Option<i64>,
+);
 
 /// The item fields a statistics ledger update can depend on, captured before an upsert.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -693,14 +701,15 @@ impl UserDb {
                 continue;
             }
             let item: Option<CompletionItemRow> = sqlx::query_as(
-                "SELECT kind, weekdays, points, active, deleted_at, created_on
+                "SELECT kind, weekdays, points, active, deleted_at, created_on, created_by
                  FROM items WHERE user_id = ? AND id = ?",
             )
             .bind(self.user_id)
             .bind(&c.item_id)
             .fetch_optional(&mut *tx)
             .await?;
-            let Some((kind, weekdays, points, active, item_deleted, created_on)) = item else {
+            let Some((kind, weekdays, points, active, item_deleted, created_on, created_by)) = item
+            else {
                 return Err(PushError::UnknownItem);
             };
             if existing.is_none() {
@@ -739,6 +748,27 @@ impl UserDb {
                     continue;
                 };
                 let canonical = day.format("%Y-%m-%d").to_string();
+                // TRACK-61: an accepted live completion of a parent-assigned item queues one
+                // alert in the same transaction. The gated insert also checks the active link's
+                // notify flag, and the unique key makes a retry idempotent. The alert stores the
+                // completion identity only; the payload is built from the parent's own item at
+                // send time, so nothing of the child's private list can enter it.
+                let alert_parent = if new_live {
+                    created_by.filter(|creator| *creator != self.user_id)
+                } else {
+                    None
+                };
+                if let Some(parent_id) = alert_parent {
+                    family::enqueue_completion_alert(
+                        &mut tx,
+                        parent_id,
+                        self.user_id,
+                        &c.item_id,
+                        &canonical,
+                        now_ms(),
+                    )
+                    .await?;
+                }
                 let item = LedgerItem {
                     kind,
                     weekdays,
@@ -1246,10 +1276,12 @@ pub struct Pruned {
     pub items: u64,
     pub completions: u64,
     pub pairing_codes: u64,
+    pub family_alerts: u64,
 }
 
-/// Delete expired pairing and reminder bookkeeping. Tombstones stay until the protocol offers
-/// device cursor acknowledgements or a forced-full-resync contract.
+/// Delete expired pairing and reminder bookkeeping, plus resolved family alerts older than the
+/// dedupe horizon. Tombstones stay until the protocol offers device cursor acknowledgements or
+/// a forced-full-resync contract.
 pub async fn prune(db: &Db, now: i64) -> Result<Pruned, sqlx::Error> {
     let day_before_yesterday = (chrono::DateTime::from_timestamp_millis(now)
         .unwrap_or_default()
@@ -1268,9 +1300,16 @@ pub async fn prune(db: &Db, now: i64) -> Result<Pruned, sqlx::Error> {
         .execute(db)
         .await?
         .rows_affected();
+    let family_alerts =
+        sqlx::query("DELETE FROM family_alerts WHERE sent_at IS NOT NULL AND created_at < ?")
+            .bind(now - 90 * DAY_MS)
+            .execute(db)
+            .await?
+            .rows_affected();
     Ok(Pruned {
         reminders,
         pairing_codes,
+        family_alerts,
         ..Pruned::default()
     })
 }

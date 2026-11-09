@@ -34,8 +34,9 @@ This stack adds migrations `0002_users.sql`, `0004_pair_rate_limits.sql`,
 `0007_user_settings.sql`, `0008_invites.sql`, `0009_public_auth_limits.sql`,
 `0010_user_disabled.sql`, `0011_authenticated_rate_limits.sql`,
 `0012_install_provenance.sql`, `0013_item_created_on.sql`,
-`0014_stats_ledger.sql`, `0015_family.sql` and `0016_family_codes.sql`. They are applied automatically at server start, each in its own
-transaction. The embedded set is `1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16`. 0004's
+`0014_stats_ledger.sql`, `0015_family.sql`, `0016_family_codes.sql` and
+`0017_family_alerts.sql`. They are applied automatically at server start, each in its own
+transaction. The embedded set is `1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17`. 0004's
 `pair_rate_limits` table stays reserved and has no writer: the live pairing and signup
 admission is 0009's `public_auth_limits`. A database that already recorded 0004 is adopted
 by the same start, keeping its checksum and table. 0002 adds a `users` table, gives all existing data to the first user (the admin) and
@@ -51,7 +52,9 @@ aggregates, deletes no history, and keeps the same creation-date bound so perfec
 exact. 0015 adds `family_links` plus nullable `items.created_by` and
 `items.permission_override`; every existing item is backfilled with its owner as creator and no
 override, so no current behavior changes. 0016 adds `family_codes` and the per-code attempt
-budget; it creates no links and grants nothing. Phones keep working without an app update: the sync
+budget; it creates no links and grants nothing. 0017 adds the durable `family_alerts` queue for
+optional parent completion alerts; it is empty on upgrade and sends nothing until a parent turns
+`notify_on_complete` on for an active link. Phones keep working without an app update: the sync
 generation fields are additive, and a request without them keeps the old behaviour.
 
 **This source branch is not a deployment approval.** Routes, reminder settings and scheduler
@@ -156,11 +159,11 @@ closed, not to be advisory.
    Do not start the containers again until step 4. Verify the copy itself. It must open,
    pass `integrity_check` and `foreign_key_check`, have a valid migration ledger (every
    migration recorded once and successful, with the checksum of the shipped file), and record
-   only migrations this release supports. The embedded set is `1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16`:
+   only migrations this release supports. The embedded set is `1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17`:
 
    ```sh
    python3 scripts/db-evidence.py check "$COPY/bread-tracker.db" \
-     --ledger-subset 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
+     --ledger-subset 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17
    ```
 
    It prints the evidence (row counts, `meta.seq`, the migration ledger, a digest of every
@@ -214,7 +217,7 @@ closed, not to be advisory.
    holds stops startup with a message.
 
    This release ships migrations `1`, `2`, `3`, `4`, `5`, `6`, `7`, `8`, `9`, `10`, `11`,
-   `12`, `13`, `14`, `15` and `16`. A database that has already recorded `4` (the reserved PR31 pairing-limiter
+   `12`, `13`, `14`, `15`, `16` and `17`. A database that has already recorded `4` (the reserved PR31 pairing-limiter
    version) is adopted by the same start: its checksum and table are kept and the later
    migrations apply.
    The live pairing and signup admission is migration `9`'s `public_auth_limits`; `4`'s
@@ -228,7 +231,7 @@ closed, not to be advisory.
    WORK=$(mktemp -d)
    docker run --rm --user "$(id -u):$(id -g)" -v "$BACKUP_DIR":/b:ro -v "$WORK":/o \
      litestream/litestream:0.3.13 restore -o /o/replica.db file:///b/litestream
-   python3 scripts/db-evidence.py check "$WORK/replica.db" --ledger-exact 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
+   python3 scripts/db-evidence.py check "$WORK/replica.db" --ledger-exact 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17
    ```
 
    Expect `CHECK PASSED` and the same counts for `items`, `completions`, `devices`,
@@ -258,7 +261,7 @@ anything, re-check the recovery point and the target volume:
 test -s "$RUN/old-image-id" && PREV_IMAGE_ID=$(cat "$RUN/old-image-id")
 test -n "$PREV_IMAGE_ID"
 python3 scripts/db-evidence.py check "$COPY/bread-tracker.db" \
-  --ledger-subset 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16       # must end CHECK PASSED
+  --ledger-subset 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17       # must end CHECK PASSED
 VOL_NOW=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/bread-tracker"}}{{.Name}}{{end}}{{end}}' bread-tracker)
 test "$VOL_NOW" = "$VOL"                         # same volume as the copy
 docker compose -f packaging/compose.yaml --project-directory . stop bread-tracker litestream

@@ -19,6 +19,7 @@ void main() {
             active: i['active'],
             deleted: i['deleted_at'] != null,
             createdOn: i['created_on'],
+            createdBy: i['created_by'] as int?,
           ),
       ];
       final comps = [
@@ -105,5 +106,75 @@ void main() {
       const RCompletion('a', '2026-10-21'),
     ], parseDay('2026-10-21'));
     expect(nextDay.perfectDays, ['2026-10-21']);
+  });
+
+  test('parent-assigned items score exactly like owned items', () {
+    final today = parseDay('2026-10-19');
+    final variants = [
+      for (final createdBy in [null, 1, 2])
+        [
+          RItem(
+            id: 'chore',
+            kind: 'chore',
+            weekdays: 127,
+            points: 10,
+            active: true,
+            createdOn: '2026-10-01',
+            createdBy: createdBy,
+          ),
+          RItem(
+            id: 'habit',
+            kind: 'habit',
+            weekdays: 127,
+            points: 15,
+            active: true,
+            createdOn: '2026-10-01',
+            createdBy: createdBy,
+          ),
+        ],
+    ];
+    final comps = [
+      const RCompletion('chore', '2026-10-19'),
+      for (final d in ['2026-10-17', '2026-10-18', '2026-10-19'])
+        RCompletion('habit', d),
+    ];
+
+    final scores = [
+      for (final set in variants) computeStats(set, comps, today),
+    ];
+    for (final s in scores) {
+      expect(s.xp, 105, reason: 'chore points, habit points and perfect-day bonus');
+      expect(s.perfectDays, ['2026-10-19']);
+      expect(s.streaks, {'habit': 3});
+    }
+    expect(scores[1].xp, scores[0].xp);
+    expect(scores[2].xp, scores[0].xp);
+    expect(scores[1].perfectDays, scores[0].perfectDays);
+    expect(scores[2].perfectDays, scores[0].perfectDays);
+    expect(scores[1].streaks, scores[0].streaks);
+    expect(scores[2].streaks, scores[0].streaks);
+  });
+
+  test('a parent-assigned item follows the creation-date bound', () {
+    final parentChore = RItem(
+      id: 'parent',
+      kind: 'chore',
+      weekdays: 127,
+      points: 10,
+      active: true,
+      createdOn: '2026-10-19',
+      createdBy: 2,
+    );
+    final sameDay = computeStats([parentChore], [
+      const RCompletion('parent', '2026-10-19'),
+    ], parseDay('2026-10-19'));
+    expect(sameDay.xp, 10, reason: 'the completion still earns item XP');
+    expect(sameDay.perfectDays, isEmpty, reason: 'the creation day is not scheduled');
+
+    final nextDay = computeStats([parentChore], [
+      const RCompletion('parent', '2026-10-20'),
+    ], parseDay('2026-10-20'));
+    expect(nextDay.xp, 60, reason: '10 points plus the perfect-day bonus');
+    expect(nextDay.perfectDays, ['2026-10-20']);
   });
 }

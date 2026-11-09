@@ -25,6 +25,7 @@ class RItem {
     required this.active,
     this.deleted = false,
     this.createdOn,
+    this.createdBy,
   });
   final String id, kind;
   final int weekdays, points;
@@ -32,6 +33,11 @@ class RItem {
 
   /// `YYYY-MM-DD`, or null for an item that predates TRACK-65 (no lower bound).
   final String? createdOn;
+
+  /// Who created the item, or null when unknown. This is display provenance for a
+  /// parent-assigned item; the scoring rules below must never branch on it. A parent-assigned
+  /// item earns the same XP, streak and perfect-day credit as an owned one.
+  final int? createdBy;
 }
 
 class RCompletion {

@@ -227,6 +227,7 @@ mod tests {
             created_on: Some(created_on.to_string()),
             created_by: None,
             permission_override: None,
+            effective_permission: None,
             seq: 0,
         }
     }
@@ -247,6 +248,7 @@ mod tests {
             created_on: Some(created_on.to_string()),
             created_by: None,
             permission_override: None,
+            effective_permission: None,
             seq: 0,
         }
     }

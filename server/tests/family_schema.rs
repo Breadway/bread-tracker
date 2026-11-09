@@ -27,6 +27,7 @@ fn item(id: &str, name: &str, updated_at: i64) -> Item {
         created_on: None,
         created_by: None,
         permission_override: None,
+        effective_permission: None,
         seq: 0,
     }
 }

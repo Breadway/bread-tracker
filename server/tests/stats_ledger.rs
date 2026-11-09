@@ -42,6 +42,7 @@ fn item(id: &str, kind: &str, weekdays: i64, points: i64) -> Item {
         created_on: Some("2020-01-01".to_string()),
         created_by: None,
         permission_override: None,
+        effective_permission: None,
         seq: 0,
     }
 }

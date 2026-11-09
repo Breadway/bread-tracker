@@ -6,12 +6,15 @@
 //! status is `active`, which is the seam later item routes use; a pending or revoked link
 //! therefore grants no items and no parent reads.
 
+use std::collections::HashMap;
+
 use rand::Rng;
-use sqlx::{Sqlite, Transaction};
+use sqlx::{Sqlite, SqliteConnection, Transaction};
 
 use crate::auth::{hash, normalize_code, CallerIdentity, CODE_ALPHABET};
 use crate::db::Db;
-use crate::store::now_ms;
+use crate::model::{valid_permission, Item};
+use crate::store::{now_ms, ITEM_COLS};
 
 /// Family codes expire after 15 minutes, like pairing codes.
 pub const CODE_TTL_MS: i64 = 15 * 60 * 1000;
@@ -48,6 +51,7 @@ pub struct LinkInfo {
     pub direction: String,
     pub status: String,
     pub permission: String,
+    pub notify_on_complete: bool,
     pub other_name: String,
     pub created_at: i64,
     pub accepted_at: Option<i64>,
@@ -324,6 +328,7 @@ async fn link_info(
                 CASE WHEN l.parent_id = ? THEN 'parent' ELSE 'child' END AS direction,
                 l.status,
                 l.default_permission AS permission,
+                l.notify_on_complete,
                 CASE WHEN l.parent_id = ? THEN c.name ELSE p.name END AS other_name,
                 l.created_at, l.accepted_at, l.revoked_at, l.pending_expires_at
          FROM family_links l
@@ -347,6 +352,7 @@ pub async fn links_for(db: &Db, user_id: i64) -> Result<Vec<LinkInfo>, sqlx::Err
                 CASE WHEN l.parent_id = ? THEN 'parent' ELSE 'child' END AS direction,
                 l.status,
                 l.default_permission AS permission,
+                l.notify_on_complete,
                 CASE WHEN l.parent_id = ? THEN c.name ELSE p.name END AS other_name,
                 l.created_at, l.accepted_at, l.revoked_at, l.pending_expires_at
          FROM family_links l
@@ -404,6 +410,269 @@ pub async fn active_parents(db: &Db, child_id: i64) -> Result<Vec<ActiveParty>, 
     .bind(child_id)
     .fetch_all(db)
     .await
+}
+
+/// The permission an item actually grants: its own override when set, otherwise the active
+/// link's default. `None` when the item has no active parent link, which is how the user's own
+/// items (and anything left after a revoke) stay fully editable.
+pub fn effective_permission(
+    override_level: Option<&str>,
+    default_permission: Option<&str>,
+) -> Option<String> {
+    default_permission.map(|default| override_level.unwrap_or(default).to_string())
+}
+
+/// Fill [`Item::effective_permission`] for the child's pull.
+///
+/// This deliberately reads the active links separately and post-processes the rows fetched by
+/// the indexed `(user_id, seq)` query. Joining `family_links` into `pull_sql` would change that
+/// plan; a parent's default is a small, per-child lookup either way.
+pub async fn apply_effective_permissions(
+    conn: &mut SqliteConnection,
+    child_id: i64,
+    items: &mut [Item],
+) -> Result<(), sqlx::Error> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT parent_id, default_permission FROM family_links
+         WHERE child_id = ? AND status = 'active'",
+    )
+    .bind(child_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    let defaults: HashMap<i64, String> = rows.into_iter().collect();
+    for item in items {
+        item.effective_permission = match item.created_by {
+            Some(creator) if creator != child_id => effective_permission(
+                item.permission_override.as_deref(),
+                defaults.get(&creator).map(String::as_str),
+            ),
+            _ => None,
+        };
+    }
+    Ok(())
+}
+
+/// A parent's listing of the items it assigned to one child, with the effective permission
+/// resolved exactly as the child sees it. `None` when the link is not active, so a route can
+/// answer 404 instead of leaking items after a revoke.
+pub async fn assigned_items(
+    db: &Db,
+    parent_id: i64,
+    child_id: i64,
+) -> Result<Option<Vec<Item>>, sqlx::Error> {
+    let Some(default_permission) = permission_for(db, parent_id, child_id).await? else {
+        return Ok(None);
+    };
+    let mut conn = db.acquire().await?;
+    // `items_user_created_by_seq` serves both the filter and the order.
+    let mut items: Vec<Item> = sqlx::query_as(&format!(
+        "SELECT {ITEM_COLS} FROM items
+         WHERE user_id = ? AND created_by = ?
+         ORDER BY seq"
+    ))
+    .bind(child_id)
+    .bind(parent_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    for item in &mut items {
+        item.effective_permission = effective_permission(
+            item.permission_override.as_deref(),
+            Some(&default_permission),
+        );
+    }
+    Ok(Some(items))
+}
+
+/// Advance the sequence of every item one parent created for one child, without touching
+/// `updated_at`.
+///
+/// The child's pull is cursor-based, so a changed link default only reaches the phone if the
+/// affected rows move past its cursor. Bumping `updated_at` instead would make the permission
+/// change look like a real edit and could win last-write-wins against a genuine child edit.
+/// Fresh sequence numbers are allocated in one block and assigned in stored sequence order,
+/// so the bumped rows stay ordered and every one is strictly newer than the caller's cursor.
+async fn bump_creator_items_seq(
+    tx: &mut Transaction<'_, Sqlite>,
+    child_id: i64,
+    parent_id: i64,
+) -> Result<u64, sqlx::Error> {
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE user_id = ? AND created_by = ?")
+            .bind(child_id)
+            .bind(parent_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if count == 0 {
+        return Ok(0);
+    }
+    let last: i64 =
+        sqlx::query_scalar("UPDATE meta SET val = val + ? WHERE key = 'seq' RETURNING val")
+            .bind(count)
+            .fetch_one(&mut **tx)
+            .await?;
+    let base = last - count;
+    let updated = sqlx::query(
+        "WITH ranked AS (
+             SELECT id, ROW_NUMBER() OVER (ORDER BY seq, id) AS rn
+             FROM items WHERE user_id = ? AND created_by = ?
+         )
+         UPDATE items
+         SET seq = ? + (SELECT rn FROM ranked WHERE ranked.id = items.id)
+         WHERE user_id = ? AND created_by = ?",
+    )
+    .bind(child_id)
+    .bind(parent_id)
+    .bind(base)
+    .bind(child_id)
+    .bind(parent_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    debug_assert_eq!(updated as i64, count);
+    Ok(updated)
+}
+
+/// Why a parent could not change its link's configuration.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LinkUpdateOutcome {
+    Updated(LinkInfo),
+    /// No such link for this caller. A child, or an unowned id, sees this, so ids are not
+    /// confirmed.
+    NotFound,
+    /// Pending or revoked links grant nothing and cannot be configured.
+    NotActive,
+    InvalidPermission,
+}
+
+/// Change the link's default permission and/or completion alerts. Only the parent may do it,
+/// and only while the link is active. Changing the default bumps the sequence of the parent's
+/// items under the child (see [`bump_creator_items_seq`]); changing only the alert toggle does
+/// not, because it does not change any item's effective permission.
+pub async fn update_link(
+    db: &Db,
+    parent_id: i64,
+    link_id: i64,
+    default_permission: Option<&str>,
+    notify_on_complete: Option<bool>,
+) -> Result<LinkUpdateOutcome, sqlx::Error> {
+    if let Some(level) = default_permission {
+        if !valid_permission(level) {
+            return Ok(LinkUpdateOutcome::InvalidPermission);
+        }
+    }
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    let row: Option<(String, i64, String, bool)> = sqlx::query_as(
+        "SELECT status, child_id, default_permission, notify_on_complete
+         FROM family_links WHERE id = ? AND parent_id = ?",
+    )
+    .bind(link_id)
+    .bind(parent_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((status, child_id, current_permission, current_notify)) = row else {
+        return Ok(LinkUpdateOutcome::NotFound);
+    };
+    if status != "active" {
+        return Ok(LinkUpdateOutcome::NotActive);
+    }
+    let permission = default_permission.unwrap_or(&current_permission);
+    let permission_changed = permission != current_permission;
+    let notify = notify_on_complete.unwrap_or(current_notify);
+    sqlx::query(
+        "UPDATE family_links SET default_permission = ?, notify_on_complete = ?
+         WHERE id = ? AND parent_id = ? AND status = 'active'",
+    )
+    .bind(permission)
+    .bind(notify)
+    .bind(link_id)
+    .bind(parent_id)
+    .execute(&mut *tx)
+    .await?;
+    if permission_changed {
+        bump_creator_items_seq(&mut tx, child_id, parent_id).await?;
+    }
+    let link = link_info(&mut tx, link_id, parent_id).await?;
+    tx.commit().await?;
+    Ok(LinkUpdateOutcome::Updated(link))
+}
+
+/// Why a parent could not set an item's override.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OverrideOutcome {
+    Updated {
+        effective_permission: String,
+    },
+    /// No active link with this child, or no such item on it.
+    NotFound,
+    NotActive,
+    InvalidPermission,
+    /// The item belongs to the child, not to this parent.
+    NotCreator,
+}
+
+/// Set or clear one item's permission override.
+///
+/// This is the write helper the TRACK-57 parent item routes call. It enforces the whole rule
+/// in one transaction: the caller must have an active link to the child, the enum must be
+/// valid, and only the parent that created the item may change it. Like a link default change,
+/// a new override bumps the item's sequence without moving `updated_at`, so the child's normal
+/// pull delivers the new effective permission and a permission change never competes with a
+/// real edit in last-write-wins.
+pub async fn set_item_override(
+    db: &Db,
+    parent_id: i64,
+    child_id: i64,
+    item_id: &str,
+    permission: Option<&str>,
+) -> Result<OverrideOutcome, sqlx::Error> {
+    if let Some(level) = permission {
+        if !valid_permission(level) {
+            return Ok(OverrideOutcome::InvalidPermission);
+        }
+    }
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT status, default_permission FROM family_links
+         WHERE parent_id = ? AND child_id = ?",
+    )
+    .bind(parent_id)
+    .bind(child_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((status, default_permission)) = row else {
+        return Ok(OverrideOutcome::NotFound);
+    };
+    if status != "active" {
+        return Ok(OverrideOutcome::NotActive);
+    }
+    let creator: Option<Option<i64>> =
+        sqlx::query_scalar("SELECT created_by FROM items WHERE user_id = ? AND id = ?")
+            .bind(child_id)
+            .bind(item_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(creator) = creator else {
+        return Ok(OverrideOutcome::NotFound);
+    };
+    if creator != Some(parent_id) {
+        return Ok(OverrideOutcome::NotCreator);
+    }
+    let seq = crate::store::next_seq(&mut tx).await?;
+    sqlx::query(
+        "UPDATE items SET permission_override = ?, seq = ?
+         WHERE user_id = ? AND id = ? AND created_by = ?",
+    )
+    .bind(permission)
+    .bind(seq)
+    .bind(child_id)
+    .bind(item_id)
+    .bind(parent_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(OverrideOutcome::Updated {
+        effective_permission: permission.unwrap_or(&default_permission).to_string(),
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]

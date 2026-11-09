@@ -6,8 +6,14 @@ use serde::{Deserialize, Serialize};
 pub const KINDS: [&str; 3] = ["chore", "habit", "todo"];
 
 /// Permission levels a family link or item override can hold. The database enforces the same
-/// list; no client-write path accepts either field, so these are server-set in a later change.
+/// list; clients never set the link default or item override through `/sync`, so these are
+/// validated whenever a family route changes them.
 pub const PERMISSIONS: [&str; 3] = ["complete_only", "complete_and_reschedule", "full"];
+
+/// Whether `level` is one of the three accepted permission values.
+pub fn valid_permission(level: &str) -> bool {
+    PERMISSIONS.contains(&level)
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Item {
@@ -34,9 +40,17 @@ pub struct Item {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by: Option<i64>,
     /// An item-level permission override. NULL means the family link's default applies.
-    /// Server-set for now; clients cannot write it.
+    /// Server-set; a client's value is ignored by the sync upsert, and family routes validate
+    /// it against [`PERMISSIONS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_override: Option<String>,
+    /// The permission the child actually has for this item: the override when set, otherwise
+    /// the active link's default. Read-only and computed by the server after the rows are
+    /// fetched, so it never participates in the sync write or the `(user_id, seq)` pull query.
+    /// Absent for the user's own items and for items whose parent link is not active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[sqlx(default)]
+    pub effective_permission: Option<String>,
     #[serde(default)]
     pub seq: i64,
 }

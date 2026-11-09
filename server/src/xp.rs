@@ -225,6 +225,8 @@ mod tests {
             updated_at: 0,
             deleted_at: None,
             created_on: Some(created_on.to_string()),
+            created_by: None,
+            permission_override: None,
             seq: 0,
         }
     }

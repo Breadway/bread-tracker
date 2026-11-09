@@ -25,6 +25,8 @@ fn item(id: &str, name: &str, created_on: Option<&str>, updated_at: i64) -> Item
         updated_at,
         deleted_at: None,
         created_on: created_on.map(str::to_string),
+        created_by: None,
+        permission_override: None,
         seq: 0,
     }
 }

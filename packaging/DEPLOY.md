@@ -34,8 +34,8 @@ This stack adds migrations `0002_users.sql`, `0004_pair_rate_limits.sql`,
 `0007_user_settings.sql`, `0008_invites.sql`, `0009_public_auth_limits.sql`,
 `0010_user_disabled.sql`, `0011_authenticated_rate_limits.sql`,
 `0012_install_provenance.sql`, `0013_item_created_on.sql`,
-`0014_stats_ledger.sql` and `0015_family.sql`. They are applied automatically at server start, each in its own
-transaction. The embedded set is `1,2,3,4,5,6,7,8,9,10,11,12,13,14,15`. 0004's
+`0014_stats_ledger.sql`, `0015_family.sql` and `0016_family_codes.sql`. They are applied automatically at server start, each in its own
+transaction. The embedded set is `1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16`. 0004's
 `pair_rate_limits` table stays reserved and has no writer: the live pairing and signup
 admission is 0009's `public_auth_limits`. A database that already recorded 0004 is adopted
 by the same start, keeping its checksum and table. 0002 adds a `users` table, gives all existing data to the first user (the admin) and
@@ -50,7 +50,8 @@ once per account from retained history before the server starts listening; it st
 aggregates, deletes no history, and keeps the same creation-date bound so perfect days stay
 exact. 0015 adds `family_links` plus nullable `items.created_by` and
 `items.permission_override`; every existing item is backfilled with its owner as creator and no
-override, so no current behavior changes. Phones keep working without an app update: the sync
+override, so no current behavior changes. 0016 adds `family_codes` and the per-code attempt
+budget; it creates no links and grants nothing. Phones keep working without an app update: the sync
 generation fields are additive, and a request without them keeps the old behaviour.
 
 **This source branch is not a deployment approval.** Routes, reminder settings and scheduler
@@ -155,11 +156,11 @@ closed, not to be advisory.
    Do not start the containers again until step 4. Verify the copy itself. It must open,
    pass `integrity_check` and `foreign_key_check`, have a valid migration ledger (every
    migration recorded once and successful, with the checksum of the shipped file), and record
-   only migrations this release supports. The embedded set is `1,2,3,4,5,6,7,8,9,10,11,12,13,14,15`:
+   only migrations this release supports. The embedded set is `1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16`:
 
    ```sh
    python3 scripts/db-evidence.py check "$COPY/bread-tracker.db" \
-     --ledger-subset 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+     --ledger-subset 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
    ```
 
    It prints the evidence (row counts, `meta.seq`, the migration ledger, a digest of every
@@ -213,7 +214,7 @@ closed, not to be advisory.
    holds stops startup with a message.
 
    This release ships migrations `1`, `2`, `3`, `4`, `5`, `6`, `7`, `8`, `9`, `10`, `11`,
-   `12`, `13` and `14`. A database that has already recorded `4` (the reserved PR31 pairing-limiter
+   `12`, `13`, `14`, `15` and `16`. A database that has already recorded `4` (the reserved PR31 pairing-limiter
    version) is adopted by the same start: its checksum and table are kept and the later
    migrations apply.
    The live pairing and signup admission is migration `9`'s `public_auth_limits`; `4`'s
@@ -227,7 +228,7 @@ closed, not to be advisory.
    WORK=$(mktemp -d)
    docker run --rm --user "$(id -u):$(id -g)" -v "$BACKUP_DIR":/b:ro -v "$WORK":/o \
      litestream/litestream:0.3.13 restore -o /o/replica.db file:///b/litestream
-   python3 scripts/db-evidence.py check "$WORK/replica.db" --ledger-exact 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+   python3 scripts/db-evidence.py check "$WORK/replica.db" --ledger-exact 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
    ```
 
    Expect `CHECK PASSED` and the same counts for `items`, `completions`, `devices`,
@@ -257,7 +258,7 @@ anything, re-check the recovery point and the target volume:
 test -s "$RUN/old-image-id" && PREV_IMAGE_ID=$(cat "$RUN/old-image-id")
 test -n "$PREV_IMAGE_ID"
 python3 scripts/db-evidence.py check "$COPY/bread-tracker.db" \
-  --ledger-subset 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15       # must end CHECK PASSED
+  --ledger-subset 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16       # must end CHECK PASSED
 VOL_NOW=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/bread-tracker"}}{{.Name}}{{end}}{{end}}' bread-tracker)
 test "$VOL_NOW" = "$VOL"                         # same volume as the copy
 docker compose -f packaging/compose.yaml --project-directory . stop bread-tracker litestream
@@ -444,9 +445,11 @@ docker exec bread-tracker bread-tracker-server user export NAME     # everything
 docker exec bread-tracker bread-tracker-server user disable NAME
 docker exec bread-tracker bread-tracker-server user enable NAME
 docker exec bread-tracker bread-tracker-server user remove NAME --yes # deletes the user and all their data
+docker exec bread-tracker bread-tracker-server family list            # every parent/child link and its state
+docker exec bread-tracker bread-tracker-server family revoke <id>     # revoke exactly that link
 ```
 
-Without `--user`, `pair` makes a code for the admin. Users add their own second device from the app (Settings), which calls `POST /pair-code`; you do not need to be involved. `user remove` cannot be undone, so take a backup first if in doubt; it refuses to remove an admin. `user disable` stops an account without deleting anything.
+Without `--user`, `pair` makes a code for the admin. Users add their own second device from the app (Settings), which calls `POST /pair-code`; you do not need to be involved. `user remove` cannot be undone, so take a backup first if in doubt; it refuses to remove an admin. `user disable` stops an account without deleting anything. `family list` and `family revoke` take only the documented arguments; a missing, non-numeric or extra argument is an error. A family link is normally created and accepted in the app: the child issues a code with `POST /family/code`, the parent redeems it with `POST /family/links`, and only the child can accept it. `family revoke` is the owner-side override for a link that must end at once; either party can also unlink from the app.
 
 Send an invite code and the server address to the new person through a private channel, then give them `docs/ONBOARDING.md`: it covers installing the APK, joining with the invite, adding a second device, and what you as the server owner can see.
 
